@@ -239,6 +239,28 @@ int audio_buffer_get_frame_count(audio_buffer_t *buffer) {
   return frames;
 }
 
+/* ---------- newest queued timestamp (diagnostics) ---------- */
+
+bool audio_buffer_peek_newest_rtp(audio_buffer_t *buffer, uint32_t *rtp_out) {
+  if (!buffer || !rtp_out || !buffer->pool || !buffer->sorted) {
+    return false;
+  }
+
+  bool found = false;
+  portENTER_CRITICAL(&buffer->lock);
+  if (buffer->count > 0) {
+    /* sorted[] is ordered by RTP timestamp, so the last entry is newest. */
+    uint16_t slot = buffer->sorted[buffer->count - 1];
+    const audio_frame_header_t *hdr =
+        (const audio_frame_header_t *)(buffer->pool +
+                                       (size_t)slot * buffer->slot_size);
+    *rtp_out = hdr->rtp_timestamp;
+    found = true;
+  }
+  portEXIT_CRITICAL(&buffer->lock);
+  return found;
+}
+
 /* ---------- nearly full check (for back-pressure) ---------- */
 
 bool audio_buffer_is_nearly_full(audio_buffer_t *buffer) {

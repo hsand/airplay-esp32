@@ -569,6 +569,33 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
       int64_t on_time_err_us = 0;
       if (compute_early_us(timing, format, hdr->rtp_timestamp, sync_mode,
                            &on_time_err_us)) {
+        // Playout report (diagnostic).  Logged about once a second at
+        // ~125 frames/s.  Three quantities, together enough to tell where a
+        // constant sync offset comes from:
+        //   err      — how far this frame is from its anchored play time.
+        //              Near 0 means we are playing exactly where the anchor
+        //              says, so a constant offset must come from the anchor
+        //              or from latency negotiation, not from this gate.
+        //   buffered — frames still queued behind this one.
+        //   depth_ms — how far the frame we are playing sits behind the
+        //              NEWEST frame in the buffer.  This is the real
+        //              end-to-end delay we are adding on top of the anchor;
+        //              if it is ~1 s while err is ~0, we are faithfully
+        //              playing a frame that is a second stale.
+        if (timing->playout_reports++ % 125 == 0) {
+          uint32_t newest_rtp = 0;
+          int64_t depth_ms = -1;
+          if (audio_buffer_peek_newest_rtp(buffer, &newest_rtp)) {
+            depth_ms =
+                ((int64_t)(int32_t)(newest_rtp - hdr->rtp_timestamp) * 1000LL) /
+                format->sample_rate;
+          }
+          ESP_LOGI(
+              TAG,
+              "Playout: err=%lld ms buffered=%d depth=%lld ms rtp=%" PRIu32,
+              (long long)(on_time_err_us / 1000LL), buffered_frames,
+              (long long)depth_ms, hdr->rtp_timestamp);
+        }
         // First-order IIR: err_filtered += (err - err_filtered) / 16.
         // At ~125 frames/s this has a time constant of ~0.13 s, long enough
         // to reject per-frame network jitter but fast enough to track a

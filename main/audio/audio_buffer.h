@@ -50,6 +50,9 @@ void audio_buffer_deinit(audio_buffer_t *buffer);
 void audio_buffer_flush(audio_buffer_t *buffer);
 int audio_buffer_get_frame_count(audio_buffer_t *buffer);
 bool audio_buffer_is_nearly_full(audio_buffer_t *buffer);
+/* Newest (highest-RTP) frame currently queued.  Diagnostics only: used to
+ * report how far behind the head of the buffer playout is running. */
+bool audio_buffer_peek_newest_rtp(audio_buffer_t *buffer, uint32_t *rtp_out);
 bool audio_buffer_take(audio_buffer_t *buffer, void **item, size_t *item_size,
                        TickType_t ticks);
 void audio_buffer_return(audio_buffer_t *buffer, void *item);

@@ -35,6 +35,8 @@ typedef struct {
   // drift_corrections counts applied trims (diagnostics only).
   int64_t drift_err_filtered_us;
   uint32_t drift_corrections;
+  // Counts played frames so the periodic playout report can be rate-limited.
+  uint32_t playout_reports;
   // Quick-start flag: set after a seek/flush/track-change so that
   // audio_timing_read starts playback with just 1 buffered frame instead of
   // waiting for target_buffer_frames.  Anchor-based timing is used from the
