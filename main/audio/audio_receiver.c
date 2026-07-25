@@ -167,6 +167,10 @@ void audio_receiver_set_encryption(const audio_encrypt_t *encrypt) {
   }
 }
 
+void audio_receiver_set_playout_latency_samples(uint32_t latency_samples) {
+  audio_timing_set_playout_latency(&receiver.timing, latency_samples);
+}
+
 void audio_receiver_set_output_latency_us(uint32_t latency_us) {
   if (!receiver.stream) {
     return;

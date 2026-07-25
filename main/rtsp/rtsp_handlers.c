@@ -81,6 +81,12 @@ bool rtsp_codec_configure(int64_t type_id, audio_format_t *fmt,
 
 // Event port task state
 #define EVENT_STACK_SIZE 3072
+
+// Default playout latency for realtime (type 96) streams when SETUP does not
+// carry a usable latencyMin: 11025 samples = 250 ms at 44.1 kHz.  This is the
+// standard AirPlay realtime-stream minimum latency; senders transmit audio
+// ~2 s (88200 samples) ahead of this deadline.
+#define AIRPLAY_RT_LATENCY_DEFAULT_SAMPLES 11025
 static int event_client_socket = -1;
 static int event_listen_socket = -1;
 static TaskHandle_t event_task_handle = NULL;
@@ -1268,6 +1274,36 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
 
   if (!start_audio_receiver_or_fail(socket, conn, req, stream_type)) {
     return;
+  }
+
+  // Playout latency.  For REALTIME streams (type 96) the anchor from
+  // SETRATEANCHORTIME maps an RTP timestamp onto the sender's source
+  // timeline; actual playout is expected latencyMin samples later.  Every
+  // reference receiver applies this, so playing at the anchor directly puts
+  // this device ~250 ms AHEAD of the rest of a multi-room group (issue #54:
+  // an empirical +300 ms offset on a build that subtracted 46 ms of
+  // hardware latency — net +254 ms — gave near-perfect sync; 11025 samples
+  // is 250.0 ms).  Use the sender's latencyMin from the SETUP stream dict
+  // when present and sane, else the AirPlay default of 11025.
+  // Buffered streams (type 103) schedule playout with the anchor directly.
+  // Only applied on the AirPlay 2 (bplist SETUP) path; the AirPlay 1 path
+  // keeps its existing behavior (0) — no field evidence either way there.
+  if (!is_bplist || buffered) {
+    audio_receiver_set_playout_latency_samples(0);
+  } else {
+    int64_t latency_min = 0;
+    const char *latency_src = "default";
+    if (body && body_len > 0 &&
+        bplist_find_int(body, body_len, "latencyMin", &latency_min) &&
+        latency_min > 0 && latency_min <= 5 * 44100) {
+      latency_src = "SETUP latencyMin";
+    } else {
+      latency_min = AIRPLAY_RT_LATENCY_DEFAULT_SAMPLES;
+    }
+    audio_receiver_set_playout_latency_samples((uint32_t)latency_min);
+    ESP_LOGI(TAG, "Realtime playout latency: %lld samples (%lld ms, %s)",
+             (long long)latency_min, (long long)(latency_min * 1000 / 44100),
+             latency_src);
   }
 
   if (is_bplist) {

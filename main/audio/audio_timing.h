@@ -28,13 +28,14 @@ typedef struct {
   // anchor. Reset whenever a new anchor is set or a late/on-time frame is
   // played.
   int consecutive_early_frames;
-  // Drift servo state.  drift_err_filtered_us is a smoothed estimate of how
-  // early (positive) or late (negative) on-time frames are actually playing,
-  // used to trim single samples so the local crystal tracks the sender's
-  // clock without ever accumulating enough error to drop a whole frame.
-  // drift_corrections counts applied trims (diagnostics only).
-  int64_t drift_err_filtered_us;
-  uint32_t drift_corrections;
+  // Stream playout latency in samples, added to every frame's scheduled
+  // play time.  Realtime streams (type 96): the anchor maps RTP onto the
+  // sender's source timeline and playout happens latencyMin samples later
+  // (11025 = 250 ms unless SETUP says otherwise).  Buffered streams
+  // (type 103): 0 — the anchor is the play time.  Set at stream SETUP;
+  // survives audio_timing_reset() because it is stream configuration, not
+  // playback state.
+  uint32_t playout_latency_samples;
   // Counts played frames so the periodic playout report can be rate-limited.
   uint32_t playout_reports;
   // Quick-start flag: set after a seek/flush/track-change so that
@@ -76,6 +77,9 @@ uint32_t audio_timing_get_hardware_latency(void);
 // so it is not the true end-to-end delay either. Use it for logging and
 // introspection, not for protocol negotiation.
 uint32_t audio_timing_get_advertised_latency(const audio_timing_t *timing);
+// Set the stream playout latency (samples).  See playout_latency_samples.
+void audio_timing_set_playout_latency(audio_timing_t *timing,
+                                      uint32_t latency_samples);
 void audio_timing_set_anchor(audio_timing_t *timing,
                              const audio_format_t *format, uint64_t clock_id,
                              uint64_t network_time_ns, uint32_t rtp_time);

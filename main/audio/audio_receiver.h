@@ -146,6 +146,13 @@ void audio_receiver_set_deferred_flush(uint32_t flush_until_ts);
 void audio_receiver_pause(void);
 
 /**
+ * Set the stream playout latency in samples, added to every frame's
+ * anchor-scheduled play time.  Realtime streams (type 96): latencyMin from
+ * SETUP (default 11025 = 250 ms).  Buffered streams (type 103): 0.
+ */
+void audio_receiver_set_playout_latency_samples(uint32_t latency_samples);
+
+/**
  * Set advertised/target output latency in microseconds.
  */
 void audio_receiver_set_output_latency_us(uint32_t latency_us);

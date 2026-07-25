@@ -17,17 +17,6 @@
 #define PIPELINE_LATENCY_US 5000 // ~5ms scheduling + write delay
 #define MIN_STARTUP_FRAMES  4
 
-// Drift servo tuning.  DRIFT_FILTER_DIV is the IIR divisor applied to the
-// per-frame timing error; larger = smoother but slower to react.  At ~125
-// frames/s a divisor of 16 gives a ~0.13 s time constant.
-// DRIFT_DEADBAND_US is how far the smoothed error may wander before a
-// one-sample trim is applied.  It must sit well inside the drop threshold
-// (10 ms by default) so the servo corrects long before a frame would be
-// discarded, but comfortably above one sample period (22.7 µs at 44.1 kHz)
-// so the servo is not chasing quantisation noise.
-#define DRIFT_FILTER_DIV  16
-#define DRIFT_DEADBAND_US 1500
-
 // Every audio output backend (I2S, S/PDIF, USB) allocates its read buffer as
 // (FRAME_SAMPLES + 1) * 2 int16 samples — i.e. interleaved stereo — and the
 // output stage is stereo regardless of what an incoming frame header claims.
@@ -115,22 +104,44 @@ static bool compute_early_us(const audio_timing_t *timing,
   int64_t frame_offset_ns =
       ((int64_t)rtp_delta * 1000000000LL) / format->sample_rate;
 
+  // Stream playout latency.  For AirPlay 2 REALTIME streams (type 96) the
+  // anchor maps an RTP timestamp onto the sender's source timeline, and the
+  // receiver is expected to emit that frame `latencyMin` samples LATER —
+  // 11025 samples (250 ms) unless SETUP negotiates otherwise.  Every
+  // reference receiver applies this delay; playing at the anchor instant
+  // directly makes this device lead the whole group by exactly 250 ms.
+  //
+  // Field evidence, all fitting latencyMin = 11025 within a few ms:
+  //   - steady jitter-buffer depth measured 1604-1748 ms, median 1716 ms:
+  //     the sender transmits 88200 samples (2 s) ahead of the play deadline,
+  //     so a receiver that fails to wait 11025 holds 88200-11025 = 77175
+  //     samples = 1750 ms;
+  //   - "First early frame" at stream start: 1711/1709 ms early vs anchor;
+  //   - issue #54: a +300 ms manual offset on a build subtracting 46 ms of
+  //     hardware latency (net +254 ms) produced near-perfect sync.
+  //
+  // Buffered streams (type 103) schedule playout with the anchor directly
+  // and keep this at 0.
+  int64_t latency_ns =
+      ((int64_t)timing->playout_latency_samples * 1000000000LL) /
+      format->sample_rate;
+
   int64_t target_ns;
   switch (sync_mode) {
   case SYNC_MODE_PTP:
     // AirPlay 2: use network time with PTP offset for multi-room sync
     target_ns = (int64_t)timing->anchor_network_time_ns -
-                ptp_clock_get_offset_ns() + frame_offset_ns;
+                ptp_clock_get_offset_ns() + frame_offset_ns + latency_ns;
     break;
   case SYNC_MODE_NTP:
     // AirPlay 1: use network time with NTP offset for multi-room sync
     // offset = remote_time - local_time, so local = remote - offset
     target_ns = (int64_t)timing->anchor_network_time_ns -
-                ntp_clock_get_offset_ns() + frame_offset_ns;
+                ntp_clock_get_offset_ns() + frame_offset_ns + latency_ns;
     break;
   default:
     // Fallback: use local anchor time (no multi-room sync)
-    target_ns = timing->anchor_local_time_ns + frame_offset_ns;
+    target_ns = timing->anchor_local_time_ns + frame_offset_ns + latency_ns;
     break;
   }
 
@@ -179,8 +190,6 @@ void audio_timing_reset(audio_timing_t *timing) {
   timing->quick_start = false;
   timing->deferred_flush_pending = false;
   timing->flush_until_ts = 0;
-  timing->drift_err_filtered_us = 0;
-  timing->drift_corrections = 0;
 }
 
 void audio_timing_set_format(audio_timing_t *timing,
@@ -228,6 +237,14 @@ uint32_t audio_timing_get_advertised_latency(const audio_timing_t *timing) {
   return base + audio_output_get_hardware_latency_us() + PIPELINE_LATENCY_US;
 }
 
+void audio_timing_set_playout_latency(audio_timing_t *timing,
+                                      uint32_t latency_samples) {
+  if (!timing) {
+    return;
+  }
+  timing->playout_latency_samples = latency_samples;
+}
+
 void audio_timing_set_anchor(audio_timing_t *timing,
                              const audio_format_t *format, uint64_t clock_id,
                              uint64_t network_time_ns, uint32_t rtp_time) {
@@ -247,10 +264,6 @@ void audio_timing_set_anchor(audio_timing_t *timing,
   // Reset frame counters so pre-buffered audio after a pause/resume or
   // track skip does not accumulate into the new anchor's counts.
   timing->consecutive_early_frames = 0;
-  // The servo's error estimate is relative to the old anchor; a new anchor
-  // redefines the reference, so carrying the old error over would make the
-  // servo trim against a offset that no longer exists.
-  timing->drift_err_filtered_us = 0;
 
   // Compute lead time: how far in the future this anchor's network timestamp
   // is relative to now.  Negative means the anchor is already in the past
@@ -547,41 +560,18 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
     // Frame is on time (or anchor-invalid) — reset counter.
     timing->consecutive_early_frames = 0;
 
-    // ---- Drift servo -------------------------------------------------
-    // The I2S clock is derived from the local crystal and free-runs against
-    // the sender's PTP timebase.  A typical crystal is off by 10-40 ppm,
-    // which accumulates ~40-140 ms of error per hour.  Without correction
-    // the error walks until it crosses timing_threshold_us and an entire
-    // frame is dropped (or a whole silence period inserted) — an audible
-    // click every few minutes on an otherwise healthy network.
-    //
-    // Instead, track a heavily-smoothed estimate of the on-time error and
-    // trim ONE sample from the frame when it drifts outside a band well
-    // inside the drop threshold.  One sample at 44.1 kHz is 22.7 µs, far
-    // below audibility, and correcting continuously means the error never
-    // reaches the point where a frame has to be discarded.
-    //
-    // Only runs while an anchor is valid and a network clock is locked —
-    // with no reference there is nothing meaningful to servo against.
-    int sample_adjust = 0;
+    // Playout report (diagnostic), roughly once a second at ~125 frames/s.
     if (timing->anchor_valid && sync_mode != SYNC_MODE_NONE &&
         timing->playout_started) {
       int64_t on_time_err_us = 0;
       if (compute_early_us(timing, format, hdr->rtp_timestamp, sync_mode,
                            &on_time_err_us)) {
-        // Playout report (diagnostic).  Logged about once a second at
-        // ~125 frames/s.  Three quantities, together enough to tell where a
-        // constant sync offset comes from:
-        //   err      — how far this frame is from its anchored play time.
-        //              Near 0 means we are playing exactly where the anchor
-        //              says, so a constant offset must come from the anchor
-        //              or from latency negotiation, not from this gate.
+        //   err      — distance from this frame's scheduled play time
+        //              (anchor + stream playout latency).  Should sit near 0.
         //   buffered — frames still queued behind this one.
-        //   depth_ms — how far the frame we are playing sits behind the
-        //              NEWEST frame in the buffer.  This is the real
-        //              end-to-end delay we are adding on top of the anchor;
-        //              if it is ~1 s while err is ~0, we are faithfully
-        //              playing a frame that is a second stale.
+        //   depth_ms — how far the played frame sits behind the NEWEST frame
+        //              in the buffer.  For a realtime stream with the sender
+        //              transmitting 2 s ahead, ~2000 ms minus err is healthy.
         if (timing->playout_reports++ % 125 == 0) {
           uint32_t newest_rtp = 0;
           int64_t depth_ms = -1;
@@ -610,78 +600,24 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
                    (long long)depth_ms, (long long)ptp_gap_us, ps.outlier_count,
                    hdr->rtp_timestamp);
         }
-        // First-order IIR: err_filtered += (err - err_filtered) / 16.
-        // At ~125 frames/s this has a time constant of ~0.13 s, long enough
-        // to reject per-frame network jitter but fast enough to track a
-        // real clock offset.
-        timing->drift_err_filtered_us +=
-            (on_time_err_us - timing->drift_err_filtered_us) / DRIFT_FILTER_DIV;
-
-        // Positive filtered error => we are playing EARLY (frame's scheduled
-        // time is still ahead of now) => stretch by duplicating one sample.
-        // Negative => playing LATE => shrink by dropping one sample.
-        if (timing->drift_err_filtered_us > DRIFT_DEADBAND_US) {
-          sample_adjust = 1;
-        } else if (timing->drift_err_filtered_us < -DRIFT_DEADBAND_US) {
-          sample_adjust = -1;
-        }
-
-        if (sample_adjust != 0) {
-          // Credit the correction back to the filter so the servo does not
-          // keep trimming for an error it has already begun to cancel.
-          int64_t corrected_us =
-              (int64_t)sample_adjust * 1000000LL / format->sample_rate;
-          timing->drift_err_filtered_us -= corrected_us;
-          timing->drift_corrections++;
-          if (timing->drift_corrections % 500 == 1) {
-            ESP_LOGI(TAG,
-                     "Drift servo: %+d sample, filtered_err=%lld us, "
-                     "corrections=%" PRIu32,
-                     sample_adjust, (long long)timing->drift_err_filtered_us,
-                     timing->drift_corrections);
-          }
-        }
       }
     }
 
-    // Copy PCM data to output, applying the servo's one-sample trim.
-    // Shrink: copy one sample fewer.  Stretch: copy the frame then repeat
-    // its final sample once.  Both stay within the caller's capacity, which
-    // is at least frame_samples + 1 (see AUDIO_OUT_CHANNELS note above).
-    size_t out_samples = frame_samples;
-    if (sample_adjust < 0 && out_samples > 1) {
-      out_samples--;
-    } else if (sample_adjust > 0 && out_samples + 1 <= samples) {
-      out_samples++;
-    } else {
-      sample_adjust = 0;
-    }
-
-    // The output buffer is interleaved stereo of exactly `samples` frames,
-    // so never write more than AUDIO_OUT_CHANNELS per sample regardless of
-    // what the frame header claims.  `channels` is still used to step
-    // through the SOURCE frame, which was length-validated above against
-    // expected_bytes.
+    // Copy PCM data to output.  The output buffer is interleaved stereo of
+    // exactly `samples` frames, so never write more than AUDIO_OUT_CHANNELS
+    // per sample regardless of what the frame header claims.  `channels` is
+    // still used to step through the SOURCE frame, which was
+    // length-validated above against expected_bytes.
     size_t out_ch =
         channels < AUDIO_OUT_CHANNELS ? channels : AUDIO_OUT_CHANNELS;
-    size_t copy_samples =
-        out_samples < frame_samples ? out_samples : frame_samples;
     if (out_ch == channels) {
-      memcpy(out, pcm, copy_samples * out_ch * sizeof(int16_t));
+      memcpy(out, pcm, frame_samples * out_ch * sizeof(int16_t));
     } else {
       // Source has more channels than we emit — take the leading out_ch.
-      for (size_t i = 0; i < copy_samples; i++) {
+      for (size_t i = 0; i < frame_samples; i++) {
         for (size_t ch = 0; ch < out_ch; ch++) {
           out[i * out_ch + ch] = pcm[i * channels + ch];
         }
-      }
-    }
-    if (out_samples > frame_samples) {
-      // Duplicate the last sample of each channel to stretch by one.
-      const int16_t *last = pcm + (frame_samples - 1) * channels;
-      int16_t *dst = out + frame_samples * out_ch;
-      for (size_t ch = 0; ch < out_ch; ch++) {
-        dst[ch] = last[ch];
       }
     }
 
@@ -701,7 +637,7 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
                was_quick ? " (quick_start)" : "", hdr->rtp_timestamp);
     }
 
-    return out_samples;
+    return frame_samples;
   }
 
   return 0;

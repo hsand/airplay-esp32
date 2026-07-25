@@ -16,3 +16,6 @@ user_platformio.ini
 # macOS metadata
 .DS_Store
 **/.DS_Store
+
+# Merged firmware images built locally for web-flasher use
+/airplay2-receiver-*.bin
