@@ -41,6 +41,21 @@
 #define POS_SERVO_ENGAGE_US     5000 // engage when |filtered err| exceeds this
 #define POS_SERVO_DISENGAGE_US  1500 // disengage when it falls below this
 #define POS_SERVO_TRIM_INTERVAL 4    // one 1-sample trim per this many frames
+// Innovation clamp: cap how far one frame's measurement can move the filter.
+// The per-frame error measurement is NOISY in a one-sided way: the DMA ring
+// holds ~40 ms of queued audio, so when the playback task is briefly starved
+// (WiFi, metadata bursts) the READ happens late and the measurement says
+// "late" — but the audio on the wire never moved; the ring absorbed the
+// delay.  These artifacts are always negative (a delayed read can only
+// measure late), so an unclamped average is dragged below the true position
+// and the servo chases offsets that do not exist.  Observed on hardware:
+// engage/disengage chatter every few seconds with apparent inter-cycle
+// "drift" of 750-1650 ppm — 20-60x anything a crystal can do — alongside
+// single-frame err spikes of -22 ms next to -2 ms readings.  With the clamp,
+// a -22 ms spike moves the filter by at most CLAMP/DIV ~= 94 us, so spike
+// clusters cannot reach the engage threshold, while a REAL standing offset
+// (present on every frame) still walks the filter to engagement in ~0.5 s.
+#define POS_SERVO_INNOV_CLAMP_US 1500
 
 // Every audio output backend (I2S, S/PDIF, USB) allocates its read buffer as
 // (FRAME_SAMPLES + 1) * 2 int16 samples — i.e. interleaved stereo — and the
@@ -656,13 +671,18 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
         }
 
         // Position servo (see POS_SERVO_* above).  Smooth the per-frame
-        // error, engage outside the hysteresis band, trim one sample per
-        // POS_SERVO_TRIM_INTERVAL frames until the error is back inside.
-        // No credit term: a trim changes the real playout position and the
-        // IIR tracks that on its own.
-        timing->pos_err_filtered_us +=
-            (on_time_err_us - timing->pos_err_filtered_us) /
-            POS_SERVO_FILTER_DIV;
+        // error with a clamped-innovation IIR (robust to one-sided
+        // late-read measurement spikes), engage outside the hysteresis
+        // band, trim one sample per POS_SERVO_TRIM_INTERVAL frames until
+        // the error is back inside.  No credit term: a trim changes the
+        // real playout position and the IIR tracks that on its own.
+        int64_t innovation = on_time_err_us - timing->pos_err_filtered_us;
+        if (innovation > POS_SERVO_INNOV_CLAMP_US) {
+          innovation = POS_SERVO_INNOV_CLAMP_US;
+        } else if (innovation < -POS_SERVO_INNOV_CLAMP_US) {
+          innovation = -POS_SERVO_INNOV_CLAMP_US;
+        }
+        timing->pos_err_filtered_us += innovation / POS_SERVO_FILTER_DIV;
 
         int64_t abs_err = timing->pos_err_filtered_us < 0
                               ? -timing->pos_err_filtered_us
