@@ -28,7 +28,13 @@ typedef struct {
   // anchor. Reset whenever a new anchor is set or a late/on-time frame is
   // played.
   int consecutive_early_frames;
-  // Late-frame guard: counts consecutive individually-late frames.  When this
+  // Drift servo state.  drift_err_filtered_us is a smoothed estimate of how
+  // early (positive) or late (negative) on-time frames are actually playing,
+  // used to trim single samples so the local crystal tracks the sender's
+  // clock without ever accumulating enough error to drop a whole frame.
+  // drift_corrections counts applied trims (diagnostics only).
+  int64_t drift_err_filtered_us;
+  uint32_t drift_corrections;
   // Quick-start flag: set after a seek/flush/track-change so that
   // audio_timing_read starts playback with just 1 buffered frame instead of
   // waiting for target_buffer_frames.  Anchor-based timing is used from the
@@ -54,10 +60,19 @@ void audio_timing_set_output_latency(audio_timing_t *timing,
                                      uint32_t latency_us);
 uint32_t audio_timing_get_output_latency(const audio_timing_t *timing);
 uint32_t audio_timing_get_hardware_latency(void);
-// Total advertised latency (output + HW + fixed pipeline processing).
-// Use this for outputLatencyMicros, NOT (output + HW) alone — otherwise the
-// phone schedules sends 15 ms tight and the fill controller will pad
-// silence to compensate for the missing decode/decrypt/net delay.
+// Total end-to-end latency (output target + HW DMA + fixed pipeline delay).
+//
+// DIAGNOSTIC ONLY — do NOT wire this into outputLatencyMicros.
+// rtsp_handlers.c deliberately advertises 0 for both inputLatencyMicros and
+// outputLatencyMicros because compute_early_us() already compensates for the
+// hardware and pipeline delay internally; advertising a non-zero value makes
+// the sender adjust its anchor as well and the delay is applied twice.
+// shairport-sync likewise advertises no audioLatencies.
+//
+// Note also that this figure does not include the sender-driven pre-buffer
+// actually sitting in the jitter buffer during playback (frequently 1.5 s+),
+// so it is not the true end-to-end delay either. Use it for logging and
+// introspection, not for protocol negotiation.
 uint32_t audio_timing_get_advertised_latency(const audio_timing_t *timing);
 void audio_timing_set_anchor(audio_timing_t *timing,
                              const audio_format_t *format, uint64_t clock_id,

@@ -430,7 +430,7 @@ menu "Airplay ESP Configuration"
 
         config AIRPLAY_TIMING_THRESHOLD_MS
             int "Early/late timing threshold for buffered streams (ms)"
-            default 10
+            default 25
             range 2 200
             help
                 Maximum amount a frame may be early or late (in milliseconds)
@@ -438,6 +438,15 @@ menu "Airplay ESP Configuration"
                 it (late). Buffered AirPlay 2 streams (AAC, type 103) have a
                 deep jitter buffer, so a tight threshold keeps tight sync
                 without causing drop-outs.
+
+                This must stay comfortably above the I2S DMA ring's own
+                jitter (about +/-3 ms with the default 8x256 descriptor
+                config) plus PTP filter excursions, otherwise normal
+                scheduling noise crosses the threshold and good audio is
+                discarded. Steady-state accuracy is maintained by the
+                one-sample drift servo rather than by a tight threshold, so
+                lowering this does not improve sync — it only increases the
+                chance of dropouts.
 
         config AIRPLAY_RT_TIMING_THRESHOLD_MS
             int "Early/late timing threshold for unbuffered streams (ms)"

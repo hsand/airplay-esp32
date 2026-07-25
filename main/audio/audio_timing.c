@@ -14,9 +14,26 @@
 // Additional pipeline latency to account for task scheduling, I2S write
 // blocking, and resampler processing.  Without this, frames pass the
 // timing check "on time" but actually exit the speaker several ms later.
-#define PIPELINE_LATENCY_US           5000 // ~5ms scheduling + write delay
-#define MIN_STARTUP_FRAMES            4
-#define DRIFT_ADJUST_THRESHOLD_FRAMES 2
+#define PIPELINE_LATENCY_US 5000 // ~5ms scheduling + write delay
+#define MIN_STARTUP_FRAMES  4
+
+// Drift servo tuning.  DRIFT_FILTER_DIV is the IIR divisor applied to the
+// per-frame timing error; larger = smoother but slower to react.  At ~125
+// frames/s a divisor of 16 gives a ~0.13 s time constant.
+// DRIFT_DEADBAND_US is how far the smoothed error may wander before a
+// one-sample trim is applied.  It must sit well inside the drop threshold
+// (10 ms by default) so the servo corrects long before a frame would be
+// discarded, but comfortably above one sample period (22.7 µs at 44.1 kHz)
+// so the servo is not chasing quantisation noise.
+#define DRIFT_FILTER_DIV  16
+#define DRIFT_DEADBAND_US 1500
+
+// Every audio output backend (I2S, S/PDIF, USB) allocates its read buffer as
+// (FRAME_SAMPLES + 1) * 2 int16 samples — i.e. interleaved stereo — and the
+// output stage is stereo regardless of what an incoming frame header claims.
+// Writes into the caller's buffer must therefore be bounded by this constant,
+// never by hdr->channels.
+#define AUDIO_OUT_CHANNELS 2
 
 // Early/late threshold: how far a frame may be early (held as pending) or late
 // (dropped) before the timing engine acts.  Buffered AirPlay 2 streams have a
@@ -28,7 +45,7 @@
 #ifdef CONFIG_AIRPLAY_TIMING_THRESHOLD_MS
 #define TIMING_THRESHOLD_US (CONFIG_AIRPLAY_TIMING_THRESHOLD_MS * 1000)
 #else
-#define TIMING_THRESHOLD_US 10000 // 10ms. early/late threshold (buffered)
+#define TIMING_THRESHOLD_US 25000 // 25ms early/late threshold (buffered)
 #endif
 
 #ifdef CONFIG_AIRPLAY_RT_TIMING_THRESHOLD_MS
@@ -162,6 +179,8 @@ void audio_timing_reset(audio_timing_t *timing) {
   timing->quick_start = false;
   timing->deferred_flush_pending = false;
   timing->flush_until_ts = 0;
+  timing->drift_err_filtered_us = 0;
+  timing->drift_corrections = 0;
 }
 
 void audio_timing_set_format(audio_timing_t *timing,
@@ -228,6 +247,10 @@ void audio_timing_set_anchor(audio_timing_t *timing,
   // Reset frame counters so pre-buffered audio after a pause/resume or
   // track skip does not accumulate into the new anchor's counts.
   timing->consecutive_early_frames = 0;
+  // The servo's error estimate is relative to the old anchor; a new anchor
+  // redefines the reference, so carrying the old error over would make the
+  // servo trim against a offset that no longer exists.
+  timing->drift_err_filtered_us = 0;
 
   // Compute lead time: how far in the future this anchor's network timestamp
   // is relative to now.  Negative means the anchor is already in the past
@@ -484,8 +507,19 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
               timing->pending_valid = true;
               audio_buffer_return(buffer, item);
             }
-            memset(out, 0, samples * channels * sizeof(int16_t));
-            return samples;
+            // Emit one frame's worth of silence, not the caller's full
+            // capacity.  Callers allocate exactly `samples` stereo frames
+            // (see audio_output.c), so the write must be bounded by
+            // AUDIO_OUT_CHANNELS rather than the frame header's channel
+            // count — a malformed header claiming >2 channels would
+            // otherwise overrun the caller's buffer.  Returning
+            // frame_samples (not `samples`) also keeps the silence path's
+            // output length consistent with the normal playback path, so
+            // holding a frame pending does not advance the output clock
+            // faster than playing one.
+            memset(out, 0,
+                   frame_samples * AUDIO_OUT_CHANNELS * sizeof(int16_t));
+            return frame_samples;
           }
         } else if (early_us < -timing_threshold_us) {
           // Reset consecutive early counter on late/normal frames
@@ -513,8 +547,102 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
     // Frame is on time (or anchor-invalid) — reset counter.
     timing->consecutive_early_frames = 0;
 
-    // Copy PCM data to output
-    memcpy(out, pcm, frame_samples * channels * sizeof(int16_t));
+    // ---- Drift servo -------------------------------------------------
+    // The I2S clock is derived from the local crystal and free-runs against
+    // the sender's PTP timebase.  A typical crystal is off by 10-40 ppm,
+    // which accumulates ~40-140 ms of error per hour.  Without correction
+    // the error walks until it crosses timing_threshold_us and an entire
+    // frame is dropped (or a whole silence period inserted) — an audible
+    // click every few minutes on an otherwise healthy network.
+    //
+    // Instead, track a heavily-smoothed estimate of the on-time error and
+    // trim ONE sample from the frame when it drifts outside a band well
+    // inside the drop threshold.  One sample at 44.1 kHz is 22.7 µs, far
+    // below audibility, and correcting continuously means the error never
+    // reaches the point where a frame has to be discarded.
+    //
+    // Only runs while an anchor is valid and a network clock is locked —
+    // with no reference there is nothing meaningful to servo against.
+    int sample_adjust = 0;
+    if (timing->anchor_valid && sync_mode != SYNC_MODE_NONE &&
+        timing->playout_started) {
+      int64_t on_time_err_us = 0;
+      if (compute_early_us(timing, format, hdr->rtp_timestamp, sync_mode,
+                           &on_time_err_us)) {
+        // First-order IIR: err_filtered += (err - err_filtered) / 16.
+        // At ~125 frames/s this has a time constant of ~0.13 s, long enough
+        // to reject per-frame network jitter but fast enough to track a
+        // real clock offset.
+        timing->drift_err_filtered_us +=
+            (on_time_err_us - timing->drift_err_filtered_us) / DRIFT_FILTER_DIV;
+
+        // Positive filtered error => we are playing EARLY (frame's scheduled
+        // time is still ahead of now) => stretch by duplicating one sample.
+        // Negative => playing LATE => shrink by dropping one sample.
+        if (timing->drift_err_filtered_us > DRIFT_DEADBAND_US) {
+          sample_adjust = 1;
+        } else if (timing->drift_err_filtered_us < -DRIFT_DEADBAND_US) {
+          sample_adjust = -1;
+        }
+
+        if (sample_adjust != 0) {
+          // Credit the correction back to the filter so the servo does not
+          // keep trimming for an error it has already begun to cancel.
+          int64_t corrected_us =
+              (int64_t)sample_adjust * 1000000LL / format->sample_rate;
+          timing->drift_err_filtered_us -= corrected_us;
+          timing->drift_corrections++;
+          if (timing->drift_corrections % 500 == 1) {
+            ESP_LOGI(TAG,
+                     "Drift servo: %+d sample, filtered_err=%lld us, "
+                     "corrections=%" PRIu32,
+                     sample_adjust, (long long)timing->drift_err_filtered_us,
+                     timing->drift_corrections);
+          }
+        }
+      }
+    }
+
+    // Copy PCM data to output, applying the servo's one-sample trim.
+    // Shrink: copy one sample fewer.  Stretch: copy the frame then repeat
+    // its final sample once.  Both stay within the caller's capacity, which
+    // is at least frame_samples + 1 (see AUDIO_OUT_CHANNELS note above).
+    size_t out_samples = frame_samples;
+    if (sample_adjust < 0 && out_samples > 1) {
+      out_samples--;
+    } else if (sample_adjust > 0 && out_samples + 1 <= samples) {
+      out_samples++;
+    } else {
+      sample_adjust = 0;
+    }
+
+    // The output buffer is interleaved stereo of exactly `samples` frames,
+    // so never write more than AUDIO_OUT_CHANNELS per sample regardless of
+    // what the frame header claims.  `channels` is still used to step
+    // through the SOURCE frame, which was length-validated above against
+    // expected_bytes.
+    size_t out_ch =
+        channels < AUDIO_OUT_CHANNELS ? channels : AUDIO_OUT_CHANNELS;
+    size_t copy_samples =
+        out_samples < frame_samples ? out_samples : frame_samples;
+    if (out_ch == channels) {
+      memcpy(out, pcm, copy_samples * out_ch * sizeof(int16_t));
+    } else {
+      // Source has more channels than we emit — take the leading out_ch.
+      for (size_t i = 0; i < copy_samples; i++) {
+        for (size_t ch = 0; ch < out_ch; ch++) {
+          out[i * out_ch + ch] = pcm[i * channels + ch];
+        }
+      }
+    }
+    if (out_samples > frame_samples) {
+      // Duplicate the last sample of each channel to stretch by one.
+      const int16_t *last = pcm + (frame_samples - 1) * channels;
+      int16_t *dst = out + frame_samples * out_ch;
+      for (size_t ch = 0; ch < out_ch; ch++) {
+        dst[ch] = last[ch];
+      }
+    }
 
     // Cleanup
     if (from_pending) {
@@ -532,7 +660,7 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
                was_quick ? " (quick_start)" : "", hdr->rtp_timestamp);
     }
 
-    return frame_samples;
+    return out_samples;
   }
 
   return 0;

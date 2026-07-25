@@ -242,9 +242,24 @@ void audio_output_set_source_rate(int rate) {
 }
 
 uint32_t audio_output_get_hardware_latency_us(void) {
-  return (
-      uint32_t)(((uint64_t)I2S_DMA_DESC_NUM * I2S_DMA_FRAME_NUM * 1000000ULL) /
-                OUTPUT_RATE);
+  // Delay between i2s_channel_write() accepting a sample and that sample
+  // leaving the DAC.  This is the DMA ring occupancy AHEAD of the newly
+  // written data, which is NOT the full ring: i2s_channel_write() blocks
+  // only until space frees, so the writer refills as soon as a descriptor
+  // completes and steady-state occupancy oscillates between
+  // (DESC_NUM - 1) and DESC_NUM descriptors.
+  //
+  // Using the full ring (DESC_NUM) overstates the delay by half a
+  // descriptor on average — 2.9 ms at 44.1 kHz with the config below — and
+  // that bias lands directly in compute_early_us(), pushing every frame
+  // toward the "late" side of the threshold.  Model the midpoint instead:
+  //   (DESC_NUM - 0.5) x FRAME_NUM  ==  (2*DESC_NUM - 1) x FRAME_NUM / 2
+  // The residual +/-2.9 ms swing is real jitter that the drift servo in
+  // audio_timing.c absorbs; only the constant bias is removed here.
+  return (uint32_t)((((uint64_t)(2 * I2S_DMA_DESC_NUM - 1) * I2S_DMA_FRAME_NUM *
+                      1000000ULL) /
+                     2) /
+                    OUTPUT_RATE);
 }
 
 audio_channel_mode_t audio_output_cycle_channel_mode(void) {
