@@ -88,6 +88,13 @@ static struct {
 
   // Asymmetric smoothing state (replaces median ring buffer)
   int64_t previous_offset;
+  // Most recent RAW (unsmoothed) offset sample.  The smoothing filter is
+  // deliberately asymmetric (see SMOOTH_* below), so filtered_offset_ns can
+  // sit a long way from the truth without any existing log revealing it —
+  // every timing figure the firmware prints is derived from the filtered
+  // value, so an error in it is invisible to those figures.  Keeping the raw
+  // sample lets callers compare the two and detect filter divergence.
+  int64_t raw_offset_ns;
   uint32_t previous_offset_time_ms; // 0 = no previous sample yet
   uint32_t mastership_start_ms;     // when continuous tracking began
 
@@ -152,6 +159,9 @@ static void update_offset(int64_t new_offset_ns) {
   uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
   ptp.last_sync_ms = now_ms;
   ptp.sample_count++;
+  // Record the raw sample before any smoothing or outlier rejection, so the
+  // divergence between measured and filtered offset stays observable.
+  ptp.raw_offset_ns = new_offset_ns;
 
   int64_t smoothed_offset;
 
@@ -628,8 +638,12 @@ uint64_t ptp_clock_get_master_clock_id(void) {
 void ptp_clock_get_stats(ptp_stats_t *stats) {
   stats->sync_count = ptp.sync_count;
   stats->followup_count = ptp.followup_count;
-  stats->last_offset_ns = ptp.previous_offset;
+  // last_offset_ns previously reported previous_offset, which is itself a
+  // smoothed value — so it could never reveal filter divergence.  Report the
+  // genuinely raw sample instead.
+  stats->last_offset_ns = ptp.raw_offset_ns;
   stats->filtered_offset_ns = ptp.filtered_offset_ns;
+  stats->outlier_count = ptp.outlier_count;
 
   if (ptp.locked && ptp.lock_start_ms > 0) {
     uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;

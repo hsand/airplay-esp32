@@ -590,11 +590,25 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
                 ((int64_t)(int32_t)(newest_rtp - hdr->rtp_timestamp) * 1000LL) /
                 format->sample_rate;
           }
-          ESP_LOGI(
-              TAG,
-              "Playout: err=%lld ms buffered=%d depth=%lld ms rtp=%" PRIu32,
-              (long long)(on_time_err_us / 1000LL), buffered_frames,
-              (long long)depth_ms, hdr->rtp_timestamp);
+          // PTP filter divergence.  err/lead/depth are all computed THROUGH
+          // filtered_offset_ns, so none of them can reveal an error in that
+          // offset — the device converges perfectly onto a displaced target
+          // and reports err=0 the whole time.  Comparing the filtered offset
+          // against the most recent raw sample is the only independent check
+          // available on-device: the smoothing is deliberately asymmetric
+          // (positive jitter /16, negative clamped and /256), so a filter
+          // that has ratcheted away from reality shows up here as a large
+          // persistent raw-vs-filtered gap.
+          ptp_stats_t ps;
+          ptp_clock_get_stats(&ps);
+          int64_t ptp_gap_us =
+              (ps.last_offset_ns - ps.filtered_offset_ns) / 1000LL;
+          ESP_LOGI(TAG,
+                   "Playout: err=%lld ms buffered=%d depth=%lld ms "
+                   "ptp_gap=%lld us outliers=%" PRIu32 " rtp=%" PRIu32,
+                   (long long)(on_time_err_us / 1000LL), buffered_frames,
+                   (long long)depth_ms, (long long)ptp_gap_us, ps.outlier_count,
+                   hdr->rtp_timestamp);
         }
         // First-order IIR: err_filtered += (err - err_filtered) / 16.
         // At ~125 frames/s this has a time constant of ~0.13 s, long enough
