@@ -38,6 +38,15 @@ typedef struct {
   uint32_t playout_latency_samples;
   // Counts played frames so the periodic playout report can be rate-limited.
   uint32_t playout_reports;
+  // RTP continuity tracking.  expected_rtp is the timestamp the NEXT frame
+  // must carry to be contiguous with what was just played.  A fresh frame
+  // above it means packets were lost and never recovered: the playout gap is
+  // concealed with schedule-length silence instead of skipping ahead (which
+  // would both pop and shift the whole playback position early).  gaps
+  // counts concealed discontinuities (diagnostics).
+  uint32_t expected_rtp;
+  bool expected_rtp_valid;
+  uint32_t gaps;
   // Position servo state (see POS_SERVO_* in audio_timing.c).
   // pos_err_filtered_us: IIR-smoothed playout position error.
   // servo_engaged/servo_phase: hysteresis state and trim rate divider.

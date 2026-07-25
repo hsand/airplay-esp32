@@ -199,6 +199,29 @@ static bool compute_early_us(const audio_timing_t *timing,
   return true;
 }
 
+// Index of the quietest sample in a frame (smallest summed magnitude across
+// the output channels).  Servo trims drop or duplicate exactly one sample;
+// doing that at the frame's quietest point makes the waveform seam
+// inaudible even on loud tonal content, where trimming the frame's last
+// sample regardless of amplitude could produce a faint click.
+static size_t quietest_sample_index(const int16_t *pcm, size_t frame_samples,
+                                    size_t channels, size_t out_ch) {
+  size_t best = frame_samples - 1;
+  int32_t best_mag = INT32_MAX;
+  for (size_t i = 0; i < frame_samples; i++) {
+    int32_t mag = 0;
+    for (size_t ch = 0; ch < out_ch; ch++) {
+      int32_t s = pcm[i * channels + ch];
+      mag += s < 0 ? -s : s;
+    }
+    if (mag < best_mag) {
+      best_mag = mag;
+      best = i;
+    }
+  }
+  return best;
+}
+
 void audio_timing_init(audio_timing_t *timing, size_t pending_capacity) {
   if (!timing) {
     return;
@@ -234,6 +257,7 @@ void audio_timing_reset(audio_timing_t *timing) {
   timing->servo_engaged = false;
   timing->servo_phase = 0;
   timing->servo_trims = 0;
+  timing->expected_rtp_valid = false;
 }
 
 void audio_timing_set_format(audio_timing_t *timing,
@@ -493,6 +517,7 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
         }
         audio_buffer_flush(buffer);
         timing->deferred_flush_pending = false;
+        timing->expected_rtp_valid = false;
         timing->playout_started = false;
         timing->ready_time_us = 0;
         timing->consecutive_early_frames = 0;
@@ -511,6 +536,39 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
     // their scheduled play time, and late frames are dropped.  This mirrors
     // shairport-sync's approach and guarantees the first audible sample is
     // correctly synchronised.
+    // RTP continuity vs the frame just played.  A fresh frame exactly at
+    // expected_rtp is contiguous audio: it can never legitimately need
+    // holding (its schedule slot begins the instant the previous frame
+    // ends), so it bypasses the early-hold entirely — measurement noise can
+    // then never insert silence into an unbroken stream.  A fresh frame
+    // ABOVE expected_rtp means packets were lost and not recovered by the
+    // resend mechanism: conceal the hole by holding the frame to the strict
+    // release, so exactly gap-length silence plays at the right schedule.
+    // Without this, the post-gap frame (typically ~8 ms early, far inside
+    // the 50 ms realtime threshold) played immediately — an audible skip
+    // AND a permanent early shift of the whole playback position for every
+    // unrecovered packet.  Below expected_rtp (duplicate/overlap from a
+    // redundant resend) is treated as continuous: playing it repeats at
+    // most one frame, which keeps the stream moving.
+    bool continuous = false;
+    bool gap = false;
+    if (!from_pending && timing->playout_started &&
+        timing->expected_rtp_valid) {
+      int32_t cont_delta = (int32_t)(hdr->rtp_timestamp - timing->expected_rtp);
+      if (cont_delta > 0) {
+        gap = true;
+        timing->gaps++;
+        ESP_LOGW(TAG,
+                 "Gap: %ld samples (%ld ms) missing before rtp=%" PRIu32
+                 " — concealing with silence (gaps=%" PRIu32 ")",
+                 (long)cont_delta,
+                 (long)(cont_delta * 1000L / format->sample_rate),
+                 hdr->rtp_timestamp, timing->gaps);
+      } else {
+        continuous = true;
+      }
+    }
+
     if (timing->anchor_valid && format->sample_rate > 0) {
       int64_t early_us = 0;
       if (compute_early_us(timing, format, hdr->rtp_timestamp, sync_mode,
@@ -524,12 +582,15 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
         // so the whole session inherits that bias (measured: err pinned at
         // +33..48 ms with the 50 ms realtime threshold).  Releasing at half
         // a frame period centres the startup error at 0 (±4 ms at 44.1 kHz).
+        // Frames following a drop run or a detected RTP gap also use the
+        // strict release, so discontinuity recovery re-locks position
+        // precisely instead of anywhere inside the wide threshold.
         int64_t frame_period_us =
             ((int64_t)frame_samples * 1000000LL) / format->sample_rate;
-        int64_t release_us = (from_pending || dropped_late)
+        int64_t release_us = (from_pending || dropped_late || gap)
                                  ? frame_period_us / 2
                                  : timing_threshold_us;
-        if (early_us > release_us) {
+        if (!continuous && early_us > release_us) {
           // Only advance the stuck-anchor counter for NEW frames taken from
           // the buffer — not for pending re-checks of the same early frame.
           // A pending frame is re-examined every DMA callback (~8 ms) while
@@ -664,10 +725,11 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
               (ps.last_offset_ns - ps.filtered_offset_ns) / 1000LL;
           ESP_LOGI(TAG,
                    "Playout: err=%lld ms buffered=%d depth=%lld ms "
-                   "ptp_gap=%lld us outliers=%" PRIu32 " rtp=%" PRIu32,
+                   "ptp_gap=%lld us outliers=%" PRIu32 " gaps=%" PRIu32
+                   " rtp=%" PRIu32,
                    (long long)(on_time_err_us / 1000LL), buffered_frames,
                    (long long)depth_ms, (long long)ptp_gap_us, ps.outlier_count,
-                   hdr->rtp_timestamp);
+                   timing->gaps, hdr->rtp_timestamp);
         }
 
         // Position servo (see POS_SERVO_* above).  Smooth the per-frame
@@ -727,26 +789,44 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
     // length-validated above against expected_bytes.
     size_t out_ch =
         channels < AUDIO_OUT_CHANNELS ? channels : AUDIO_OUT_CHANNELS;
-    size_t copy_samples =
-        out_samples < frame_samples ? out_samples : frame_samples;
-    if (out_ch == channels) {
-      memcpy(out, pcm, copy_samples * out_ch * sizeof(int16_t));
+    if (out_samples == frame_samples) {
+      if (out_ch == channels) {
+        memcpy(out, pcm, frame_samples * out_ch * sizeof(int16_t));
+      } else {
+        // Source has more channels than we emit — take the leading out_ch.
+        for (size_t i = 0; i < frame_samples; i++) {
+          for (size_t ch = 0; ch < out_ch; ch++) {
+            out[i * out_ch + ch] = pcm[i * channels + ch];
+          }
+        }
+      }
     } else {
-      // Source has more channels than we emit — take the leading out_ch.
-      for (size_t i = 0; i < copy_samples; i++) {
+      // Servo trim: drop or duplicate exactly one sample, placed at the
+      // frame's quietest point so the seam is inaudible.
+      size_t m = quietest_sample_index(pcm, frame_samples, channels, out_ch);
+      size_t o = 0;
+      for (size_t i = 0; i < frame_samples; i++) {
+        if (out_samples < frame_samples && i == m) {
+          continue; // shrink: skip the quietest sample
+        }
         for (size_t ch = 0; ch < out_ch; ch++) {
-          out[i * out_ch + ch] = pcm[i * channels + ch];
+          out[o * out_ch + ch] = pcm[i * channels + ch];
+        }
+        o++;
+        if (out_samples > frame_samples && i == m) {
+          // stretch: duplicate the quietest sample
+          for (size_t ch = 0; ch < out_ch; ch++) {
+            out[o * out_ch + ch] = pcm[i * channels + ch];
+          }
+          o++;
         }
       }
     }
-    if (out_samples > frame_samples) {
-      // Duplicate the last sample of each output channel to stretch by one.
-      const int16_t *last = pcm + (frame_samples - 1) * channels;
-      int16_t *dst = out + frame_samples * out_ch;
-      for (size_t ch = 0; ch < out_ch; ch++) {
-        dst[ch] = last[ch];
-      }
-    }
+
+    // The next contiguous frame starts where this one's SOURCE data ends
+    // (servo trims alter output length, not source consumption).
+    timing->expected_rtp = hdr->rtp_timestamp + hdr->samples_per_channel;
+    timing->expected_rtp_valid = true;
 
     // Cleanup
     if (from_pending) {

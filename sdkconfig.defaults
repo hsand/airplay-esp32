@@ -35,6 +35,17 @@ CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y
 # LWIP - increase socket limits for AirPlay
 CONFIG_LWIP_MAX_SOCKETS=16
 
+# UDP receive queue depth (per socket, in packets).  Realtime AirPlay audio
+# arrives as ~125 UDP packets/s on one socket, and every packet passes
+# through the single lwIP tcpip thread, which it shares with all TCP traffic
+# (web UI, OTA, the built-in speed test).  The default queue of 6 packets is
+# only ~48 ms of audio: any TCP processing burst longer than that overflows
+# the queue and audio packets are dropped ON THE RECEIVER despite perfect
+# WiFi signal — reproducible as pops by running the speed test during
+# playback.  32 packets (~250 ms) rides out such bursts; the cost is a few
+# pointer slots per socket.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
+
 # Enable SO_RCVBUF so the buffered-audio socket can use a small receive
 # buffer.  We do our own jitter buffering in audio_buffer; the kernel
 # should hold no more than a couple of MSS so back-pressure to the
