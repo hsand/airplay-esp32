@@ -462,7 +462,20 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
       int64_t early_us = 0;
       if (compute_early_us(timing, format, hdr->rtp_timestamp, sync_mode,
                            &early_us)) {
-        if (early_us > timing_threshold_us) {
+        // Hold-release point.  A FRESH frame is shelved as pending when it
+        // is more than the (wide, jitter-hysteresis) threshold early.  But a
+        // frame ALREADY pending is re-checked once per frame period (~8 ms),
+        // and must be held until its play time has actually arrived —
+        // releasing it at the threshold instead starts playback up to
+        // threshold_us early, and nothing downstream ever corrects position,
+        // so the whole session inherits that bias (measured: err pinned at
+        // +33..48 ms with the 50 ms realtime threshold).  Releasing at half
+        // a frame period centres the startup error at 0 (±4 ms at 44.1 kHz).
+        int64_t frame_period_us =
+            ((int64_t)frame_samples * 1000000LL) / format->sample_rate;
+        int64_t release_us =
+            from_pending ? frame_period_us / 2 : timing_threshold_us;
+        if (early_us > release_us) {
           // Only advance the stuck-anchor counter for NEW frames taken from
           // the buffer — not for pending re-checks of the same early frame.
           // A pending frame is re-examined every DMA callback (~8 ms) while
