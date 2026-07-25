@@ -56,9 +56,29 @@ static volatile audio_channel_mode_t channel_mode = AUDIO_CHANNEL_STEREO;
 
 static void apply_volume(int16_t *buf, size_t n) {
 #ifndef CONFIG_DAC_CONTROLS_VOLUME
-  int32_t vol = airplay_get_volume_q15();
+  // Ramp toward the target gain instead of applying volume changes
+  // instantly.  An abrupt gain step mid-waveform is a discontinuity scaled
+  // by the signal's current amplitude — the classic volume "zipper" click,
+  // audible on every step of the sender's volume slider.  Approach the
+  // target exponentially, stepping once per stereo frame (even indices) so
+  // both channels always carry the same gain; the /256 divisor gives a
+  // ~3 ms time constant and a worst-case per-frame gain step of ~0.4%,
+  // with a minimum step of 1 so the ramp always completes.
+  static int32_t cur_q15 = -1;
+  int32_t target = airplay_get_volume_q15();
+  if (cur_q15 < 0) {
+    cur_q15 = target; // first call: no audio has played yet, jump silently
+  }
   for (size_t i = 0; i < n; i++) {
-    buf[i] = (int16_t)(((int32_t)buf[i] * vol) >> 15);
+    if ((i & 1) == 0 && cur_q15 != target) {
+      int32_t diff = target - cur_q15;
+      int32_t step = diff / 256;
+      if (step == 0) {
+        step = diff > 0 ? 1 : -1;
+      }
+      cur_q15 += step;
+    }
+    buf[i] = (int16_t)(((int32_t)buf[i] * cur_q15) >> 15);
   }
 #endif
 }
@@ -143,6 +163,13 @@ esp_err_t audio_output_init(void) {
       I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
   chan_cfg.dma_desc_num = I2S_DMA_DESC_NUM;
   chan_cfg.dma_frame_num = I2S_DMA_FRAME_NUM;
+  // Zero each DMA descriptor after it is sent.  Without this, a writer
+  // stall longer than the DMA ring (~46 ms — e.g. an NVS/flash write
+  // disabling the cache, or a CPU burst from the web server) makes the
+  // hardware REPLAY the stale ring contents in a loop: a loud stutter, then
+  // a second discontinuity on recovery.  With auto_clear an underrun
+  // degrades to plain silence.
+  chan_cfg.auto_clear = true;
 
   ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &tx_handle, NULL), TAG,
                       "channel create failed");
