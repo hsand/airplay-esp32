@@ -17,6 +17,31 @@
 #define PIPELINE_LATENCY_US 5000 // ~5ms scheduling + write delay
 #define MIN_STARTUP_FRAMES  4
 
+// Position servo: corrects small standing playout offsets by trimming or
+// duplicating single samples.  Residual position errors arise from
+// drop-recovery after network stalls (bounded by the late threshold) and
+// from crystal drift accumulating between sender and local clock (~10-40
+// ppm, i.e. 40-140 ms/hour) — inside the early/late gate's dead zone nothing
+// else corrects position, so without this a 20 ms post-stall bias persists
+// for the rest of the session (observed on hardware).
+//
+// Control law, and why the earlier (removed) servo failed: that design
+// compared the ABSOLUTE error against a deadband and "credited" each trim
+// back onto the filtered error.  Against the then-undiagnosed 250 ms
+// structural offset the credit was ~1000x weaker than the filter's
+// re-tracking, so it pinned at max authority — a continuous 0.28% stretch.
+// This design has no credit term (trims change reality; the filter simply
+// tracks it), engages only outside POS_SERVO_ENGAGE_US with hysteresis, and
+// is rate-limited to one sample per POS_SERVO_TRIM_INTERVAL frames:
+//   1 / (352 x 4) = 710 ppm = 0.07% pitch deviation (inaudible; JND ~0.2%).
+// Saturation is impossible by construction: the early/late gate bounds any
+// played frame's error to +/-threshold (50 ms realtime), and 50 ms at
+// 710 ppm converges in ~70 s, after which the servo disengages.
+#define POS_SERVO_FILTER_DIV    16   // IIR divisor, ~0.13 s time constant
+#define POS_SERVO_ENGAGE_US     5000 // engage when |filtered err| exceeds this
+#define POS_SERVO_DISENGAGE_US  1500 // disengage when it falls below this
+#define POS_SERVO_TRIM_INTERVAL 4    // one 1-sample trim per this many frames
+
 // Every audio output backend (I2S, S/PDIF, USB) allocates its read buffer as
 // (FRAME_SAMPLES + 1) * 2 int16 samples — i.e. interleaved stereo — and the
 // output stage is stereo regardless of what an incoming frame header claims.
@@ -190,6 +215,10 @@ void audio_timing_reset(audio_timing_t *timing) {
   timing->quick_start = false;
   timing->deferred_flush_pending = false;
   timing->flush_until_ts = 0;
+  timing->pos_err_filtered_us = 0;
+  timing->servo_engaged = false;
+  timing->servo_phase = 0;
+  timing->servo_trims = 0;
 }
 
 void audio_timing_set_format(audio_timing_t *timing,
@@ -360,6 +389,15 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
   // in one pass advances RTP at zero wall-time cost and lets the buffer
   // skip past stale data without the DMA ever idling.
   enum { MAX_DRAIN_ATTEMPTS = 256 };
+  // Set when the drain loop below discards at least one late frame in this
+  // call.  After a drop run, the stream is re-locking onto a new position:
+  // the next playable frame must meet the strict (half frame period) release
+  // rather than the wide jitter threshold, otherwise a discontinuity in the
+  // RTP sequence re-starts playback up to threshold_us early and the bias
+  // persists (observed on hardware: a WiFi stall dropped ~9 frames and left
+  // err parked at +20..31 ms for the rest of the session).
+  bool dropped_late = false;
+
   for (int attempt = 0; attempt < MAX_DRAIN_ATTEMPTS; attempt++) {
     size_t item_size = 0;
     void *item = NULL;
@@ -473,8 +511,9 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
         // a frame period centres the startup error at 0 (±4 ms at 44.1 kHz).
         int64_t frame_period_us =
             ((int64_t)frame_samples * 1000000LL) / format->sample_rate;
-        int64_t release_us =
-            from_pending ? frame_period_us / 2 : timing_threshold_us;
+        int64_t release_us = (from_pending || dropped_late)
+                                 ? frame_period_us / 2
+                                 : timing_threshold_us;
         if (early_us > release_us) {
           // Only advance the stuck-anchor counter for NEW frames taken from
           // the buffer — not for pending re-checks of the same early frame.
@@ -556,6 +595,7 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
           // wall-time cost, skipping past arbitrarily many stale frames in
           // one pass without the DMA ever idling.
           ESP_LOGW(TAG, "Dropping late frame: %lld ms", -early_us / 1000LL);
+          dropped_late = true;
           if (stats) {
             stats->late_frames++;
           }
@@ -573,7 +613,8 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
     // Frame is on time (or anchor-invalid) — reset counter.
     timing->consecutive_early_frames = 0;
 
-    // Playout report (diagnostic), roughly once a second at ~125 frames/s.
+    // Playout report (diagnostic) and position servo.
+    int sample_adjust = 0;
     if (timing->anchor_valid && sync_mode != SYNC_MODE_NONE &&
         timing->playout_started) {
       int64_t on_time_err_us = 0;
@@ -613,7 +654,50 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
                    (long long)depth_ms, (long long)ptp_gap_us, ps.outlier_count,
                    hdr->rtp_timestamp);
         }
+
+        // Position servo (see POS_SERVO_* above).  Smooth the per-frame
+        // error, engage outside the hysteresis band, trim one sample per
+        // POS_SERVO_TRIM_INTERVAL frames until the error is back inside.
+        // No credit term: a trim changes the real playout position and the
+        // IIR tracks that on its own.
+        timing->pos_err_filtered_us +=
+            (on_time_err_us - timing->pos_err_filtered_us) /
+            POS_SERVO_FILTER_DIV;
+
+        int64_t abs_err = timing->pos_err_filtered_us < 0
+                              ? -timing->pos_err_filtered_us
+                              : timing->pos_err_filtered_us;
+        if (!timing->servo_engaged && abs_err > POS_SERVO_ENGAGE_US) {
+          timing->servo_engaged = true;
+          timing->servo_phase = 0;
+          ESP_LOGI(TAG, "Position servo engaged: err=%lld us",
+                   (long long)timing->pos_err_filtered_us);
+        } else if (timing->servo_engaged && abs_err < POS_SERVO_DISENGAGE_US) {
+          timing->servo_engaged = false;
+          ESP_LOGI(TAG, "Position servo disengaged: err=%lld us trims=%" PRIu32,
+                   (long long)timing->pos_err_filtered_us, timing->servo_trims);
+        }
+
+        if (timing->servo_engaged &&
+            ++timing->servo_phase >= POS_SERVO_TRIM_INTERVAL) {
+          timing->servo_phase = 0;
+          // Positive error = playing early = stretch (emit one extra sample)
+          // so playout slows; negative = late = shrink to catch up.
+          sample_adjust = timing->pos_err_filtered_us > 0 ? 1 : -1;
+          timing->servo_trims++;
+        }
       }
+    }
+
+    // Apply the servo's one-sample trim.  Shrink: copy one sample fewer.
+    // Stretch: copy the frame then repeat its final sample once.  The
+    // stretch stays within the caller's capacity (`samples` frames, which
+    // is FRAME_SAMPLES + 1 in every output backend).
+    size_t out_samples = frame_samples;
+    if (sample_adjust < 0 && out_samples > 1) {
+      out_samples--;
+    } else if (sample_adjust > 0 && out_samples + 1 <= samples) {
+      out_samples++;
     }
 
     // Copy PCM data to output.  The output buffer is interleaved stereo of
@@ -623,14 +707,24 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
     // length-validated above against expected_bytes.
     size_t out_ch =
         channels < AUDIO_OUT_CHANNELS ? channels : AUDIO_OUT_CHANNELS;
+    size_t copy_samples =
+        out_samples < frame_samples ? out_samples : frame_samples;
     if (out_ch == channels) {
-      memcpy(out, pcm, frame_samples * out_ch * sizeof(int16_t));
+      memcpy(out, pcm, copy_samples * out_ch * sizeof(int16_t));
     } else {
       // Source has more channels than we emit — take the leading out_ch.
-      for (size_t i = 0; i < frame_samples; i++) {
+      for (size_t i = 0; i < copy_samples; i++) {
         for (size_t ch = 0; ch < out_ch; ch++) {
           out[i * out_ch + ch] = pcm[i * channels + ch];
         }
+      }
+    }
+    if (out_samples > frame_samples) {
+      // Duplicate the last sample of each output channel to stretch by one.
+      const int16_t *last = pcm + (frame_samples - 1) * channels;
+      int16_t *dst = out + frame_samples * out_ch;
+      for (size_t ch = 0; ch < out_ch; ch++) {
+        dst[ch] = last[ch];
       }
     }
 
@@ -650,7 +744,7 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
                was_quick ? " (quick_start)" : "", hdr->rtp_timestamp);
     }
 
-    return frame_samples;
+    return out_samples;
   }
 
   return 0;

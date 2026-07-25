@@ -38,6 +38,14 @@ typedef struct {
   uint32_t playout_latency_samples;
   // Counts played frames so the periodic playout report can be rate-limited.
   uint32_t playout_reports;
+  // Position servo state (see POS_SERVO_* in audio_timing.c).
+  // pos_err_filtered_us: IIR-smoothed playout position error.
+  // servo_engaged/servo_phase: hysteresis state and trim rate divider.
+  // servo_trims: total single-sample corrections applied (diagnostics).
+  int64_t pos_err_filtered_us;
+  bool servo_engaged;
+  uint8_t servo_phase;
+  uint32_t servo_trims;
   // Quick-start flag: set after a seek/flush/track-change so that
   // audio_timing_read starts playback with just 1 buffered frame instead of
   // waiting for target_buffer_frames.  Anchor-based timing is used from the
