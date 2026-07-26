@@ -261,6 +261,42 @@ bool audio_buffer_peek_newest_rtp(audio_buffer_t *buffer, uint32_t *rtp_out) {
   return found;
 }
 
+/* ---------- start of the contiguous tail run (diagnostics/startup) ----- */
+
+bool audio_buffer_bulk_start_rtp(audio_buffer_t *buffer, uint32_t *rtp_out) {
+  if (!buffer || !rtp_out || !buffer->pool || !buffer->sorted) {
+    return false;
+  }
+
+  bool found = false;
+  portENTER_CRITICAL(&buffer->lock);
+  if (buffer->count > 0) {
+    /* Walk backward from the newest frame until the run breaks.  The
+     * result is the first frame of the contiguous region that includes
+     * the newest data — the "real" stream head, as opposed to stale
+     * islands (e.g. late pre-flush retransmissions) stranded below it. */
+    uint16_t slot = buffer->sorted[buffer->count - 1];
+    const audio_frame_header_t *cur =
+        (const audio_frame_header_t *)(buffer->pool +
+                                       (size_t)slot * buffer->slot_size);
+    uint32_t bulk = cur->rtp_timestamp;
+    for (int i = buffer->count - 1; i > 0; i--) {
+      uint16_t pslot = buffer->sorted[i - 1];
+      const audio_frame_header_t *prev =
+          (const audio_frame_header_t *)(buffer->pool +
+                                         (size_t)pslot * buffer->slot_size);
+      if (prev->rtp_timestamp + prev->samples_per_channel != bulk) {
+        break;
+      }
+      bulk = prev->rtp_timestamp;
+    }
+    *rtp_out = bulk;
+    found = true;
+  }
+  portEXIT_CRITICAL(&buffer->lock);
+  return found;
+}
+
 /* ---------- nearly full check (for back-pressure) ---------- */
 
 bool audio_buffer_is_nearly_full(audio_buffer_t *buffer) {

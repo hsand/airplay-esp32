@@ -436,6 +436,8 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
   // persists (observed on hardware: a WiFi stall dropped ~9 frames and left
   // err parked at +20..31 ms for the rest of the session).
   bool dropped_late = false;
+  // Stale start-island frames skipped in this call (see the check below).
+  int start_skips = 0;
 
   for (int attempt = 0; attempt < MAX_DRAIN_ATTEMPTS; attempt++) {
     size_t item_size = 0;
@@ -525,6 +527,43 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
         // as soon as 1 frame arrives, with normal anchor timing applied.
         timing->quick_start = true;
         return 0;
+      }
+    }
+
+    // Stale start-island rejection.  A stream start (fresh or post-flush)
+    // can leave a small ISLAND of stale frames stranded at the head of the
+    // buffer, separated from the real stream by a large hole — typically
+    // late retransmissions answering NACKs from before the flush, which
+    // arrive after the RTP gates re-arm and fall inside their 10 s window.
+    // Starting playout from such an island plays a ~100 ms blip of audio,
+    // then the hole (concealed as silence), then the track — an audible pop
+    // at every affected stream start (observed on hardware: a 14-frame
+    // island followed by an 830 ms hole on a track change).  Until playout
+    // has started, skip any frame that sits more than ~100 ms below the
+    // start of the contiguous run that ends at the newest received frame:
+    // the discarded audio is stale by definition, and the real stream still
+    // starts at exactly its scheduled instant via the early-hold.
+    if (!timing->playout_started && format->sample_rate > 0) {
+      uint32_t bulk_rtp = 0;
+      if (audio_buffer_bulk_start_rtp(buffer, &bulk_rtp)) {
+        int32_t behind = (int32_t)(bulk_rtp - hdr->rtp_timestamp);
+        if (behind > (int32_t)(format->sample_rate / 10)) {
+          start_skips++;
+          if (from_pending) {
+            timing->pending_valid = false;
+            timing->pending_frame_len = 0;
+          } else {
+            audio_buffer_return(buffer, item);
+          }
+          continue;
+        }
+      }
+      if (start_skips > 0) {
+        ESP_LOGI(TAG,
+                 "Skipped %d stale start frame(s); contiguous stream begins "
+                 "at rtp=%" PRIu32,
+                 start_skips, hdr->rtp_timestamp);
+        start_skips = 0;
       }
     }
 
