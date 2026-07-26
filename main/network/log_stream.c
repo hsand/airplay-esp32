@@ -24,7 +24,6 @@
 #define LOG_RING_SIZE 8192
 #define LOG_RING_MASK (LOG_RING_SIZE - 1)
 
-#define MAX_WS_CLIENTS        3
 #define BROADCAST_TASK_STACK  4096
 #define BROADCAST_INTERVAL_MS 100
 #define MAX_SEND_CHUNK        1024
@@ -35,9 +34,6 @@ static volatile size_t s_tail; /* next read position   */
 static SemaphoreHandle_t s_mutex;
 
 static httpd_handle_t s_server;
-static int s_clients[MAX_WS_CLIENTS];
-static int s_client_count;
-static SemaphoreHandle_t s_client_mutex;
 
 static vprintf_like_t s_orig_vprintf;
 
@@ -106,29 +102,18 @@ static int log_vprintf_hook(const char *fmt, va_list args) {
 /* ------------------------------------------------------------------ */
 
 static esp_err_t ws_log_handler(httpd_req_t *req) {
-  if (req->method == HTTP_GET) {
-    /* Handshake — register this socket. */
-    int fd = httpd_req_to_sockfd(req);
-    if (xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      if (s_client_count < MAX_WS_CLIENTS) {
-        s_clients[s_client_count++] = fd;
-        xSemaphoreGive(s_client_mutex);
-        ESP_LOGI("log_stream", "WebSocket client connected (fd=%d, total=%d)",
-                 fd, s_client_count);
-      } else {
-        xSemaphoreGive(s_client_mutex);
-        ESP_LOGW("log_stream", "Max WebSocket clients reached, rejecting fd=%d",
-                 fd);
-        return ESP_FAIL;
-      }
-    } else {
-      ESP_LOGW("log_stream", "Client mutex timeout, rejecting fd=%d", fd);
-      return ESP_FAIL;
-    }
-    return ESP_OK;
-  }
-
-  /* We only stream logs out; ignore any incoming frames. */
+  /* On ESP-IDF >= 5.x the server completes the WebSocket handshake
+   * internally and does NOT invoke this handler for the handshake GET
+   * (httpd_uri.c: "If the request is websocket handshake, then do not
+   * call the uri->handler").  Clients are therefore not tracked here at
+   * all — the broadcast task discovers active WebSocket sessions each
+   * tick via httpd_get_client_list()/httpd_ws_get_fd_info().  An earlier
+   * version registered clients from a handshake-time HTTP_GET call that
+   * never happens on this IDF, so the viewer connected successfully but
+   * never received a single frame.
+   *
+   * This handler now only runs for incoming data frames, which a log
+   * viewer does not send; drain and ignore them. */
   httpd_ws_frame_t frame = {.type = HTTPD_WS_TYPE_TEXT};
   return httpd_ws_recv_frame(req, &frame, 0);
 }
@@ -137,13 +122,6 @@ static esp_err_t ws_log_handler(httpd_req_t *req) {
 /*  Broadcast task                                                     */
 /* ------------------------------------------------------------------ */
 
-static void remove_client(int index) {
-  if (index < s_client_count - 1) {
-    s_clients[index] = s_clients[s_client_count - 1];
-  }
-  s_client_count--;
-}
-
 static void broadcast_task(void *arg) {
   (void)arg;
   char buf[MAX_SEND_CHUNK];
@@ -151,8 +129,25 @@ static void broadcast_task(void *arg) {
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(BROADCAST_INTERVAL_MS));
 
-    if (s_client_count == 0) {
+    /* Discover active WebSocket sessions fresh each tick.  No connect-time
+     * registration (see ws_log_handler) and no stale-fd list: a client
+     * that disconnected simply stops appearing here, so log frames can
+     * never be sent to a reused fd now serving an unrelated request. */
+    int fds[CONFIG_LWIP_MAX_SOCKETS];
+    size_t fd_count = CONFIG_LWIP_MAX_SOCKETS;
+    if (httpd_get_client_list(s_server, &fd_count, fds) != ESP_OK) {
       continue;
+    }
+
+    int ws_fds[CONFIG_LWIP_MAX_SOCKETS];
+    size_t ws_count = 0;
+    for (size_t i = 0; i < fd_count; i++) {
+      if (httpd_ws_get_fd_info(s_server, fds[i]) == HTTPD_WS_CLIENT_WEBSOCKET) {
+        ws_fds[ws_count++] = fds[i];
+      }
+    }
+    if (ws_count == 0) {
+      continue; /* leave data in the ring as backlog for the next viewer */
     }
 
     size_t len = 0;
@@ -170,17 +165,14 @@ static void broadcast_task(void *arg) {
         .len = len,
     };
 
-    if (xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      for (int i = s_client_count - 1; i >= 0; i--) {
-        esp_err_t err =
-            httpd_ws_send_frame_async(s_server, s_clients[i], &frame);
-        if (err != ESP_OK) {
-          ESP_LOGW("log_stream", "Dropping WebSocket client fd=%d: %s",
-                   s_clients[i], esp_err_to_name(err));
-          remove_client(i);
-        }
+    for (size_t i = 0; i < ws_count; i++) {
+      esp_err_t err = httpd_ws_send_frame_async(s_server, ws_fds[i], &frame);
+      if (err != ESP_OK) {
+        /* Session is closing; httpd cleans it up and it will no longer
+         * be listed on the next tick. */
+        ESP_LOGD("log_stream", "WS send to fd=%d failed: %s", ws_fds[i],
+                 esp_err_to_name(err));
       }
-      xSemaphoreGive(s_client_mutex);
     }
   }
 }
@@ -206,12 +198,6 @@ esp_err_t log_stream_init(void) {
   }
 
   s_head = s_tail = 0;
-  s_client_count = 0;
-
-  s_client_mutex = xSemaphoreCreateMutex();
-  if (!s_client_mutex) {
-    return ESP_ERR_NO_MEM;
-  }
 
   /* Hook into esp_log — keep the original so UART output continues. */
   s_orig_vprintf = esp_log_set_vprintf(log_vprintf_hook);
