@@ -597,12 +597,22 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
       if (cont_delta > 0) {
         gap = true;
         timing->gaps++;
-        ESP_LOGW(TAG,
-                 "Gap: %ld samples (%ld ms) missing before rtp=%" PRIu32
-                 " — concealing with silence (gaps=%" PRIu32 ")",
-                 (long)cont_delta,
-                 (long)(cont_delta * 1000L / format->sample_rate),
-                 hdr->rtp_timestamp, timing->gaps);
+        // Rate-limited: a burst of separate holes must not throttle this
+        // path with blocking log writes.
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - timing->last_gap_log_us > 250000) {
+          ESP_LOGW(TAG,
+                   "Gap: %ld samples (%ld ms) missing before rtp=%" PRIu32
+                   " — concealing with silence (gaps=%" PRIu32 ", +%" PRIu32
+                   " unlogged)",
+                   (long)cont_delta,
+                   (long)(cont_delta * 1000L / format->sample_rate),
+                   hdr->rtp_timestamp, timing->gaps, timing->gaps_suppressed);
+          timing->last_gap_log_us = now_us;
+          timing->gaps_suppressed = 0;
+        } else {
+          timing->gaps_suppressed++;
+        }
       } else {
         continuous = true;
       }
@@ -708,9 +718,36 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
           // Late frame — drop it and continue draining within the SAME call.
           // The 256-attempt drain loop chews through stale frames at zero
           // wall-time cost, skipping past arbitrarily many stale frames in
-          // one pass without the DMA ever idling.
-          ESP_LOGW(TAG, "Dropping late frame: %lld ms", -early_us / 1000LL);
+          // one pass without the DMA ever idling.  "Zero wall-time" is only
+          // true if this path does not log per frame: a blocking warning
+          // per drop throttled the drain to ~5 ms/frame — barely faster
+          // than realtime — turning every stream change with a deep stale
+          // buffer (buffered radio holds ~5 s) into seconds of stalled
+          // audio.  Log at most one line per 250 ms with a suppressed
+          // count.
           dropped_late = true;
+          int64_t now_us = esp_timer_get_time();
+          if (now_us - timing->last_drop_log_us > 250000) {
+            ESP_LOGW(TAG, "Dropping late frame: %lld ms (+%" PRIu32 " more)",
+                     -early_us / 1000LL, timing->drops_suppressed);
+            timing->last_drop_log_us = now_us;
+            timing->drops_suppressed = 0;
+          } else {
+            timing->drops_suppressed++;
+          }
+          // A dropped frame is consumed from the RTP sequence just like a
+          // played one: advance the continuity marker past it (forward
+          // only).  Without this, expected_rtp froze at the last PLAYED
+          // frame during a drain, so every subsequent contiguous stale
+          // frame was miscounted as a fresh loss — one field device
+          // accumulated gaps=22230 from station changes alone, each
+          // phantom gap adding a second blocking log line to the drain.
+          uint32_t drop_next = hdr->rtp_timestamp + hdr->samples_per_channel;
+          if (!timing->expected_rtp_valid ||
+              (int32_t)(drop_next - timing->expected_rtp) > 0) {
+            timing->expected_rtp = drop_next;
+            timing->expected_rtp_valid = true;
+          }
           if (stats) {
             stats->late_frames++;
           }
@@ -863,9 +900,15 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
     }
 
     // The next contiguous frame starts where this one's SOURCE data ends
-    // (servo trims alter output length, not source consumption).
-    timing->expected_rtp = hdr->rtp_timestamp + hdr->samples_per_channel;
-    timing->expected_rtp_valid = true;
+    // (servo trims alter output length, not source consumption).  Forward
+    // only: playing a duplicate (redundant resend) must not rewind the
+    // marker, which would misread the following real frame as a gap.
+    uint32_t play_next = hdr->rtp_timestamp + hdr->samples_per_channel;
+    if (!timing->expected_rtp_valid ||
+        (int32_t)(play_next - timing->expected_rtp) > 0) {
+      timing->expected_rtp = play_next;
+      timing->expected_rtp_valid = true;
+    }
 
     // Cleanup
     if (from_pending) {

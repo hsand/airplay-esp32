@@ -47,6 +47,14 @@ typedef struct {
   uint32_t expected_rtp;
   bool expected_rtp_valid;
   uint32_t gaps;
+  // Rate limiting for the drain-path warning logs.  Logging is blocking
+  // (UART + ring mutex), so unthrottled per-frame warnings slow the
+  // late-frame drain loop to roughly realtime — turning a stream change
+  // with a deep stale buffer into seconds of stalled audio.
+  int64_t last_drop_log_us;
+  uint32_t drops_suppressed;
+  int64_t last_gap_log_us;
+  uint32_t gaps_suppressed;
   // Position servo state (see POS_SERVO_* in audio_timing.c).
   // pos_err_filtered_us: IIR-smoothed playout position error.
   // servo_engaged/servo_phase: hysteresis state and trim rate divider.
