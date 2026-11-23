@@ -7,6 +7,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 
 typedef int esp_err_t;
 #define ESP_OK                0
@@ -19,9 +21,10 @@ void mock_log(const char *tag, const char *format, ...);
 #define ESP_LOGI mock_log
 #define ESP_LOGD mock_log
 
-// Time is whatever the test says it is.
-extern uint32_t mock_now_ms;
-#define esp_timer_get_time() ((int64_t)mock_now_ms * 1000)
+// Time is whatever the test says it is (the board's esp_timer, in us; the
+// millisecond tick count is derived from it and wraps like the real one).
+extern int64_t mock_now_us;
+#define esp_timer_get_time() (mock_now_us)
 
 // A real host mutex makes the packet/session concurrency stress test useful.
 typedef pthread_mutex_t portMUX_TYPE;
@@ -32,13 +35,14 @@ void mock_exit_critical(portMUX_TYPE *mux);
 #define portEXIT_CRITICAL(mux)  mock_exit_critical(mux)
 
 typedef int BaseType_t;
+typedef unsigned UBaseType_t;
 typedef uint32_t TickType_t;
 typedef void *TaskHandle_t;
 typedef void (*TaskFunction_t)(void *);
 #define pdPASS              1
 #define portTICK_PERIOD_MS  1
 #define pdMS_TO_TICKS(ms)   (ms)
-#define xTaskGetTickCount() ((TickType_t)mock_now_ms)
+#define xTaskGetTickCount() ((TickType_t)(mock_now_us / 1000))
 #define vTaskDelay(ticks)   ((void)(ticks))
 #define vTaskDelete(handle) ((void)(handle))
 
@@ -49,3 +53,11 @@ BaseType_t task_create_spiram(TaskFunction_t fn, const char *name,
                               uint32_t depth, void *param, int prio,
                               TaskHandle_t *handle, spiram_task_mem_t *mem);
 void task_free_spiram(spiram_task_mem_t *mem);
+
+#define ESP_MAC_WIFI_STA 0
+esp_err_t esp_read_mac(uint8_t *mac, int type);
+
+// Delay_Reqs are captured by the test.
+ssize_t mock_sendto(int fd, const void *buf, size_t len, int flags,
+                    const struct sockaddr *dst, socklen_t dst_len);
+#define sendto mock_sendto

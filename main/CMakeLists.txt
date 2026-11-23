@@ -156,6 +156,15 @@ idf_component_register(
     PRIV_REQUIRES ${DEPS}
 )
 
+# Timestamp PTP SYNCs in lwIP's IPv4 input (the tcpip thread), ahead of the
+# socket mailbox and the PTP task's wake-up.  ESP-IDF's documented way to add
+# a custom lwIP hook: the header defines LWIP_HOOK_IP4_INPUT, the function
+# lives in network/ptp_clock.c.  Without it the clock stamps in task context.
+idf_component_get_property(lwip_lib lwip COMPONENT_LIB)
+target_include_directories(${lwip_lib} PRIVATE "${COMPONENT_DIR}/network")
+target_compile_definitions(${lwip_lib} PRIVATE
+    "ESP_IDF_LWIP_HOOK_FILENAME=\"ptp_lwip_hook.h\"")
+
 # Enable function wrapping for abort() to intercept panics and mute GPIO
 if(CONFIG_BOARD_SQUEEZEAMP_COMMON)
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=abort")
