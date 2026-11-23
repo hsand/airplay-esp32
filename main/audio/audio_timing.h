@@ -17,7 +17,8 @@
  * which computes position from the RTP-addressed timeline instead of
  * discovering it, so what is left here is the state the RTSP layer sets and
  * the engine reads: the sender's anchor, the latency figures advertised in
- * SETUP, and the deferred-flush handshake. */
+ * SETUP.  FLUSHBUFFERED lives in audio_flush_queue.c, keyed on sequence
+ * numbers. */
 typedef struct {
   uint32_t output_latency_us;
   bool playing;
@@ -27,20 +28,14 @@ typedef struct {
   int64_t anchor_local_time_ns;
   bool ptp_locked;
   // Stream playout latency in samples, added to every frame's scheduled
-  // play time.  Realtime streams (type 96): the anchor maps RTP onto the
-  // sender's source timeline and playout happens latencyMin samples later
-  // (11025 = 250 ms unless SETUP says otherwise).  Buffered streams
-  // (type 103): 0 — the anchor is the play time.  Set at stream SETUP;
+  // play time: the sender's latency from the stream SETUP, audioLatencyMs if
+  // present, else latencyMin.  Realtime streams default to 11025 (250 ms)
+  // without one; buffered streams to 0, as Apple's receiver does.  The
+  // platform half of Apple's (sender - platform) latency is already in the
+  // output instant the playback task converts.  Set at stream SETUP;
   // survives audio_timing_reset() because it is stream configuration, not
   // playback state.
   uint32_t playout_latency_samples;
-  // Deferred flush (AirPlay 2 FLUSHBUFFERED with flushFromSeq present):
-  // keep playing until a frame with rtp_timestamp >= flush_until_ts arrives,
-  // then bulk-flush and start fresh.  Written by the RTSP task, read by the
-  // DMA callback task.  Aligned 32-bit + bool — atomic on Xtensa without a
-  // mutex (write flush_until_ts first, arm bool second; read bool first).
-  bool deferred_flush_pending;
-  uint32_t flush_until_ts;
 } audio_timing_t;
 
 void audio_timing_init(audio_timing_t *timing);
@@ -70,10 +65,3 @@ void audio_timing_set_anchor(audio_timing_t *timing,
                              const audio_format_t *format, uint64_t clock_id,
                              uint64_t network_time_ns, uint32_t rtp_time);
 void audio_timing_set_playing(audio_timing_t *timing, bool playing);
-
-// Consume a pending deferred flush if `timestamp` has reached the boundary.
-// Returns true exactly once per armed flush and stores the boundary in
-// *flush_until_ts.  Applied by the decode task as the frames go past.
-bool audio_timing_take_deferred_flush(audio_timing_t *timing,
-                                      uint32_t timestamp,
-                                      uint32_t *flush_until_ts);

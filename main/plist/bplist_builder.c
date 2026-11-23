@@ -768,3 +768,103 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
 
   return pos;
 }
+
+size_t bplist_build_session_setup(uint8_t *out, size_t capacity,
+                                  uint16_t event_port, const char *address,
+                                  const char *peer_id) {
+  if (!out || !address || !peer_id || capacity < sizeof(BPLIST_MAGIC)) {
+    return 0;
+  }
+  /* Objects, in order:
+   *  0 "eventPort"   1 "timingPort"   2 "timingPeerInfo"
+   *  3 event_port    4 0
+   *  5 "Addresses"   6 "ID"           7 address   8 [7]   9 peer_id
+   * 10 {5: 8, 6: 9}
+   * 11 {0: 3, 1: 4, 2: 10}  (top) */
+  enum { OBJECTS = 12 };
+  size_t offsets[OBJECTS];
+  size_t obj = 0;
+  size_t pos = 0;
+  memcpy(out, BPLIST_MAGIC, sizeof(BPLIST_MAGIC));
+  pos += sizeof(BPLIST_MAGIC);
+
+  static const char *const strings[] = {"eventPort", "timingPort",
+                                        "timingPeerInfo"};
+  for (size_t i = 0; i < 3; i++) {
+    offsets[obj++] = pos;
+    if (!bplist_write_ascii_string(out, capacity, &pos, strings[i])) {
+      return 0;
+    }
+  }
+  offsets[obj++] = pos;
+  if (!bplist_write_int(out, capacity, &pos, event_port)) {
+    return 0;
+  }
+  offsets[obj++] = pos;
+  if (!bplist_write_int(out, capacity, &pos, 0)) {
+    return 0;
+  }
+  offsets[obj++] = pos;
+  if (!bplist_write_ascii_string(out, capacity, &pos, "Addresses")) {
+    return 0;
+  }
+  offsets[obj++] = pos;
+  if (!bplist_write_ascii_string(out, capacity, &pos, "ID")) {
+    return 0;
+  }
+  offsets[obj++] = pos;
+  if (!bplist_write_utf8_string(out, capacity, &pos, address)) {
+    return 0;
+  }
+  static const uint8_t address_list[] = {7};
+  offsets[obj++] = pos;
+  if (!bplist_write_array(out, capacity, &pos, address_list, 1)) {
+    return 0;
+  }
+  offsets[obj++] = pos;
+  if (!bplist_write_utf8_string(out, capacity, &pos, peer_id)) {
+    return 0;
+  }
+  static const uint8_t info_keys[] = {5, 6};
+  static const uint8_t info_values[] = {8, 9};
+  offsets[obj++] = pos;
+  if (!bplist_write_dict(out, capacity, &pos, info_keys, info_values, 2)) {
+    return 0;
+  }
+  static const uint8_t top_keys[] = {0, 1, 2};
+  static const uint8_t top_values[] = {3, 4, 10};
+  offsets[obj++] = pos;
+  if (!bplist_write_dict(out, capacity, &pos, top_keys, top_values, 3) ||
+      !bplist_finish(out, capacity, &pos, offsets, obj, obj - 1U)) {
+    return 0;
+  }
+  return pos;
+}
+
+size_t bplist_build_status(uint8_t *out, size_t capacity, int64_t status) {
+  if (!out || capacity < sizeof(BPLIST_MAGIC)) {
+    return 0;
+  }
+  size_t offsets[3];
+  size_t pos = 0;
+  memcpy(out, BPLIST_MAGIC, sizeof(BPLIST_MAGIC));
+  pos += sizeof(BPLIST_MAGIC);
+  offsets[0] = pos;
+  if (!bplist_write_ascii_string(out, capacity, &pos, "status")) {
+    return 0;
+  }
+  offsets[1] = pos;
+  /* A negative OSStatus goes out as the 8-byte two's complement, which is
+   * how a binary plist stores any negative integer. */
+  if (!bplist_write_int(out, capacity, &pos, (uint64_t)status)) {
+    return 0;
+  }
+  static const uint8_t keys[] = {0};
+  static const uint8_t values[] = {1};
+  offsets[2] = pos;
+  if (!bplist_write_dict(out, capacity, &pos, keys, values, 1) ||
+      !bplist_finish(out, capacity, &pos, offsets, 3, 2)) {
+    return 0;
+  }
+  return pos;
+}

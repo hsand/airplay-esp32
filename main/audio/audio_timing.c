@@ -17,7 +17,7 @@
 // Additional pipeline latency to account for task scheduling, I2S write
 // blocking, and resampler processing.  Without this, frames pass the
 // timing check "on time" but actually exit the speaker several ms later.
-#define PIPELINE_LATENCY_US 5000 // ~5ms scheduling + write delay
+#define PIPELINE_LATENCY_US CONFIG_AUDIO_OUTPUT_EXTRA_LATENCY_US
 
 static const char *TAG = "audio_time";
 
@@ -37,8 +37,6 @@ void audio_timing_reset(audio_timing_t *timing) {
   }
 
   timing->anchor_valid = false;
-  timing->deferred_flush_pending = false;
-  timing->flush_until_ts = 0;
 }
 
 void audio_timing_set_output_latency(audio_timing_t *timing,
@@ -104,9 +102,14 @@ void audio_timing_set_anchor(audio_timing_t *timing,
   // is relative to now.  Negative means the anchor is already in the past
   // (normal: the phone pre-buffers and the anchor is 200–800 ms old by the
   // time we receive it).
-  int64_t lead_ms = ((int64_t)network_time_ns -
-                     (int64_t)(ptp_clock_get_offset_ns() + now_ns)) /
-                    1000000LL;
+  // Lead time through the anchor's own timeline, so a lead is never computed
+  // against an offset of 0.  Diagnostic only.
+  uint64_t now_network = 0;
+  uint64_t timeline = 0;
+  int64_t lead_ms = 0;
+  if (ptp_clock_local_to_network(now_ns, &now_network, &timeline)) {
+    lead_ms = ((int64_t)network_time_ns - (int64_t)now_network) / 1000000LL;
+  }
   ESP_LOGI(TAG, "Anchor set: rtp=%" PRIu32 " lead=%lld ms ptp_locked=%d",
            rtp_time, (long long)lead_ms, timing->ptp_locked);
 }
@@ -120,30 +123,4 @@ void audio_timing_set_playing(audio_timing_t *timing, bool playing) {
            playing ? "playing" : "paused");
 
   timing->playing = playing;
-}
-
-bool audio_timing_take_deferred_flush(audio_timing_t *timing,
-                                      uint32_t timestamp,
-                                      uint32_t *flush_until_ts) {
-  if (!timing || !timing->deferred_flush_pending) {
-    return false;
-  }
-
-  const uint32_t until = timing->flush_until_ts;
-  // Signed 32-bit subtraction handles RTP wraparound correctly.
-  if ((int32_t)(timestamp - until) < 0) {
-    return false;
-  }
-
-  // Test-and-clear: the RTSP task can re-arm at any moment, and only the
-  // caller that observes the transition may act on it.
-  if (!__atomic_exchange_n(&timing->deferred_flush_pending, false,
-                           __ATOMIC_SEQ_CST)) {
-    return false;
-  }
-
-  if (flush_until_ts) {
-    *flush_until_ts = until;
-  }
-  return true;
 }

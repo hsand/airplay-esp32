@@ -68,6 +68,32 @@ typedef struct {
   uint32_t drift_step_fade_in;  /* frames of the fade back in, 0 if none */
   uint32_t drift_step_faded_in; /* ...and how many of them have played */
   uint32_t drift_steps;
+  /* How long the step condition has held, in rendered frames, and the span
+   * of the clock offset over that window.  A step is only taken while the
+   * clock held still: an error the clock made comes back out by itself. */
+  uint32_t drift_step_confirm_frames;
+  int64_t drift_step_offset_min_ns;
+  int64_t drift_step_offset_max_ns;
+  uint32_t drift_step_clock_deferrals;
+  /* Network minus local time at the output instant of this render, as the
+   * caller converted it, or invalid when it could not say. */
+  bool clock_offset_valid;
+  int64_t clock_offset_ns;
+  /* The previous render's offset, and how many more frames the servo holds
+   * still after the offset jumped. */
+  bool last_clock_offset_valid;
+  int64_t last_clock_offset_ns;
+  uint32_t servo_hold_frames;
+  uint32_t servo_holds;
+  /* Set by a new anchor that moved the timeline under a playing stream: the
+   * first measurement after it puts playout where the anchor says at once
+   * (Apple re-sets its offset on the first measurement after an anchor). */
+  bool anchor_reset_pending;
+  uint32_t anchor_resets;
+  /* First audible sample: nothing before it is heard, and output starts
+   * exactly on it. */
+  bool fas_valid;
+  uint32_t fas_rtp;
   audio_scheduler_wait_reason_t wait_reason;
   uint64_t render_calls;
   uint64_t silent_render_calls;
@@ -80,6 +106,19 @@ void audio_scheduler_init(audio_scheduler_t *scheduler,
 void audio_scheduler_begin_epoch(audio_scheduler_t *scheduler, uint32_t epoch,
                                  int64_t now_us);
 void audio_scheduler_set_paused(audio_scheduler_t *scheduler, bool paused);
+
+/* A new anchor moved the timeline: forget the skew measured against the old
+ * one.  `reposition` additionally makes the first measurement afterwards
+ * step playout onto the new timeline (only meaningful while playing). */
+void audio_scheduler_new_anchor(audio_scheduler_t *scheduler, bool reposition);
+
+/* First audible sample, from SETRATEANCHORTIME; valid = false clears it. */
+void audio_scheduler_set_first_audible(audio_scheduler_t *scheduler, bool valid,
+                                       uint32_t rtp);
+
+/* The clock offset used for the coming render; see clock_offset_ns. */
+void audio_scheduler_set_clock_offset(audio_scheduler_t *scheduler, bool valid,
+                                      int64_t offset_ns);
 
 size_t audio_scheduler_render(audio_scheduler_t *scheduler,
                               audio_timeline_t *timeline,

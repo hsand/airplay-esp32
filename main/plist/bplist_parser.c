@@ -1300,3 +1300,167 @@ bool bplist_find_stream_crypto(const uint8_t *plist, size_t plist_len,
 
   return found;
 }
+
+// ---------------------------------------------------------------------------
+// IPv4 addresses anywhere under a key: SETUP timingPeerInfo (a dict whose
+// "Addresses" is an array of strings), timingPeerList (an array of such
+// dicts), SETPEERS (a top-level array of strings) and SETPEERSX (a top-level
+// array of dicts).  One walk covers all four shapes.  Strings that are not a
+// dotted quad -- IPv6 addresses, the peer "ID" -- are skipped.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+  const uint8_t *plist;
+  size_t len;
+  uint8_t offset_size;
+  uint8_t ref_size;
+  uint64_t num_objects;
+  uint64_t offset_table_offset;
+  uint32_t *out;
+  size_t max;
+  size_t count;
+  unsigned visits;
+} ipv4_walk_t;
+
+// Bounds on the walk, so a malformed plist whose references fan out or loop
+// cannot keep the RTSP task busy.
+#define IPV4_WALK_MAX_DEPTH  5
+#define IPV4_WALK_MAX_VISITS 256U
+
+static bool parse_dotted_quad(const char *s, uint8_t octets[4]) {
+  for (int i = 0; i < 4; i++) {
+    if (*s < '0' || *s > '9') {
+      return false;
+    }
+    unsigned value = 0;
+    int digits = 0;
+    while (*s >= '0' && *s <= '9') {
+      value = value * 10U + (unsigned)(*s - '0');
+      if (++digits > 3 || value > 255U) {
+        return false;
+      }
+      s++;
+    }
+    octets[i] = (uint8_t)value;
+    if (i < 3) {
+      if (*s != '.') {
+        return false;
+      }
+      s++;
+    }
+  }
+  return *s == '\0';
+}
+
+static bool walk_object_offset(const ipv4_walk_t *w, uint64_t index,
+                               uint64_t *offset) {
+  if (index >= w->num_objects ||
+      w->offset_table_offset + (index + 1U) * w->offset_size > w->len) {
+    return false;
+  }
+  *offset = bplist_get_offset(w->plist, w->offset_table_offset, w->offset_size,
+                              index);
+  return *offset < w->len;
+}
+
+static void walk_ipv4(ipv4_walk_t *w, uint64_t index, int depth) {
+  uint64_t offset = 0;
+  if (depth > IPV4_WALK_MAX_DEPTH || ++w->visits > IPV4_WALK_MAX_VISITS ||
+      !walk_object_offset(w, index, &offset)) {
+    return;
+  }
+  const uint8_t type = w->plist[offset] & 0xF0;
+  if (type == BPLIST_STRING || type == BPLIST_UNICODE) {
+    char text[64];
+    uint8_t octets[4];
+    if (!bplist_read_string(w->plist, w->len, offset, text, sizeof(text)) ||
+        !parse_dotted_quad(text, octets)) {
+      return;
+    }
+    uint32_t addr = 0;
+    memcpy(&addr, octets, sizeof(addr)); // network byte order in memory
+    for (size_t i = 0; i < w->count; i++) {
+      if (w->out[i] == addr) {
+        return;
+      }
+    }
+    if (w->count < w->max) {
+      w->out[w->count++] = addr;
+    }
+    return;
+  }
+  if (type != BPLIST_ARRAY && type != BPLIST_DICT) {
+    return;
+  }
+  size_t n = 0;
+  size_t header = 0;
+  if (!bplist_parse_count(w->plist, w->len, offset, &n, &header)) {
+    return;
+  }
+  const size_t refs_at = (size_t)offset + header;
+  if (n > w->num_objects || refs_at > w->len ||
+      (type == BPLIST_DICT ? 2U : 1U) * n * w->ref_size > w->len - refs_at) {
+    return;
+  }
+  // A dict's values follow its keys; only the values can hold addresses.
+  const uint8_t *refs =
+      w->plist + refs_at + (type == BPLIST_DICT ? n * w->ref_size : 0U);
+  for (size_t i = 0; i < n; i++) {
+    walk_ipv4(w, read_be_int(refs + i * w->ref_size, w->ref_size), depth + 1);
+  }
+}
+
+bool bplist_collect_ipv4(const uint8_t *plist, size_t plist_len,
+                         const char *key, uint32_t *out, size_t max,
+                         size_t *count) {
+  if (count) {
+    *count = 0;
+  }
+  if (!plist || !out || !count || plist_len < 40 ||
+      memcmp(plist, "bplist00", 8) != 0) {
+    return false;
+  }
+  ipv4_walk_t w = {.plist = plist, .len = plist_len, .out = out, .max = max};
+  uint64_t top_object = 0;
+  if (!bplist_parse_trailer(plist, plist_len, &w.offset_size, &w.ref_size,
+                            &w.num_objects, &top_object,
+                            &w.offset_table_offset)) {
+    return false;
+  }
+  uint64_t start = top_object;
+  if (key) {
+    uint64_t top_offset = 0;
+    if (!walk_object_offset(&w, top_object, &top_offset) ||
+        (plist[top_offset] & 0xF0) != BPLIST_DICT) {
+      return false;
+    }
+    size_t n = 0;
+    size_t header = 0;
+    if (!bplist_parse_count(plist, plist_len, top_offset, &n, &header) ||
+        n > w.num_objects ||
+        (size_t)top_offset + header + 2U * n * w.ref_size > plist_len) {
+      return false;
+    }
+    const uint8_t *keys = plist + top_offset + header;
+    const uint8_t *values = keys + n * w.ref_size;
+    bool found = false;
+    for (size_t i = 0; i < n && !found; i++) {
+      uint64_t key_offset = 0;
+      char name[64];
+      if (walk_object_offset(&w, read_be_int(keys + i * w.ref_size, w.ref_size),
+                             &key_offset) &&
+          bplist_read_string(plist, plist_len, key_offset, name,
+                             sizeof(name)) &&
+          strcmp(name, key) == 0) {
+        start = read_be_int(values + i * w.ref_size, w.ref_size);
+        found = true;
+      }
+    }
+    if (!found) {
+      return false;
+    }
+  }
+  walk_ipv4(&w, start, 0);
+  *count = w.count;
+  return true;
+}

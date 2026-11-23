@@ -18,7 +18,9 @@
 #include "audio_decode_worker.h"
 #include "audio_decoder.h"
 #include "audio_engine_v2.h"
+#include "audio_flush_queue.h"
 #include "audio_packet.h"
+#include "audio_playout_clock.h"
 #include "audio_receiver.h"
 #include "audio_stream.h"
 #include "audio_timing.h"
@@ -64,6 +66,36 @@ typedef struct audio_receiver_state {
   bool aac_diag_rtp_valid;
   // Buffered frames still to be silenced after a break in the RTP sequence.
   uint8_t aac_prime_left;
+
+  // FLUSHBUFFERED records, keyed on sequence numbers.  Pushed by the RTSP
+  // task, consulted by the decode worker for every packet before it decodes
+  // and again if a sweep overtook it; flush_lock serialises the two.
+  audio_flush_queue_t flush_queue;
+  portMUX_TYPE flush_lock;
+
+  // Converts the playback task's local output instant into the anchor's
+  // clock domain.  Touched by the playback task only; others ask for a reset
+  // by bumping playout_clock_reset_req.
+  audio_playout_clock_t playout_clock;
+  uint32_t playout_clock_reset_req;
+  uint32_t playout_clock_reset_seen;
+
+  // AirPlay 2 session timing from the session SETUP's timingProtocol: PTP,
+  // or NTP when the key is absent or says so.
+  bool session_timing_ptp;
+  // Sender latency for the buffered stream, in samples (audioLatencyMs or
+  // latencyMin from the stream SETUP; 0 when absent, as on Apple).
+  uint32_t buffered_latency_samples;
+
+  // The latest buffered SETRATEANCHORTIME rate=1, until the clock can place
+  // it: armed once ptp_clock_network_to_local() succeeds for its timeline
+  // (Apple refuses rate 1 on an unlocked clock; this waits instead).  Written
+  // by the RTSP task, armed from either task, so it is copied under
+  // anchor_lock.
+  portMUX_TYPE anchor_lock;
+  bool rate_anchor_pending;
+  audio_engine_anchor_t rate_anchor;
+  uint32_t rate_anchor_deferred;
 
   // Last SETRATEANCHORTIME, kept in the sender's PTP domain so it can be
   // re-armed once the PTP clock locks.  An anchor that arrives while the
@@ -153,14 +185,6 @@ typedef struct audio_receiver_state {
   // the new position.  A realtime flush clears seek_backlog_valid without one.
   bool seek_backlog_ended;
 
-  // Snapshot of the expected RTP position taken the moment the sender signals
-  // PAUSE (SETRATEANCHORTIME rate=0).  Path B in audio_receiver_set_anchor_time
-  // uses this as the reference when comparing the new anchor on RESUME, so
-  // that a long pause does not make the wall-clock-elapsed estimate overshoot
-  // by (pause_duration × sample_rate) and false-trigger a seek flush.
-  // Cleared on flush/reset and consumed after one use.
-  uint32_t paused_rtp;
-  bool paused_rtp_valid;
 } audio_receiver_state_t;
 
 // Lightweight RTP gate used by the buffered TCP task before decrypt/decode.

@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -30,6 +31,7 @@
 #include "ntp_clock.h"
 #include "ptp_clock.h"
 #include "plist.h"
+#include "rtsp_anchor.h"
 #include "rtsp_fairplay.h"
 #include "rtsp_rsa.h"
 #include "settings.h"
@@ -94,6 +96,22 @@ bool rtsp_codec_configure(int64_t type_id, audio_format_t *fmt,
 // standard AirPlay realtime-stream minimum latency; senders transmit audio
 // ~2 s (88200 samples) ahead of this deadline.
 #define AIRPLAY_RT_LATENCY_DEFAULT_SAMPLES 11025
+// A sender latency beyond this is not believed (and not applied).
+#define AIRPLAY_LATENCY_MAX_MS 5000
+
+// Session liveness, as Apple's receiver keeps it: the session ends after this
+// long with no request at all (/feedback counts), and TCP keepalive probes a
+// silent RTSP connection after a fifth of it, 5 times.  A buffered stream
+// stretches both, since a paused phone may send nothing but /feedback.
+#define RTSP_IDLE_TIMEOUT_S          30
+#define RTSP_IDLE_TIMEOUT_BUFFERED_S 120
+#define RTSP_KEEPALIVE_PROBES        5
+
+// The sender's NTP port when a session SETUP asks for NTP without naming one.
+#define AIRPLAY_NTP_DEFAULT_PORT 7010
+
+// Timing peers taken from one SETUP or SETPEERS.
+#define AIRPLAY_MAX_TIMING_PEERS 16
 static int event_client_socket = -1;
 static int event_listen_socket = -1;
 static TaskHandle_t event_task_handle = NULL;
@@ -194,6 +212,76 @@ static bool start_audio_receiver_or_fail(int socket, rtsp_conn_t *conn,
     return false;
   }
   return true;
+}
+
+int rtsp_session_idle_limit_s(const rtsp_conn_t *conn) {
+  return conn && conn->stream_active && conn->stream_type == 103
+             ? RTSP_IDLE_TIMEOUT_BUFFERED_S
+             : RTSP_IDLE_TIMEOUT_S;
+}
+
+void rtsp_set_keepalive(int socket, int idle_s) {
+  int on = 1;
+  int idle = idle_s;
+  // [I] The spec gives the idle time and the probe count; the interval
+  // between probes is taken as the idle time too, so a dead peer is noticed
+  // within about the session idle timeout.
+  int interval = idle_s;
+  int probes = RTSP_KEEPALIVE_PROBES;
+  if (setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on)) != 0 ||
+      setsockopt(socket, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle)) != 0 ||
+      setsockopt(socket, IPPROTO_TCP, TCP_KEEPINTVL, &interval,
+                 sizeof(interval)) != 0 ||
+      setsockopt(socket, IPPROTO_TCP, TCP_KEEPCNT, &probes, sizeof(probes)) !=
+          0) {
+    ESP_LOGW(TAG, "TCP keepalive not set: errno %d", errno);
+  }
+}
+
+void rtsp_session_end_clock(void) {
+  ptp_clock_set_peers(NULL, 0);
+  ptp_clock_end_session();
+}
+
+// This end of the RTSP connection, for the receiver's own timing peer entry.
+static bool rtsp_local_ipv4(int socket, uint32_t *addr) {
+  struct sockaddr_in local;
+  socklen_t len = sizeof(local);
+  if (getsockname(socket, (struct sockaddr *)&local, &len) != 0 ||
+      local.sin_family != AF_INET) {
+    return false;
+  }
+  *addr = local.sin_addr.s_addr;
+  return true;
+}
+
+// Peers named by a SETUP or SETPEERS, without this receiver itself.
+static size_t collect_timing_peers(const uint8_t *body, size_t body_len,
+                                   const char *key, uint32_t self,
+                                   uint32_t *peers, size_t max) {
+  size_t count = 0;
+  if (!body || !bplist_collect_ipv4(body, body_len, key, peers, max, &count)) {
+    return 0;
+  }
+  size_t kept = 0;
+  for (size_t i = 0; i < count; i++) {
+    if (peers[i] != self) {
+      peers[kept++] = peers[i];
+    }
+  }
+  return kept;
+}
+
+static void log_timing_peers(const char *what, const uint32_t *peers,
+                             size_t count) {
+  char list[AIRPLAY_MAX_TIMING_PEERS * 16 + 1] = "";
+  size_t used = 0;
+  for (size_t i = 0; i < count && used < sizeof(list); i++) {
+    const uint8_t *b = (const uint8_t *)&peers[i];
+    used += (size_t)snprintf(list + used, sizeof(list) - used, "%s%u.%u.%u.%u",
+                             i ? " " : "", b[0], b[1], b[2], b[3]);
+  }
+  ESP_LOGI(TAG, "%s: %u timing peer(s) %s", what, (unsigned)count, list);
 }
 
 // Event port task - handles AirPlay 2 session persistence
@@ -1050,6 +1138,123 @@ static void handle_announce(int socket, rtsp_conn_t *conn,
   rtsp_send_ok(socket, conn, req->cseq);
 }
 
+// A stable identifier for this receiver's timing peer entry.  Apple's is its
+// boot UUID; this one is derived from the MAC, in the same shape.
+static void timing_peer_id(char *out, size_t len) {
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  snprintf(out, len, "a1b2c3d4-0000-4000-8000-%02X%02X%02X%02X%02X%02X", mac[0],
+           mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+// Session SETUP timing, as Apple's receiver sets it up: timingProtocol
+// decides the clock (absent means NTP), and under PTP the clock is started
+// and given its peers here, before any stream, RECORD or anchor, so that it
+// can be locked by the time the first anchor arrives.
+static void session_setup_timing(rtsp_conn_t *conn, const uint8_t *body,
+                                 size_t body_len, uint32_t self_ip) {
+  char protocol[16] = "";
+  const bool named = bplist_find_string(body, body_len, "timingProtocol",
+                                        protocol, sizeof(protocol));
+  // "None" is for remote-control and persistent sessions, which borrow
+  // another session's clock; there is none here to borrow but PTP.
+  conn->timing_ptp =
+      named && (strcmp(protocol, "PTP") == 0 || strcmp(protocol, "None") == 0);
+  audio_receiver_set_session_timing(conn->timing_ptp);
+  ESP_LOGI(TAG, "SETUP: timingProtocol=%s -> %s", named ? protocol : "(absent)",
+           conn->timing_ptp ? "PTP" : "NTP");
+
+  if (!conn->timing_ptp) {
+    int64_t port = AIRPLAY_NTP_DEFAULT_PORT;
+    (void)bplist_find_int(body, body_len, "timingPort", &port);
+    if (port > 0 && port <= UINT16_MAX && conn->client_ip != 0) {
+      conn->client_timing_port = (uint16_t)port;
+      esp_err_t err =
+          ntp_clock_start_client(conn->client_ip, conn->client_timing_port);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NTP timing client failed: %s", esp_err_to_name(err));
+      }
+    }
+    return;
+  }
+
+  // Already running unless an AirPlay 1 session stopped it.
+  (void)ptp_clock_init();
+  uint32_t peers[AIRPLAY_MAX_TIMING_PEERS];
+  size_t count = collect_timing_peers(body, body_len, "timingPeerInfo", self_ip,
+                                      peers, AIRPLAY_MAX_TIMING_PEERS);
+  if (count == 0 && conn->client_ip != 0 && conn->client_ip != self_ip) {
+    // No peer info: the sender's own address, as Apple falls back to.
+    peers[count++] = conn->client_ip;
+  }
+  uint32_t list[AIRPLAY_MAX_TIMING_PEERS];
+  const size_t listed =
+      collect_timing_peers(body, body_len, "timingPeerList", self_ip, list,
+                           AIRPLAY_MAX_TIMING_PEERS);
+  for (size_t i = 0; i < listed && count < AIRPLAY_MAX_TIMING_PEERS; i++) {
+    bool known = false;
+    for (size_t j = 0; j < count; j++) {
+      known = known || peers[j] == list[i];
+    }
+    if (!known) {
+      peers[count++] = list[i];
+    }
+  }
+  log_timing_peers("SETUP", peers, count);
+  ptp_clock_set_peers(peers, count);
+}
+
+// One stream dict's keys on one line, for the hardware test: what senders put
+// in a buffered SETUP (latencyMin? audioLatencyMs?) is still an open question.
+static void log_stream_keys(const bplist_kv_info_t *kv, size_t count,
+                            int64_t stream_type) {
+  char line[512];
+  size_t used = (size_t)snprintf(
+      line, sizeof(line), "SETUP stream type %lld:", (long long)stream_type);
+  for (size_t k = 0; k < count && used < sizeof(line); k++) {
+    if (kv[k].value_type == BPLIST_VALUE_INT) {
+      used += (size_t)snprintf(line + used, sizeof(line) - used, " %s=%lld",
+                               kv[k].key, (long long)kv[k].int_value);
+    } else {
+      used += (size_t)snprintf(line + used, sizeof(line) - used, " %s(%u:%u)",
+                               kv[k].key, (unsigned)kv[k].value_type,
+                               (unsigned)kv[k].value_len);
+    }
+  }
+  ESP_LOGI(TAG, "%s", line);
+}
+
+// The sender's latency for a stream, in samples: audioLatencyMs when present
+// and non-zero (Apple then uses it for both min and max), else latencyMin.
+static bool stream_sender_latency(const bplist_kv_info_t *kv, size_t count,
+                                  int64_t sample_rate, int64_t *samples,
+                                  const char **source) {
+  int64_t latency_ms = 0;
+  int64_t latency_min = -1;
+  for (size_t k = 0; k < count; k++) {
+    if (kv[k].value_type != BPLIST_VALUE_INT) {
+      continue;
+    }
+    if (strcmp(kv[k].key, "audioLatencyMs") == 0) {
+      latency_ms = kv[k].int_value;
+    } else if (strcmp(kv[k].key, "latencyMin") == 0) {
+      latency_min = kv[k].int_value;
+    }
+  }
+  const int64_t max_samples = sample_rate * AIRPLAY_LATENCY_MAX_MS / 1000;
+  if (latency_ms > 0 && latency_ms <= AIRPLAY_LATENCY_MAX_MS) {
+    *samples = sample_rate * latency_ms / 1000;
+    *source = "audioLatencyMs";
+    return true;
+  }
+  if (latency_min >= 0 && latency_min <= max_samples) {
+    *samples = latency_min;
+    *source = "latencyMin";
+    return true;
+  }
+  return false;
+}
+
 static void handle_setup(int socket, rtsp_conn_t *conn,
                          const rtsp_request_t *req, const uint8_t *raw,
                          size_t raw_len) {
@@ -1117,6 +1322,9 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
           rtsp_codec_configure(codec_type, &format, sample_rate,
                                samples_per_frame);
           audio_receiver_set_format(&format);
+          if (i == 0) {
+            conn->sample_rate = format.sample_rate;
+          }
         }
       }
     }
@@ -1268,7 +1476,32 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
 
     ESP_LOGI(TAG, "SETUP: Initial connection setup (no streams)");
 
-    if (is_bplist) {
+    uint32_t self_ip = 0;
+    const bool have_self = rtsp_local_ipv4(socket, &self_ip);
+    if (is_bplist && body) {
+      session_setup_timing(conn, body, body_len, have_self ? self_ip : 0);
+    }
+
+    if (is_bplist && have_self) {
+      // The receiver's own timing peer entry, as Apple's receiver returns it,
+      // so the sender can put this device in its peer lists.
+      char address[16];
+      const uint8_t *b = (const uint8_t *)&self_ip;
+      snprintf(address, sizeof(address), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+      char peer_id[40];
+      timing_peer_id(peer_id, sizeof(peer_id));
+      uint8_t plist_body[256];
+      size_t plist_len = bplist_build_session_setup(
+          plist_body, sizeof(plist_body), conn->event_port, address, peer_id);
+      if (plist_len == 0) {
+        rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
+                           NULL, 0);
+        return;
+      }
+      rtsp_send_response(socket, conn, 200, "OK", req->cseq,
+                         "Content-Type: application/x-apple-binary-plist\r\n",
+                         (const char *)plist_body, plist_len);
+    } else if (is_bplist) {
       uint8_t plist_body[128];
       size_t plist_len = bplist_build_initial_setup(
           plist_body, sizeof(plist_body), conn->event_port);
@@ -1315,47 +1548,60 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     return;
   }
 
-  // Playout latency.  For REALTIME streams (type 96) the anchor from
-  // SETRATEANCHORTIME maps an RTP timestamp onto the sender's source
-  // timeline; actual playout is expected latencyMin samples later.  Every
-  // reference receiver applies this, so playing at the anchor directly puts
-  // this device ~250 ms AHEAD of the rest of a multi-room group (issue #54:
-  // an empirical +300 ms offset on a build that subtracted 46 ms of
-  // hardware latency — net +254 ms — gave near-perfect sync; 11025 samples
-  // is 250.0 ms).  Use the sender's latencyMin from the SETUP stream dict
-  // when present and sane, else the AirPlay default of 11025.
-  // Buffered streams (type 103) schedule playout with the anchor directly.
-  // Only applied on the AirPlay 2 (bplist SETUP) path; the AirPlay 1 path
-  // keeps its existing behavior (0) — no field evidence either way there.
-  if (!is_bplist || buffered) {
+  // Playout latency: the sender's, from the stream dict (audioLatencyMs,
+  // else latencyMin), applied to both stream types as Apple does
+  // (offset = sender latency - platform latency; the platform half is already
+  // in the output instant the playback task schedules against).
+  //  - REALTIME (type 96): the anchor maps an RTP timestamp onto the sender's
+  //    source timeline and playout is expected latencyMin samples later.
+  //    Playing at the anchor directly put this device ~250 ms AHEAD of a
+  //    multi-room group (issue #54), so without a value the AirPlay default of
+  //    11025 (250 ms) stands.
+  //  - BUFFERED (type 103): 0 without a value, as on Apple.
+  // The AirPlay 1 path keeps 0 -- no field evidence either way there.
+  if (!is_bplist) {
     audio_receiver_set_playout_latency_samples(0);
   } else {
-    int64_t latency_min = 0;
+    int64_t sample_rate = conn->sample_rate > 0 ? conn->sample_rate : 44100;
+    int64_t latency = 0;
     const char *latency_src = "default";
-    // latencyMin is a per-stream key inside the SETUP streams[] dict, not a
-    // top-level key — read it the same way as ct/sr/spf above.
-    if (body && body_len > 0) {
-      bplist_kv_info_t kv[16];
-      size_t kv_count = 0;
-      if (bplist_get_stream_kv_info(body, body_len, 0, kv, 16, &kv_count)) {
-        for (size_t k = 0; k < kv_count; k++) {
-          if (kv[k].value_type == BPLIST_VALUE_INT &&
-              strcmp(kv[k].key, "latencyMin") == 0) {
-            latency_min = kv[k].int_value;
-            break;
-          }
+    bplist_kv_info_t *kv = calloc(32, sizeof(*kv));
+    size_t kv_count = 0;
+    if (kv && body &&
+        bplist_get_stream_kv_info(body, body_len, 0, kv, 32, &kv_count)) {
+      for (size_t k = 0; k < kv_count; k++) {
+        if (kv[k].value_type == BPLIST_VALUE_INT &&
+            strcmp(kv[k].key, "sr") == 0 && kv[k].int_value > 0) {
+          sample_rate = kv[k].int_value;
         }
       }
-    }
-    if (latency_min > 0 && latency_min <= INT64_C(5) * 44100) {
-      latency_src = "SETUP latencyMin";
+      if (buffered && !conn->stream_keys_logged) {
+        conn->stream_keys_logged = true;
+        log_stream_keys(kv, kv_count, stream_type);
+      }
+      // A realtime latencyMin of 0 is read as none: issue #54's evidence is
+      // that 250 ms is what the rest of a group plays at.
+      if (!stream_sender_latency(kv, kv_count, sample_rate, &latency,
+                                 &latency_src) ||
+          (!buffered && latency == 0)) {
+        latency = buffered ? 0 : AIRPLAY_RT_LATENCY_DEFAULT_SAMPLES;
+        latency_src = "default";
+      }
     } else {
-      latency_min = AIRPLAY_RT_LATENCY_DEFAULT_SAMPLES;
+      latency = buffered ? 0 : AIRPLAY_RT_LATENCY_DEFAULT_SAMPLES;
     }
-    audio_receiver_set_playout_latency_samples((uint32_t)latency_min);
-    ESP_LOGI(TAG, "Realtime playout latency: %lld samples (%lld ms, %s)",
-             (long long)latency_min, (long long)(latency_min * 1000 / 44100),
-             latency_src);
+    free(kv);
+    if (buffered) {
+      audio_receiver_set_buffered_latency_samples((uint32_t)latency);
+    } else {
+      audio_receiver_set_playout_latency_samples((uint32_t)latency);
+    }
+    ESP_LOGI(TAG, "%s playout latency: %lld samples (%lld ms, %s)",
+             buffered ? "Buffered" : "Realtime", (long long)latency,
+             (long long)(latency * 1000 / sample_rate), latency_src);
+  }
+  if (buffered) {
+    rtsp_set_keepalive(socket, RTSP_IDLE_TIMEOUT_BUFFERED_S / 5);
   }
 
   if (is_bplist) {
@@ -1454,10 +1700,19 @@ static void handle_record(int socket, rtsp_conn_t *conn,
   conn->stream_paused = false;
   playback_events_emit(PLAYBACK_SOURCE_AIRPLAY, PLAYBACK_EVENT_PLAYING, NULL);
 
-  // AirPlay 1 RECORD is always type 96 (realtime/UDP) with NTP sync.
-  // Internal timing already compensates for hardware latency, so report 0.
+  // Apple reports its platform latency here (device latency plus output
+  // latency, in samples), and compensates for it internally as well -- as
+  // this receiver does, by scheduling every block that much early.  [I]
+  // Whether senders act on the value is not known.  AirPlay 1 keeps the 0 it
+  // has always reported: nothing says how a RAOP sender would read it.
   char headers[128];
-  uint32_t latency_samples = 0;
+  const int sample_rate = conn->sample_rate > 0 ? conn->sample_rate : 44100;
+  const uint32_t latency_samples =
+      conn->protocol_version == 2
+          ? (uint32_t)(((uint64_t)audio_output_get_platform_latency_us() *
+                        (uint64_t)sample_rate) /
+                       1000000ULL)
+          : 0U;
   snprintf(headers, sizeof(headers),
            "Audio-Latency: %" PRIu32 "\r\n"
            "Audio-Jack-Status: connected\r\n",
@@ -1813,53 +2068,40 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
   (void)raw;
   (void)raw_len;
 
-  const uint8_t *body = req->body;
-  size_t body_len = req->body_len;
+  const int64_t sample_rate = conn->sample_rate > 0 ? conn->sample_rate : 44100;
 
-  // AirPlay 2 FLUSHBUFFERED carries an optional bplist with:
-  //   flushFromSeq / flushFromTS  — first sequence/timestamp to discard
-  //   flushUntilSeq / flushUntilTS — last sequence/timestamp to discard
-  //
-  // If flushFromSeq is absent → immediate flush (stop and discard everything).
-  // If flushFromSeq is present → deferred flush: keep playing existing buffered
-  //   content until flushUntilTS is reached, then discard and start fresh.
-  //   The phone simultaneously starts streaming the new track, which fills the
-  //   buffer beyond flushUntilTS; the decode task detects the boundary and
-  //   triggers the bulk-flush at the right moment.
-  bool has_deferred = false;
-  if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0) {
-    int64_t flush_from_seq = 0, flush_from_ts = 0;
-    int64_t flush_until_seq = 0, flush_until_ts = 0;
-    bool got_from_seq =
-        bplist_find_int(body, body_len, "flushFromSeq", &flush_from_seq);
-    bool got_from_ts =
-        bplist_find_int(body, body_len, "flushFromTS", &flush_from_ts);
-    bool got_until_seq =
-        bplist_find_int(body, body_len, "flushUntilSeq", &flush_until_seq);
-    bool got_until_ts =
-        bplist_find_int(body, body_len, "flushUntilTS", &flush_until_ts);
-
-    if (got_from_seq && got_from_ts && got_until_seq && got_until_ts) {
-      has_deferred = true;
-      ESP_LOGI(TAG,
-               "FLUSHBUFFERED deferred: fromSeq=%" PRId64 " fromTS=%" PRId64
-               " untilSeq=%" PRId64 " untilTS=%" PRId64,
-               flush_from_seq, flush_from_ts, flush_until_seq, flush_until_ts);
-      // Arm the deferred flush.  Do NOT flush the audio output immediately —
-      // let it drain naturally to the boundary so the current track finishes.
-      audio_receiver_set_deferred_flush((uint32_t)flush_until_ts);
-    } else {
-      ESP_LOGI(TAG, "FLUSHBUFFERED immediate (missing from/until fields)");
-    }
+  // AirPlay 2 FLUSHBUFFERED, read as Apple's receiver reads it:
+  //   flushUntilSeq / flushUntilTS (required)
+  //   flushFromSeq / flushFromTS (both present: a deferred, within-range
+  //   flush of [from, until); otherwise everything before until, now).
+  // Sequence numbers decide; the timestamps are logged.
+  audio_flush_record_t record;
+  if (!rtsp_parse_flush_buffered(req->body, req->body_len, sample_rate,
+                                 &record)) {
+    ESP_LOGW(TAG, "FLUSHBUFFERED without flushUntilSeq/TS: refused");
+    rtsp_send_response(socket, conn, 400, "Bad Request", req->cseq, NULL, NULL,
+                       0);
+    return;
   }
 
-  if (!has_deferred) {
-    // Immediate flush: discard everything and reset now.
-    audio_receiver_seek_flush();
+  char headers[64] = "";
+  if (conn->stream_type == 103) {
+    uint32_t rtp = 0;
+    if (audio_receiver_flush_buffered(&record, &rtp)) {
+      // The RTP of the last packet handed to the output, as Apple replies.
+      snprintf(headers, sizeof(headers), "RTP-Info: rtptime=%" PRIu32 "\r\n",
+               rtp);
+    }
+  } else {
+    // Not a buffered stream: what FLUSH does.
+    audio_receiver_realtime_flush(false, 0);
+  }
+  if (!record.has_from) {
     audio_output_flush();
   }
 
-  rtsp_send_ok(socket, conn, req->cseq);
+  rtsp_send_response(socket, conn, 200, "OK", req->cseq,
+                     headers[0] ? headers : NULL, NULL, 0);
 }
 
 static void handle_teardown(int socket, rtsp_conn_t *conn,
@@ -1896,13 +2138,13 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
   }
   audio_receiver_stop();
   audio_output_flush();
-  // Drop PTP lock + offset history if they went stale.  AirPlay group
-  // rejoins reuse the same PTP master clock_id, and samples missed while we
-  // were detached must not be reused.  But a phone moving to its next track
-  // tears down and sets up again within half a second while its SYNCs keep
-  // arriving; clearing then cost a ~0.75 s re-lock that the start skipped.
-  ptp_clock_end_session();
+  // A stream TEARDOWN leaves the clock alone: Apple's receiver starts it at
+  // the session SETUP and stops it only when the session ends, so a phone
+  // moving to its next track (TEARDOWN + SETUP within half a second) or
+  // resuming a pause finds it still locked.
   conn->stream_active = false;
+  // Without a buffered stream the session and keepalive limits drop back.
+  rtsp_set_keepalive(socket, RTSP_IDLE_TIMEOUT_S / 5);
   conn->stream_paused =
       has_streams; // Keep session ready if only streams torn down
 
@@ -1922,10 +2164,26 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
       conn->active_remote[0] = '\0';
     }
     ntp_clock_stop();
+    rtsp_session_end_clock();
     conn->timing_port = 0;
   }
 
   rtsp_send_ok(socket, conn, req->cseq);
+}
+
+// Refuse a SETRATEANCHORTIME the way Apple's receiver does: the RTSP request
+// succeeds, and the plist says why it was not applied.
+static void reply_status(int socket, rtsp_conn_t *conn,
+                         const rtsp_request_t *req, int64_t status) {
+  uint8_t plist[64];
+  const size_t len = bplist_build_status(plist, sizeof(plist), status);
+  if (len == 0) {
+    rtsp_send_ok(socket, conn, req->cseq);
+    return;
+  }
+  rtsp_send_response(socket, conn, 200, "OK", req->cseq,
+                     "Content-Type: application/x-apple-binary-plist\r\n",
+                     (const char *)plist, len);
 }
 
 static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
@@ -1934,67 +2192,47 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
   (void)raw;
   (void)raw_len;
 
-  const uint8_t *body = req->body;
-  size_t body_len = req->body_len;
-
-  double rate = 1.0;
-  uint64_t clock_id = 0;
-  uint64_t network_time_secs = 0;
-  uint64_t network_time_frac = 0;
-  uint64_t rtp_time = 0;
-
-  if (body && body_len > 0 && body_len >= 8 &&
-      memcmp(body, "bplist00", 8) == 0) {
-    if (!bplist_find_real(body, body_len, "rate", &rate)) {
-      int64_t rate_int;
-      if (bplist_find_int(body, body_len, "rate", &rate_int)) {
-        rate = (double)rate_int;
-      }
-    }
-
-    int64_t value;
-    if (bplist_find_int(body, body_len, "networkTimeTimelineID", &value)) {
-      clock_id = (uint64_t)value;
-    }
-    if (bplist_find_int(body, body_len, "networkTimeSecs", &value)) {
-      network_time_secs = (uint64_t)value;
-    }
-    if (bplist_find_int(body, body_len, "networkTimeFrac", &value)) {
-      network_time_frac = (uint64_t)value;
-    }
-    if (bplist_find_int(body, body_len, "rtpTime", &value)) {
-      rtp_time = (uint64_t)value;
-    }
-
-    ESP_LOGI(TAG, "SETRATEANCHORTIME: secs=%llu, rtp=%llu, rate=%.1f",
-             (unsigned long long)network_time_secs,
-             (unsigned long long)rtp_time, rate);
-
-    if (network_time_secs != 0 && rtp_time != 0) {
-      uint64_t frac = network_time_frac >> 32;
-      frac = (frac * 1000000000ULL) >> 32;
-      uint64_t network_time_ns = network_time_secs * 1000000000ULL + frac;
-      audio_receiver_set_anchor_time(clock_id, network_time_ns,
-                                     (uint32_t)rtp_time);
-    }
+  const int64_t sample_rate = conn->sample_rate > 0 ? conn->sample_rate : 44100;
+  audio_rate_anchor_t anchor;
+  int64_t status = 0;
+  if (!rtsp_parse_rate_anchor(req->body, req->body_len, sample_rate, &anchor,
+                              &status)) {
+    ESP_LOGW(TAG, "SETRATEANCHORTIME refused: status %lld", (long long)status);
+    reply_status(socket, conn, req, status);
+    return;
   }
+  ESP_LOGI(TAG,
+           "SETRATEANCHORTIME: rate=%" PRIu32 " rtp=%" PRIu32
+           " net=%llu.%09llu timeline=%016llx flags=0x%" PRIx32
+           " fas=%s%" PRIu32,
+           anchor.rate, anchor.rtp,
+           (unsigned long long)(anchor.network_ns / 1000000000ULL),
+           (unsigned long long)(anchor.network_ns % 1000000000ULL),
+           (unsigned long long)anchor.timeline_id, anchor.network_flags,
+           anchor.fas_valid ? "" : "n/a:", anchor.fas_rtp);
 
-  if (rate == 0.0) {
-    ESP_LOGI(TAG, "SETRATEANCHORTIME: rate=0 -> PAUSING");
+  if (anchor.rate == 0U) {
     // Mute the DAC first via the synchronous event so audio stops now.
     playback_events_emit(PLAYBACK_SOURCE_AIRPLAY, PLAYBACK_EVENT_PAUSED, NULL);
     conn->stream_paused = true;
-    audio_receiver_pause();
+    audio_receiver_set_rate_anchor(&anchor);
     audio_output_flush();
     settings_persist_volume();
   } else {
-    ESP_LOGI(TAG, "SETRATEANCHORTIME: rate=%.1f -> RESUMING (was_paused=%d)",
-             rate, conn->stream_paused);
     conn->stream_paused = false;
-    audio_receiver_set_playing(true);
+    if (conn->stream_type == 96) {
+      // A realtime stream keeps its own anchor path (the control channel
+      // re-anchors it every second).
+      audio_receiver_set_anchor_time(anchor.timeline_id, anchor.network_ns,
+                                     anchor.rtp);
+      audio_receiver_set_playing(true);
+    } else {
+      audio_receiver_set_rate_anchor(&anchor);
+    }
     playback_events_emit(PLAYBACK_SOURCE_AIRPLAY, PLAYBACK_EVENT_PLAYING, NULL);
   }
 
+  // A plain 200 on success: Apple's reply carries nothing either.
   rtsp_send_ok(socket, conn, req->cseq);
 }
 
@@ -2004,22 +2242,23 @@ static void handle_setpeers(int socket, rtsp_conn_t *conn,
   (void)raw;
   (void)raw_len;
 
-  const uint8_t *body = req->body;
-  size_t body_len = req->body_len;
-
-  ESP_LOGI(TAG, "%s: body_len=%zu", req->method, body_len);
-  if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0) {
-    ESP_LOGI(TAG, "SETPEERS: got bplist");
+  // SETPEERS carries an array of address strings, SETPEERSX an array of peer
+  // dicts; both replace the whole peer list.  Apple applies them only to a
+  // PTP session and ignores them otherwise.  The anchor timing is not reset:
+  // the anchor names its timeline, and the playback task follows a
+  // grandmaster change by re-expressing the anchor on the new one.
+  if (!conn->timing_ptp) {
+    ESP_LOGI(TAG, "%s ignored: not a PTP session", req->method);
+    rtsp_send_ok(socket, conn, req->cseq);
+    return;
   }
-
-  // PTP peers changed — the PTP clock will re-lock to the new master on
-  // its own.  Do NOT reset the audio timing anchor here: the anchor's
-  // network_time_ns is in absolute PTP time, and compute_early_us
-  // auto-corrects via ptp_clock_get_offset_ns() as PTP re-locks.
-  // Resetting mid-stream orphans the pre-buffer (up to ~23 s of audio)
-  // with no valid anchor, causing consecutive-early detection to
-  // invalidate the anchor and break playback.
-  ESP_LOGI(TAG, "SETPEERS: PTP peers changed, clock will re-lock");
+  uint32_t self_ip = 0;
+  (void)rtsp_local_ipv4(socket, &self_ip);
+  uint32_t peers[AIRPLAY_MAX_TIMING_PEERS];
+  const size_t count = collect_timing_peers(
+      req->body, req->body_len, NULL, self_ip, peers, AIRPLAY_MAX_TIMING_PEERS);
+  log_timing_peers(req->method, peers, count);
+  ptp_clock_set_peers(peers, count);
 
   rtsp_send_ok(socket, conn, req->cseq);
 }

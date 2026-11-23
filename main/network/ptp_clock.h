@@ -3,8 +3,10 @@
 
 #pragma once
 
-#include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
 #include "esp_err.h"
 
 /**
@@ -109,3 +111,33 @@ void ptp_clock_set_master_clock_id(uint64_t clock_id);
  * Read the current expected master clock_id (0 if none / filter cleared).
  */
 uint64_t ptp_clock_get_master_clock_id(void);
+
+/* ---------------------------------------------------------------------------
+ * Cross-package contract (PTP <-> audio).  Implemented by ptp_clock.c; until
+ * that lands, ptp_clock_contract_stub.c supplies weak fallbacks built on the
+ * offset-only API above.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Peers from SETUP timingPeerInfo/timingPeerList and SETPEERS/SETPEERSX.
+ * IPv4 only; replaces the whole list.  count == 0 clears it (session end).
+ */
+void ptp_clock_set_peers(const uint32_t *ipv4_addrs_net_order, size_t count);
+
+/**
+ * Local (esp_timer ns) -> network (PTP ns) using the offset+rate model.
+ * Returns false when not locked.  *gm_id = grandmaster/timeline the value is
+ * on.
+ */
+bool ptp_clock_local_to_network(int64_t local_ns, uint64_t *network_ns,
+                                uint64_t *gm_id);
+
+/**
+ * Network -> local; returns false if gm_id is not the current grandmaster
+ * (the timeline changed) or the clock is not locked.
+ */
+bool ptp_clock_network_to_local(uint64_t network_ns, uint64_t gm_id,
+                                int64_t *local_ns);
+
+/** The current grandmaster / timeline ID, 0 if none. */
+uint64_t ptp_clock_get_grandmaster_id(void);

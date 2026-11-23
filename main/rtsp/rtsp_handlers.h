@@ -94,6 +94,27 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
  */
 void rtsp_get_device_id(char *device_id, size_t len);
 
+/**
+ * End of an AirPlay session (full TEARDOWN, connection closed, idle timeout):
+ * drop the session's timing peers and end the PTP session.  Apple stops its
+ * clock for the session only here, never on a stream TEARDOWN or a pause.
+ * Only for the connection that owns the session.
+ */
+void rtsp_session_end_clock(void);
+
+/**
+ * Seconds without any request (/feedback included) after which the session
+ * is torn down: 30, or 120 while a buffered stream exists.
+ */
+int rtsp_session_idle_limit_s(const rtsp_conn_t *conn);
+
+/**
+ * TCP keepalive on an RTSP connection, as Apple's receiver sets it: probes
+ * after idle_s seconds of silence (6, or 24 with a buffered stream), 5 of
+ * them, idle_s apart.
+ */
+void rtsp_set_keepalive(int socket, int idle_s);
+
 // Event port task management
 esp_err_t rtsp_start_event_port_task(int listen_socket);
 void rtsp_stop_event_port_task(void);

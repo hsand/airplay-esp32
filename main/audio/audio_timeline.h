@@ -64,6 +64,10 @@ typedef struct {
 typedef struct {
   /* Descriptors in internal RAM, PCM payloads in PSRAM. */
   audio_timeline_desc_t *desc;
+  /* Per-slot sender sequence number, AUDIO_TIMELINE_SEQ_VALID | seq24, or 0
+   * for a block that came without one (realtime, Sendspin).  Kept out of the
+   * descriptors and in PSRAM: only a FLUSHBUFFERED sweep reads it. */
+  uint32_t *seq_tag;
   int16_t *pcm_pool;
   uint16_t count;
   uint16_t writing_count;
@@ -101,6 +105,9 @@ typedef struct {
   portMUX_TYPE lock;
 } audio_timeline_t;
 
+/* Marks a seq_tag as carrying a sequence number. */
+#define AUDIO_TIMELINE_SEQ_VALID 0x80000000U
+
 /* Opaque producer reservation used to keep a slot private while PCM is copied
  * outside both the timeline metadata lock and the engine publish lock. */
 typedef struct {
@@ -134,6 +141,14 @@ size_t audio_timeline_count(audio_timeline_t *timeline);
 size_t audio_timeline_discard_from(audio_timeline_t *timeline, uint32_t epoch,
                                    uint32_t rtp);
 
+/* AirPlay 2 FLUSHBUFFERED by sequence number: drop every READY block of
+ * `epoch` whose seq lies in [from_seq, until_seq) (24-bit serial order), or
+ * below until_seq when !has_from.  Blocks without a sequence number are kept.
+ * The origin stays valid.  Returns blocks dropped. */
+size_t audio_timeline_discard_seq_range(audio_timeline_t *timeline,
+                                        uint32_t epoch, bool has_from,
+                                        uint32_t from_seq, uint32_t until_seq);
+
 /* Inverse of the above: drop every READY block of `epoch` that ends at or
  * before `rtp`, i.e. audio the playout position has already passed.  Returns
  * blocks dropped. */
@@ -159,8 +174,9 @@ void audio_timeline_set_playback_floor(audio_timeline_t *timeline,
 bool audio_timeline_wait_for_space(audio_timeline_t *timeline,
                                    uint32_t timeout_ms);
 
+/* seq_tag: AUDIO_TIMELINE_SEQ_VALID | seq24, or 0 for none. */
 bool audio_timeline_reserve(audio_timeline_t *timeline, uint32_t epoch,
-                            uint32_t rtp_start,
+                            uint32_t rtp_start, uint32_t seq_tag,
                             audio_timeline_reservation_t *reservation,
                             int16_t **pcm_out);
 bool audio_timeline_commit(audio_timeline_t *timeline,

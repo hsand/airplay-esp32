@@ -150,6 +150,14 @@ bool audio_output_get_pipeline_us(int64_t *now_us, uint32_t *pipeline_us);
 int64_t audio_output_get_next_playout_time_ns(int64_t now_us);
 
 /**
+ * What Apple calls the platform latency: from a block leaving the playback
+ * task to it being heard, i.e. the modelled DMA depth plus
+ * CONFIG_AUDIO_OUTPUT_EXTRA_LATENCY_US.  Scheduling already subtracts it;
+ * RECORD reports it to the sender as Audio-Latency.
+ */
+uint32_t audio_output_get_platform_latency_us(void);
+
+/**
  * Render callback used by a playback task to pull the next block of PCM.
  *
  * @param buffer  destination, interleaved stereo int16.

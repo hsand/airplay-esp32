@@ -242,9 +242,36 @@ bool bplist_find_real(const uint8_t *plist, size_t plist_len, const char *key,
 bool bplist_find_string(const uint8_t *plist, size_t plist_len, const char *key,
                         char *out_str, size_t out_capacity);
 
+/**
+ * Collect every IPv4 dotted-quad string found under `key` of the top-level
+ * dict (or under the top-level object itself when key is NULL), at any depth
+ * of nested arrays and dicts.  Duplicates are dropped.  Addresses are written
+ * in network byte order.
+ * @return false if the plist is malformed or the key is absent
+ */
+bool bplist_collect_ipv4(const uint8_t *plist, size_t plist_len,
+                         const char *key, uint32_t *out, size_t max,
+                         size_t *count);
+
 // ========================================
 // Binary plist builders (for AirPlay SETUP responses)
 // ========================================
+
+/**
+ * Session SETUP response: { eventPort, timingPort: 0, timingPeerInfo:
+ * { Addresses: [address], ID: peer_id } }, the receiver's own PTP peer
+ * entry as Apple's receiver returns it.
+ * @return Length of generated bplist, or 0 on error
+ */
+size_t bplist_build_session_setup(uint8_t *out, size_t capacity,
+                                  uint16_t event_port, const char *address,
+                                  const char *peer_id);
+
+/**
+ * { status: <status> }, the body of a refused SETRATEANCHORTIME.
+ * @return Length of generated bplist, or 0 on error
+ */
+size_t bplist_build_status(uint8_t *out, size_t capacity, int64_t status);
 
 /**
  * Build initial SETUP response bplist (no streams array)

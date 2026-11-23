@@ -14,6 +14,7 @@
 #include "audio_buffer.h"
 #include "audio_decoder.h"
 #include "audio_output.h"
+#include "audio_playout_clock.h"
 #include "audio_receiver_internal.h"
 #include "audio_stream.h"
 #include "audio_timing.h"
@@ -190,6 +191,14 @@ static void audio_receiver_reset_engine_v2(void) {
   // aac_prime_left is left alone too: the decode worker owns it under the
   // decoder mutex, and may already have primed a frame of the new epoch.
   receiver.engine_v2_anchor_pending = false;
+  taskENTER_CRITICAL(&receiver.anchor_lock);
+  receiver.rate_anchor_pending = false;
+  taskEXIT_CRITICAL(&receiver.anchor_lock);
+  // A new epoch holds nothing a pending flush could still apply to, and the
+  // sequence numbers it will see belong to whatever stream comes next.
+  taskENTER_CRITICAL(&receiver.flush_lock);
+  audio_flush_queue_reset(&receiver.flush_queue);
+  taskEXIT_CRITICAL(&receiver.flush_lock);
 }
 
 // Local -> sender clock offset, and whether that clock is actually locked.
@@ -234,6 +243,43 @@ static void audio_receiver_arm_engine_v2_anchor(void) {
                                  receiver.engine_v2_playout_offset_ns)) {
     receiver.engine_v2_anchor_pending = false;
   }
+}
+
+// True once the clock can place a buffered anchor: locked, and on the
+// timeline the anchor names.  This is the check Apple makes before it accepts
+// a rate-1 SETRATEANCHORTIME (net-to-host conversion, then IsLocked).
+static bool rate_anchor_placeable(const audio_engine_anchor_t *anchor) {
+  if (!receiver.session_timing_ptp) {
+    return ntp_clock_is_locked();
+  }
+  int64_t local_ns = 0;
+  return ptp_clock_network_to_local(anchor->network_ns, anchor->timeline_id,
+                                    &local_ns);
+}
+
+// Install the pending buffered anchor once the clock can place it.  Called
+// on arrival and from every render after that.  Apple refuses a rate-1 anchor
+// on an unlocked clock; the sender's reaction to that refusal is unknown, so
+// this accepts it and waits, which is what the ESP32 always did.  Nothing is
+// ever scheduled against an unlocked offset meanwhile: a stream already
+// playing carries on on its old timeline, and a fresh one stays silent.
+static void audio_receiver_arm_rate_anchor(void) {
+  audio_engine_anchor_t anchor;
+  taskENTER_CRITICAL(&receiver.anchor_lock);
+  const bool pending = receiver.rate_anchor_pending;
+  anchor = receiver.rate_anchor;
+  taskEXIT_CRITICAL(&receiver.anchor_lock);
+  if (!pending || !rate_anchor_placeable(&anchor)) {
+    return;
+  }
+  (void)audio_engine_v2_set_rate_anchor(&receiver.engine_v2, &anchor);
+  taskENTER_CRITICAL(&receiver.anchor_lock);
+  // Only if no newer anchor replaced it meanwhile.
+  if (receiver.rate_anchor_pending &&
+      memcmp(&receiver.rate_anchor, &anchor, sizeof(anchor)) == 0) {
+    receiver.rate_anchor_pending = false;
+  }
+  taskEXIT_CRITICAL(&receiver.anchor_lock);
 }
 
 esp_err_t audio_receiver_init(void) {
@@ -301,6 +347,10 @@ esp_err_t audio_receiver_init(void) {
 
   receiver.buffered_listen_socket = -1;
   receiver.buffered_client_socket = -1;
+  receiver.flush_lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
+  receiver.anchor_lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
+  receiver.session_timing_ptp = true;
+  audio_playout_clock_reset(&receiver.playout_clock, AUDIO_PLAYOUT_CLOCK_PTP);
 
   audio_receiver_reset_blocks();
 
@@ -390,17 +440,18 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
   // a normal 2-4 s pre-buffer passes, but small enough to reject stale frames
   // left in the TCP socket buffer after a backward seek.
   const uint32_t gate_window = (uint32_t)(10 * sample_rate);
-  const int32_t seek_threshold = 5 * sample_rate;
 
-  // --- Phase 1: Arm the RTP gates ----------------------------------------
-  //
   // The per-RTP gates filter by timestamp range.  They are armed before
   // anything else here: on single-core ESP32-S2, ESP_LOGI can yield to the
   // scheduler, and the TCP task must not queue stale frames in that gap.
-  bool gates_armed = false;
-
-  // Path A: seek_flush set arm_gate_on_next_anchor because the buffer was
-  // already empty when the flush happened (forward-seek).
+  //
+  // seek_flush set arm_gate_on_next_anchor because the buffer was already
+  // empty when the flush happened (forward-seek).
+  //
+  // There used to be a second path here that flushed everything when an
+  // anchor landed more than 5 s from where the old one predicted.  Apple's
+  // receiver never does that -- buffered audio survives a SETRATEANCHORTIME,
+  // and only FLUSHBUFFERED/FLUSH discard -- and it misfired on long pauses.
   if (receiver.arm_gate_on_next_anchor) {
     receiver.arm_gate_on_next_anchor = false;
     // Once the backlog gate has seen the sequence break, the reader is on the
@@ -420,7 +471,6 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
     receiver.discard_before_rtp_valid = true;
     receiver.discard_above_rtp = above_from + gate_window;
     receiver.discard_above_rtp_valid = true;
-    gates_armed = true;
     ESP_LOGI(
         TAG, "RTP gates armed on anchor: discard_before=%lu discard_above=%lu",
         (unsigned long)rtp_time, (unsigned long)(above_from + gate_window));
@@ -438,83 +488,6 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
       if (stale > 0U) {
         ESP_LOGI(TAG, "Dropped %u blocks before the anchor", (unsigned)stale);
       }
-    }
-  }
-
-  // Path B: Anchor-change detection — the phone changed track with a
-  // PAUSE → RESUME cycle but no FLUSHBUFFERED.
-  //
-  // Compare the new anchor against the EXPECTED current playback position
-  // (old_anchor_rtp + elapsed_time × sample_rate), NOT against the raw old
-  // anchor.  The raw old anchor was set at the start of the previous play
-  // segment; comparing against it gives a delta equal to (elapsed_play_time +
-  // new_anchor_lead_time), which easily exceeds the 5-second threshold on a
-  // normal pause/resume within the same track — causing a false flush that
-  // empties valid pre-buffered frames and produces 6+ seconds of silence.
-  // Using the expected position instead, normal resume gives a delta of only
-  // the anchor's lead-time offset (< 2 s), while a real track-change or seek
-  // gives a huge delta (many minutes).
-  if (!gates_armed && receiver.timing.anchor_valid) {
-    // Choose reference point for the seek-detection comparison:
-    //   - If we have a pause snapshot, use it. The snapshot was taken at the
-    //     exact moment the sender said PAUSE, so it reflects the true pause
-    //     position rather than a wall-clock estimate that keeps running during
-    //     the pause and overshoots by (pause_duration x sample_rate).
-    //   - Otherwise fall back to the elapsed-time estimate (covers the edge
-    //     case where a track changes without a prior PAUSE signal).
-    uint32_t reference_rtp;
-    if (receiver.paused_rtp_valid) {
-      reference_rtp = receiver.paused_rtp;
-      receiver.paused_rtp_valid = false; // one-shot: consume after use
-      // Compute the pause duration from the RTP snapshot so we can notify
-      // the PTP clock without tracking a separate wall-clock timestamp.
-      // anchor_local_time_ns/1000 is the µs when the anchor was set;
-      // adding the played-sample offset gives the µs when play paused.
-      int32_t played =
-          (int32_t)(reference_rtp - receiver.timing.anchor_rtp_time);
-      int64_t pause_time_us = receiver.timing.anchor_local_time_ns / 1000LL +
-                              (int64_t)played * 1000000LL / sample_rate;
-      int64_t pause_us = esp_timer_get_time() - pause_time_us;
-      ptp_clock_notify_resume((pause_us > 0) ? (uint32_t)(pause_us / 1000LL)
-                                             : 0);
-      ESP_LOGD(TAG, "Path B: pause snapshot rtp=%lu pause=%.1f s",
-               (unsigned long)reference_rtp, (float)pause_us / 1e6f);
-    } else {
-      int64_t elapsed_us = esp_timer_get_time() -
-                           (receiver.timing.anchor_local_time_ns / 1000LL);
-      if (elapsed_us < 0) {
-        elapsed_us = 0;
-      }
-      // Cap elapsed to prevent int64 overflow on very long pauses.
-      if (elapsed_us > 600000000LL) {
-        elapsed_us = 600000000LL;
-      }
-      int32_t elapsed_samples =
-          (int32_t)((elapsed_us * (int64_t)sample_rate) / 1000000LL);
-      reference_rtp =
-          receiver.timing.anchor_rtp_time + (uint32_t)elapsed_samples;
-    }
-    int32_t delta = (int32_t)(rtp_time - reference_rtp);
-    int32_t abs_delta = delta < 0 ? -delta : delta;
-    if (abs_delta > seek_threshold) {
-      ESP_LOGI(TAG,
-               "Anchor change detected: ref_rtp=%lu new_rtp=%lu "
-               "delta=%ld samples (%.1f s) - flushing & arming gates",
-               (unsigned long)reference_rtp, (unsigned long)rtp_time,
-               (long)delta, (float)delta / sample_rate);
-      audio_receiver_reset_engine_v2();
-      receiver.timing.deferred_flush_pending = false;
-      receiver.blocks_read_in_sequence = 0;
-      receiver.discard_before_rtp = rtp_time;
-      receiver.discard_before_rtp_valid = true;
-      receiver.discard_above_rtp = rtp_time + gate_window;
-      receiver.discard_above_rtp_valid = true;
-    } else {
-      ESP_LOGD(TAG,
-               "Anchor resume OK: ref_rtp=%lu new_rtp=%lu "
-               "delta=%ld samples (%.2f s) - same track, no flush",
-               (unsigned long)reference_rtp, (unsigned long)rtp_time,
-               (long)delta, (float)delta / (float)sample_rate);
     }
   }
 
@@ -562,53 +535,8 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
   }
 }
 
-// Snapshot the RTP position at the moment of pause so that Path B in
-// audio_receiver_set_anchor_time() can compare the next resume anchor against
-// the actual pause position.  Call it before pausing the scheduler.
-//
-// Without it, Path B uses (anchor_rtp + wall_clock_elapsed), which overshoots
-// by the pause duration and fires a false seek flush on any pause >=
-// seek_threshold (5 s) -- the flush drops the buffer the phone will not
-// resend, and the resume stalls ~5 s before a fallback start.
-//
-// The scheduler's render cursor is the true position.  The wall-clock
-// estimate assumes playback has run from the moment the anchor arrived, and
-// is only the fallback, for a pause that lands before playback started.
-static void snapshot_pause_position(void) {
-  if (receiver.engine_v2_ready &&
-      receiver.engine_v2.scheduler.state == AUDIO_SCHED_PLAYING) {
-    receiver.paused_rtp = receiver.engine_v2.scheduler.cursor_rtp;
-    receiver.paused_rtp_valid = true;
-    ESP_LOGD(TAG, "Pause: RTP snapshot=%lu (render cursor)",
-             (unsigned long)receiver.paused_rtp);
-  } else if (receiver.timing.anchor_valid && receiver.stream) {
-    int sample_rate = receiver.stream->format.sample_rate;
-    if (sample_rate <= 0) {
-      sample_rate = 44100;
-    }
-    int64_t elapsed_us =
-        esp_timer_get_time() - (receiver.timing.anchor_local_time_ns / 1000LL);
-    if (elapsed_us < 0) {
-      elapsed_us = 0;
-    }
-    if (elapsed_us > 600000000LL) {
-      elapsed_us = 600000000LL;
-    }
-    int32_t elapsed_samples =
-        (int32_t)((elapsed_us * (int64_t)sample_rate) / 1000000LL);
-    receiver.paused_rtp =
-        receiver.timing.anchor_rtp_time + (uint32_t)elapsed_samples;
-    receiver.paused_rtp_valid = true;
-    ESP_LOGD(TAG, "Pause: RTP snapshot=%lu (elapsed=%.2f s)",
-             (unsigned long)receiver.paused_rtp, (float)elapsed_us / 1e6f);
-  }
-}
-
 void audio_receiver_set_playing(bool playing) {
   audio_timing_set_playing(&receiver.timing, playing);
-  if (!playing) {
-    snapshot_pause_position();
-  }
   if (receiver.engine_v2_ready) {
     audio_engine_v2_set_playing(&receiver.engine_v2, playing);
   }
@@ -834,13 +762,29 @@ size_t audio_receiver_read(int16_t *buffer, size_t samples) {
 
   if (engine_v2_active()) {
     audio_receiver_arm_engine_v2_anchor();
-    // The scheduler works in the sender's clock domain: network = local +
-    // offset.
-    const int64_t playout_network_ns =
-        audio_output_get_next_playout_time_ns(esp_timer_get_time()) +
-        audio_receiver_network_offset_ns(NULL);
-    return audio_engine_v2_render(&receiver.engine_v2, playout_network_ns,
-                                  buffer, samples);
+    audio_receiver_arm_rate_anchor();
+    // Which clock the anchor is read through: the session's for a buffered
+    // stream, the anchor's own for a realtime one.
+    const bool buffered = receiver.stream == receiver.buffered_stream;
+    const bool ptp = buffered ? receiver.session_timing_ptp
+                              : receiver.engine_v2_anchor_uses_ptp;
+    const audio_playout_clock_kind_t kind =
+        ptp ? AUDIO_PLAYOUT_CLOCK_PTP : AUDIO_PLAYOUT_CLOCK_NTP;
+    const uint32_t reset_req =
+        __atomic_load_n(&receiver.playout_clock_reset_req, __ATOMIC_ACQUIRE);
+    if (receiver.playout_clock.kind != kind ||
+        reset_req != receiver.playout_clock_reset_seen) {
+      receiver.playout_clock_reset_seen = reset_req;
+      audio_playout_clock_reset(&receiver.playout_clock, kind);
+    }
+    // The scheduler works in the sender's clock domain.  The output instant
+    // is converted through the clock's offset+rate model by the engine, under
+    // the lock that also guards the anchor.
+    const int64_t playout_local_ns =
+        audio_output_get_next_playout_time_ns(esp_timer_get_time());
+    return audio_engine_v2_render_local(&receiver.engine_v2, playout_local_ns,
+                                        &receiver.playout_clock, buffer,
+                                        samples);
   }
 
   return 0;
@@ -863,7 +807,6 @@ void audio_receiver_flush(void) {
   receiver.discard_before_rtp_valid = false;
   receiver.discard_above_rtp_valid = false;
   receiver.arm_gate_on_next_anchor = false;
-  receiver.paused_rtp_valid = false;
   receiver.blocks_read_in_sequence = 1;
 }
 
@@ -916,16 +859,145 @@ void audio_receiver_realtime_flush(bool until_valid, uint32_t until_rtp) {
   receiver.arm_gate_on_next_anchor = true;
 }
 
-void audio_receiver_set_deferred_flush(uint32_t flush_until_ts) {
-  if (!receiver.stream) {
+bool audio_receiver_flush_buffered(const audio_flush_record_t *record,
+                                   uint32_t *reply_rtp) {
+  if (!record || !receiver.engine_v2_ready) {
+    return false;
+  }
+  taskENTER_CRITICAL(&receiver.flush_lock);
+  const bool at_once = audio_flush_queue_push(&receiver.flush_queue, record);
+  const size_t pending = audio_flush_queue_pending(&receiver.flush_queue);
+  taskEXIT_CRITICAL(&receiver.flush_lock);
+
+  if (!record->has_from) {
+    // Flush-all: rate 0 and no anchor until the next SETRATEANCHORTIME.  The
+    // epoch is deliberately kept: blocks at or past untilSeq that already
+    // arrived belong to the new position and stay.
+    taskENTER_CRITICAL(&receiver.anchor_lock);
+    receiver.rate_anchor_pending = false;
+    taskEXIT_CRITICAL(&receiver.anchor_lock);
+    audio_timing_set_playing(&receiver.timing, false);
+    audio_engine_v2_stop(&receiver.engine_v2);
+  }
+  // Everything already decoded in the range goes now; what is still queued
+  // or arriving is dropped by the decode worker as it gets there.
+  const size_t dropped =
+      audio_engine_v2_flush_seq_range(&receiver.engine_v2, record->has_from,
+                                      record->from_seq, record->until_seq);
+
+  bool have_rtp = false;
+  if (at_once && reply_rtp) {
+    have_rtp =
+        audio_engine_v2_last_rendered_rtp(&receiver.engine_v2, reply_rtp);
+    if (!have_rtp && receiver.stats.packets_received > 0U) {
+      *reply_rtp = receiver.stats.last_timestamp;
+      have_rtp = true;
+    }
+  }
+  ESP_LOGI(TAG,
+           "FLUSHBUFFERED %s: seq [%s%" PRIu32 ", %" PRIu32 ") ts [%" PRIu32
+           ", %" PRIu32 ") dropped %u buffered, %u record(s) pending",
+           record->has_from ? "deferred" : "immediate",
+           record->has_from ? "" : "..", record->from_seq, record->until_seq,
+           record->from_ts, record->until_ts, (unsigned)dropped,
+           (unsigned)pending);
+  return have_rtp;
+}
+
+void audio_receiver_set_session_timing(bool ptp) {
+  receiver.session_timing_ptp = ptp;
+  __atomic_add_fetch(&receiver.playout_clock_reset_req, 1U, __ATOMIC_RELEASE);
+}
+
+void audio_receiver_set_buffered_latency_samples(uint32_t latency_samples) {
+  receiver.buffered_latency_samples = latency_samples;
+}
+
+void audio_receiver_set_rate_anchor(const audio_rate_anchor_t *anchor) {
+  if (!anchor || !receiver.stream) {
     return;
   }
-  // Write flush_until_ts before arming the flag so no reader ever sees
-  // deferred_flush_pending=true with a stale timestamp.
-  receiver.timing.flush_until_ts = flush_until_ts;
-  receiver.timing.deferred_flush_pending = true;
-  ESP_LOGI(TAG, "Deferred flush armed: flush_until_ts=%" PRIu32,
-           flush_until_ts);
+  if (anchor->rate == 0U) {
+    audio_receiver_pause();
+    return;
+  }
+
+  int sample_rate = receiver.stream->format.sample_rate;
+  if (sample_rate <= 0) {
+    sample_rate = 44100;
+  }
+  // The anchor names the timeline.  Without this, ptp_clock can lock to any
+  // PTP master on the LAN and produce offsets that have nothing to do with
+  // the sender's clock domain.
+  if (receiver.session_timing_ptp && anchor->timeline_id != 0) {
+    ptp_clock_set_master_clock_id(anchor->timeline_id);
+  }
+  audio_timing_set_anchor(&receiver.timing, &receiver.stream->format,
+                          anchor->timeline_id, anchor->network_ns, anchor->rtp);
+
+  const audio_engine_anchor_t engine_anchor = {
+      .rtp = anchor->rtp,
+      .network_ns = anchor->network_ns,
+      .timeline_id = receiver.session_timing_ptp ? anchor->timeline_id : 0,
+      .playout_offset_ns =
+          ((int64_t)receiver.buffered_latency_samples * 1000000000LL) /
+          sample_rate,
+      .fas_valid = anchor->fas_valid,
+      .fas_rtp = anchor->fas_rtp,
+  };
+  taskENTER_CRITICAL(&receiver.anchor_lock);
+  receiver.rate_anchor = engine_anchor;
+  receiver.rate_anchor_pending = true;
+  taskEXIT_CRITICAL(&receiver.anchor_lock);
+
+  audio_receiver_arm_rate_anchor();
+  taskENTER_CRITICAL(&receiver.anchor_lock);
+  const bool deferred = receiver.rate_anchor_pending;
+  taskEXIT_CRITICAL(&receiver.anchor_lock);
+  if (deferred) {
+    receiver.rate_anchor_deferred++;
+    ESP_LOGW(TAG,
+             "Anchor rtp=%" PRIu32 " waits for the %s clock (timeline %016llx)",
+             anchor->rtp, receiver.session_timing_ptp ? "PTP" : "NTP",
+             (unsigned long long)anchor->timeline_id);
+  }
+  audio_receiver_set_playing(true);
+}
+
+void audio_receiver_get_diag(audio_receiver_diag_t *diag) {
+  if (!diag) {
+    return;
+  }
+  memset(diag, 0, sizeof(*diag));
+  diag->state = "none";
+  if (!receiver.engine_v2_ready) {
+    return;
+  }
+  // Plain reads of counters other tasks own: a status line can stand a value
+  // one update old.
+  const audio_engine_v2_t *engine = &receiver.engine_v2;
+  const audio_scheduler_t *scheduler = &engine->scheduler;
+  diag->anchors_installed = engine->anchors_installed;
+  diag->anchors_consistent = engine->anchors_consistent;
+  diag->anchor_resets = scheduler->anchor_resets;
+  diag->anchors_deferred = receiver.rate_anchor_deferred;
+  diag->gm_rebases = receiver.playout_clock.rebases;
+  diag->gm_rebase_failures = receiver.playout_clock.rebase_failures;
+  diag->freewheels = receiver.playout_clock.freewheel_entries;
+  diag->freewheeling = receiver.playout_clock.freewheeling;
+  diag->steps = scheduler->drift_steps;
+  diag->step_clock_deferrals = scheduler->drift_step_clock_deferrals;
+  diag->trims = scheduler->drift_servo_trims;
+  const int sample_rate = engine->format.sample_rate > 0
+                              ? engine->format.sample_rate
+                              : DEFAULT_SAMPLE_RATE;
+  diag->error_us =
+      (int32_t)(((int64_t)scheduler->playout_error_samples * 1000000LL) /
+                sample_rate);
+  diag->flushes_pending = (uint32_t)receiver.flush_queue.count;
+  diag->flush_dropped = receiver.flush_queue.dropped;
+  diag->buffered_blocks = (uint32_t)engine->timeline.count;
+  diag->state = audio_scheduler_state_name(scheduler->state);
 }
 
 void audio_receiver_pause(void) {
@@ -935,9 +1007,19 @@ void audio_receiver_pause(void) {
   // SETRATEANCHORTIME anchor that re-aligns the buffered frames to the
   // correct wall-clock position; no flush or offset compensation is needed.
   audio_timing_set_playing(&receiver.timing, false);
-  snapshot_pause_position();
   if (receiver.engine_v2_ready) {
-    audio_engine_v2_set_playing(&receiver.engine_v2, false);
+    if (receiver.stream == receiver.buffered_stream) {
+      // Rate 0 on Apple flushes the output and invalidates the anchor but
+      // keeps every buffered packet.  Forgetting the anchor matters: the
+      // resume's anchor may still be waiting for the clock, and a scheduler
+      // restarted on the old one would preroll at a stale position.
+      taskENTER_CRITICAL(&receiver.anchor_lock);
+      receiver.rate_anchor_pending = false;
+      taskEXIT_CRITICAL(&receiver.anchor_lock);
+      audio_engine_v2_stop(&receiver.engine_v2);
+    } else {
+      audio_engine_v2_set_playing(&receiver.engine_v2, false);
+    }
   }
   receiver.blocks_read_in_sequence = 0;
 }

@@ -246,21 +246,62 @@ static void trim_resample(int16_t *out, size_t frames, uint8_t channels,
 #define DRIFT_SERVO_WARMUP_RENDERS 250
 
 /* An error the rate limit would take far too long over is made up in one step
- * instead.  A stall of the playback task -- a flash erase, say -- leaves
- * playout tens of milliseconds late at once, and trimming 40 ms away at the
- * limit took 70 s of trims at 25/s, a warble on any steady tone.  Normal
- * operation stays within a fraction of a millisecond, so past
- * DRIFT_STEP_MS for DRIFT_STEP_CONFIRM_RENDERS renders running (both raw and
- * filtered, so one odd measurement cannot trigger it) the cursor skips
- * forward, or holds back behind silence, by the whole error.  The audio fades
- * out and back in over DRIFT_STEP_FADE frames, a short dip instead of a
- * click. */
-#define DRIFT_STEP_MS              5U
-#define DRIFT_STEP_CONFIRM_RENDERS 4U
+ * instead.  A stall of the playback task longer than the DMA ring -- a flash
+ * erase, say -- leaves playout tens of milliseconds late at once, and
+ * trimming 40 ms away at the limit takes a minute of trims at 25/s, a warble
+ * on any steady tone.  The cursor then skips forward, or holds back behind
+ * silence, by the whole error, fading out and back in over DRIFT_STEP_FADE
+ * frames: a short dip instead of a click.
+ *
+ * Apple's buffered receiver never steps mid-stream under PTP (its threshold
+ * is 0xFFFFFFFF; under NTP it is 100 ms) and only re-sets its offset on the
+ * first measurement after an anchor.  What it guards against is stepping on a
+ * clock excursion: the old 5 ms / 4 render (32 ms) trigger stepped out on a
+ * PTP offset jump and back again when the filter recovered, two audible dips
+ * for an error the audio path never had.  So a step now needs:
+ *   - both the raw and the filtered error past DRIFT_STEP_MS, on the same
+ *     side, without a break for DRIFT_STEP_CONFIRM_MS of audio, and
+ *   - the clock offset to have moved less than DRIFT_STEP_CLOCK_STABLE_US
+ *     over that window, and not to have jumped within CLOCK_JUMP_HOLD_MS
+ *     before it.  An error that appears while the clock is moving is the
+ *     clock's, and it may well come back out by itself; the window restarts.
+ * 10 ms / 500 ms is the point the simulation in tests/playout_sim settles on:
+ * a stall that outlasts the 46 ms DMA ring is still made up in one dip within
+ * a second, a PTP excursion shorter than 2 s causes no step at all, and below
+ * 10 ms the servo clears the error within ~15 s at rates that do not warble.
+ *
+ * An early error beyond DRIFT_STEP_HOLD_MAX_MS is not held behind silence (an
+ * unlocked offset could ask for hours); the stream re-prerolls instead. */
+#define DRIFT_STEP_MS              10U
+#define DRIFT_STEP_CONFIRM_MS      500U
+#define DRIFT_STEP_CLOCK_STABLE_US 2000
+#define DRIFT_STEP_HOLD_MAX_MS     500U
 #define DRIFT_STEP_FADE            64U
 
-static void step_reset(audio_scheduler_t *scheduler) {
+/* The re-set after a new anchor: smaller differences are left to the servo,
+ * which removes them without a dip. */
+#define ANCHOR_RESET_MIN_US 2000
+
+/* The servo corrects the DAC against the sender's clock; it cannot tell a
+ * jump of the clock estimate from a real playout error, and chasing a 1.5 s,
+ * 8 ms PTP excursion at the trim rate limit put playout 0.9 ms off and then
+ * took as long to come back.  So when the offset between two renders jumps by
+ * more than CLOCK_JUMP_US -- far beyond what any crystal drifts in 8 ms --
+ * the servo holds still for CLOCK_JUMP_HOLD_MS of audio.  An excursion that
+ * comes back within that never moves playout; a lasting change is followed
+ * once the hold ends, by the servo or by a step. */
+#define CLOCK_JUMP_US      1000
+#define CLOCK_JUMP_HOLD_MS 2000U
+
+static void step_window_reset(audio_scheduler_t *scheduler) {
   scheduler->drift_step_confirm = 0;
+  scheduler->drift_step_confirm_frames = 0;
+  scheduler->drift_step_offset_min_ns = 0;
+  scheduler->drift_step_offset_max_ns = 0;
+}
+
+static void step_reset(audio_scheduler_t *scheduler) {
+  step_window_reset(scheduler);
   scheduler->drift_step_skip = 0;
   scheduler->drift_step_hold = 0;
   scheduler->drift_step_fade_out = false;
@@ -271,6 +312,23 @@ static void step_reset(audio_scheduler_t *scheduler) {
 static bool step_active(const audio_scheduler_t *scheduler) {
   return scheduler->drift_step_fade_out || scheduler->drift_step_hold > 0U ||
          scheduler->drift_step_fade_in > 0U;
+}
+
+/* Forget the error measured so far, and with it the servo's queued
+ * correction: after a step, a start or a new anchor it describes a timeline
+ * that no longer applies.  `warmup` also restarts the start-up hold-off. */
+static void measure_reset(audio_scheduler_t *scheduler, bool warmup) {
+  scheduler->error_filter_valid = false;
+  scheduler->raw_playout_error_samples = 0;
+  scheduler->playout_error_samples = 0;
+  scheduler->filtered_playout_error_q16 = 0;
+  scheduler->drift_reference_error_q16 = 0;
+  scheduler->drift_reference_network_ns = 0;
+  scheduler->drift_servo_accum = 0;
+  scheduler->drift_servo_phase = 0;
+  if (warmup) {
+    scheduler->drift_servo_warmup = 0;
+  }
 }
 
 /* Read `frames` from the cursor on, silence standing in for any it lacks. */
@@ -364,15 +422,8 @@ static size_t step_render(audio_scheduler_t *scheduler,
     /* The skip or the hold is done: fade back in, and measure afresh. */
     scheduler->drift_step_fade_in = DRIFT_STEP_FADE;
     scheduler->drift_step_faded_in = 0;
-    scheduler->error_filter_valid = false;
-    scheduler->raw_playout_error_samples = 0;
-    scheduler->playout_error_samples = 0;
-    scheduler->filtered_playout_error_q16 = 0;
-    scheduler->drift_reference_error_q16 = 0;
-    scheduler->drift_reference_network_ns = 0;
-    scheduler->drift_servo_accum = 0;
-    scheduler->drift_servo_phase = 0;
-    scheduler->drift_step_confirm = 0;
+    measure_reset(scheduler, false);
+    step_window_reset(scheduler);
   }
   step_fade_in(scheduler, &out[k * channels], samples - k, channels);
   return samples;
@@ -400,22 +451,24 @@ void audio_scheduler_begin_epoch(audio_scheduler_t *scheduler, uint32_t epoch,
   scheduler->cursor_rtp = 0;
   scheduler->preroll_started_us = now_us;
   scheduler->wanted_rtp = 0;
-  scheduler->raw_playout_error_samples = 0;
   scheduler->raw_error_span_valid = false;
-  scheduler->playout_error_samples = 0;
-  scheduler->filtered_playout_error_q16 = 0;
   scheduler->max_abs_playout_error_samples = 0;
   scheduler->estimated_drift_ppm = 0;
-  scheduler->drift_reference_error_q16 = 0;
-  scheduler->drift_reference_network_ns = 0;
   scheduler->rendered_samples = 0;
-  scheduler->error_filter_valid = false;
-  scheduler->drift_servo_accum = 0;
-  scheduler->drift_servo_phase = 0;
-  scheduler->drift_servo_warmup = 0;
+  measure_reset(scheduler, true);
   scheduler->drift_servo_trims = 0;
   step_reset(scheduler);
   scheduler->drift_steps = 0;
+  scheduler->drift_step_clock_deferrals = 0;
+  scheduler->clock_offset_valid = false;
+  scheduler->clock_offset_ns = 0;
+  scheduler->last_clock_offset_valid = false;
+  scheduler->servo_hold_frames = 0;
+  scheduler->servo_holds = 0;
+  scheduler->anchor_reset_pending = false;
+  scheduler->anchor_resets = 0;
+  scheduler->fas_valid = false;
+  scheduler->fas_rtp = 0;
   scheduler->wait_reason = AUDIO_SCHED_WAIT_CLOCK_MAP;
   scheduler->render_calls = 0;
   scheduler->silent_render_calls = 0;
@@ -430,6 +483,128 @@ void audio_scheduler_set_paused(audio_scheduler_t *scheduler, bool paused) {
   scheduler->state = paused ? AUDIO_SCHED_PAUSED : AUDIO_SCHED_PREROLL;
   scheduler->wait_reason =
       paused ? AUDIO_SCHED_WAIT_PAUSED : AUDIO_SCHED_WAIT_PREROLL;
+}
+
+void audio_scheduler_new_anchor(audio_scheduler_t *scheduler, bool reposition) {
+  if (!scheduler) {
+    return;
+  }
+  /* A step already fading out or holding finishes on its own terms; cutting
+   * it short would click.  It measures afresh when it is done anyway. */
+  measure_reset(scheduler, false);
+  step_window_reset(scheduler);
+  /* The offset is measured against the anchor, so a new one moves it. */
+  scheduler->last_clock_offset_valid = false;
+  scheduler->servo_hold_frames = 0;
+  scheduler->anchor_reset_pending =
+      reposition && scheduler->state == AUDIO_SCHED_PLAYING;
+}
+
+void audio_scheduler_set_first_audible(audio_scheduler_t *scheduler, bool valid,
+                                       uint32_t rtp) {
+  if (!scheduler) {
+    return;
+  }
+  scheduler->fas_valid = valid;
+  scheduler->fas_rtp = rtp;
+}
+
+void audio_scheduler_set_clock_offset(audio_scheduler_t *scheduler, bool valid,
+                                      int64_t offset_ns) {
+  if (!scheduler) {
+    return;
+  }
+  scheduler->clock_offset_valid = valid;
+  scheduler->clock_offset_ns = offset_ns;
+  if (valid && scheduler->last_clock_offset_valid) {
+    const int64_t jump = offset_ns - scheduler->last_clock_offset_ns;
+    if (jump > CLOCK_JUMP_US * 1000LL || jump < -CLOCK_JUMP_US * 1000LL) {
+      /* In frames at 48 kHz, which covers every rate in use. */
+      scheduler->servo_hold_frames = 48U * CLOCK_JUMP_HOLD_MS;
+      scheduler->servo_holds++;
+    }
+  }
+  scheduler->last_clock_offset_valid = valid;
+  scheduler->last_clock_offset_ns = offset_ns;
+}
+
+/* Silence everything before the first audible sample.  `first_rtp` is the
+ * source position the block started from; a trim inside the block moves its
+ * frames by under one sample, which is below what this needs to resolve. */
+static void fas_gate(audio_scheduler_t *scheduler, int16_t *out,
+                     uint32_t first_rtp, size_t samples, uint8_t channels) {
+  if (!scheduler->fas_valid) {
+    return;
+  }
+  const int32_t ahead = (int32_t)(scheduler->fas_rtp - first_rtp);
+  if (ahead <= 0) {
+    scheduler->fas_valid = false;
+    return;
+  }
+  const size_t mute = (size_t)ahead < samples ? (size_t)ahead : samples;
+  output_silence(out, mute, channels);
+  if ((size_t)ahead <= samples) {
+    scheduler->fas_valid = false;
+  }
+}
+
+/* Start a step by `raw_error` (positive: early, hold back; negative: late,
+ * skip ahead).  Beyond DRIFT_STEP_HOLD_MAX_MS it re-prerolls instead and
+ * returns false. */
+static bool step_begin(audio_scheduler_t *scheduler, int32_t raw_error,
+                       uint32_t sample_rate) {
+  step_window_reset(scheduler);
+  const uint32_t limit = sample_rate * DRIFT_STEP_HOLD_MAX_MS / 1000U;
+  const uint32_t magnitude =
+      raw_error < 0 ? (uint32_t)-(int64_t)raw_error : (uint32_t)raw_error;
+  if (magnitude > limit) {
+    scheduler->state = AUDIO_SCHED_PREROLL;
+    scheduler->wait_reason = AUDIO_SCHED_WAIT_PREROLL;
+    scheduler->preroll_started_us = esp_timer_get_time();
+    measure_reset(scheduler, true);
+    step_reset(scheduler);
+    return false;
+  }
+  if (raw_error < 0) {
+    scheduler->drift_step_skip = magnitude;
+  } else {
+    scheduler->drift_step_hold = magnitude;
+  }
+  scheduler->drift_step_fade_out = true;
+  scheduler->drift_steps++;
+  return true;
+}
+
+/* One more render with the step condition met.  True once it has held for
+ * DRIFT_STEP_CONFIRM_MS with the clock offset steady; an offset that moved
+ * more than DRIFT_STEP_CLOCK_STABLE_US restarts the window. */
+static bool step_window_confirm(audio_scheduler_t *scheduler, size_t samples,
+                                uint32_t sample_rate) {
+  const int64_t offset = scheduler->clock_offset_ns;
+  if (scheduler->drift_step_confirm_frames == 0U) {
+    scheduler->drift_step_offset_min_ns = offset;
+    scheduler->drift_step_offset_max_ns = offset;
+  } else if (scheduler->clock_offset_valid) {
+    if (offset < scheduler->drift_step_offset_min_ns) {
+      scheduler->drift_step_offset_min_ns = offset;
+    }
+    if (offset > scheduler->drift_step_offset_max_ns) {
+      scheduler->drift_step_offset_max_ns = offset;
+    }
+    if (scheduler->drift_step_offset_max_ns -
+            scheduler->drift_step_offset_min_ns >
+        (int64_t)DRIFT_STEP_CLOCK_STABLE_US * 1000LL) {
+      scheduler->drift_step_clock_deferrals++;
+      scheduler->drift_step_confirm = 0;
+      scheduler->drift_step_confirm_frames = 0;
+      scheduler->drift_step_offset_min_ns = offset;
+      scheduler->drift_step_offset_max_ns = offset;
+    }
+  }
+  scheduler->drift_step_confirm++;
+  scheduler->drift_step_confirm_frames += (uint32_t)samples;
+  return (uint64_t)scheduler->drift_step_confirm_frames * 1000U >=
+         (uint64_t)sample_rate * DRIFT_STEP_CONFIRM_MS;
 }
 
 size_t audio_scheduler_render(audio_scheduler_t *scheduler,
@@ -556,29 +731,59 @@ size_t audio_scheduler_render(audio_scheduler_t *scheduler,
      * somewhere to keep the frames waiting to be written back. */
     const bool trimmable =
         samples >= TRIM_MIN_FRAMES && channels <= AUDIO_V2_MAX_CHANNELS;
-    const int32_t step_samples =
-        (int32_t)(clock_map->sample_rate * DRIFT_STEP_MS / 1000U);
+    const uint32_t sample_rate = clock_map->sample_rate;
+    const int32_t step_samples = (int32_t)(sample_rate * DRIFT_STEP_MS / 1000U);
     const int32_t abs_raw = raw_error < 0 ? -raw_error : raw_error;
-    const bool past_step = abs_raw >= step_samples && abs_error >= step_samples;
+    const bool past_step =
+        abs_raw >= step_samples && abs_error >= step_samples &&
+        (raw_error < 0) == (scheduler->playout_error_samples < 0);
+    bool skip_servo = false;
     if (step_active(scheduler)) {
       /* A step is under way, and measures afresh when it is done. */
+      skip_servo = true;
+    } else if (scheduler->anchor_reset_pending &&
+               scheduler->drift_servo_warmup >= DRIFT_SERVO_WARMUP_RENDERS) {
+      /* The first measurement on a new anchor's timeline: go there now. */
+      scheduler->anchor_reset_pending = false;
+      const int32_t reset_samples =
+          (int32_t)((int64_t)sample_rate * ANCHOR_RESET_MIN_US / 1000000);
+      if (abs_raw >= reset_samples) {
+        scheduler->anchor_resets++;
+        skip_servo = true;
+        if (!step_begin(scheduler, raw_error, sample_rate)) {
+          scheduler->silent_render_calls++;
+          output_silence(out, samples, channels);
+          return samples;
+        }
+      }
     } else if (scheduler->drift_servo_warmup < DRIFT_SERVO_WARMUP_RENDERS) {
       scheduler->drift_servo_warmup++;
+      skip_servo = true;
+    } else if (past_step && scheduler->servo_hold_frames > 0U) {
+      /* The clock just jumped: an error it made is not stepped while it may
+       * still jump back.  The window starts once the hold is over. */
+      step_window_reset(scheduler);
     } else if (past_step &&
-               ++scheduler->drift_step_confirm >= DRIFT_STEP_CONFIRM_RENDERS) {
+               step_window_confirm(scheduler, samples, sample_rate)) {
       /* Late: skip ahead.  Early: hold back behind silence. */
-      if (raw_error < 0) {
-        scheduler->drift_step_skip = (uint32_t)-raw_error;
-      } else {
-        scheduler->drift_step_hold = (uint32_t)raw_error;
+      skip_servo = true;
+      if (!step_begin(scheduler, raw_error, sample_rate)) {
+        scheduler->silent_render_calls++;
+        output_silence(out, samples, channels);
+        return samples;
       }
-      scheduler->drift_step_fade_out = true;
-      scheduler->drift_steps++;
-    } else {
+    } else if (!past_step) {
+      step_window_reset(scheduler);
+    }
+    if (scheduler->servo_hold_frames > 0U) {
+      scheduler->servo_hold_frames =
+          scheduler->servo_hold_frames > samples
+              ? scheduler->servo_hold_frames - (uint32_t)samples
+              : 0U;
+      skip_servo = true;
+    }
+    if (!skip_servo) {
       /* Until a step is confirmed, the servo carries on. */
-      if (!past_step) {
-        scheduler->drift_step_confirm = 0;
-      }
       scheduler->drift_servo_accum +=
           (int64_t)scheduler->playout_error_samples * (int64_t)samples;
       if (scheduler->drift_servo_accum > DRIFT_SERVO_ACCUM_LIMIT) {
@@ -623,31 +828,35 @@ size_t audio_scheduler_render(audio_scheduler_t *scheduler,
       (void)audio_timeline_trim_before(timeline, scheduler->epoch, wanted_rtp);
     }
 
+    /* A first audible sample still ahead of the playout position is where the
+     * preroll has to be: the stretch before it plays as silence whether or
+     * not the sender filled it, so waiting for it would only delay the
+     * start. */
+    uint32_t target_rtp = wanted_rtp;
+    if (scheduler->fas_valid &&
+        (int32_t)(scheduler->fas_rtp - wanted_rtp) > 0) {
+      target_rtp = scheduler->fas_rtp;
+    }
+
     /* Start in sample coordinates, not block coordinates.  The requested RTP
      * may fall anywhere inside a 1024-sample AAC PCM frame.  The timeline
      * verifies that a continuous preroll exists from that exact sample and
      * returns the same RTP value, rather than rounding to the next block
      * boundary. */
     if (audio_timeline_find_contiguous_from(
-            timeline, scheduler->epoch, wanted_rtp, scheduler->preroll_samples,
+            timeline, scheduler->epoch, target_rtp, scheduler->preroll_samples,
             0U, &start_rtp)) {
-      scheduler->cursor_rtp = start_rtp;
+      scheduler->cursor_rtp = target_rtp == wanted_rtp ? start_rtp : wanted_rtp;
       /* O(1): older preroll becomes lazily reclaimable on ring collision.
        * No 192-slot cleanup scan is performed at start. */
       audio_timeline_set_playback_floor(timeline, scheduler->epoch,
                                         scheduler->cursor_rtp);
       scheduler->state = AUDIO_SCHED_PLAYING;
       scheduler->wait_reason = AUDIO_SCHED_WAIT_NONE;
-      scheduler->error_filter_valid = false;
-      scheduler->raw_playout_error_samples = 0;
-      scheduler->playout_error_samples = 0;
-      scheduler->filtered_playout_error_q16 = 0;
-      scheduler->drift_reference_error_q16 = 0;
-      scheduler->drift_reference_network_ns = 0;
-      scheduler->drift_servo_accum = 0;
-      scheduler->drift_servo_phase = 0;
-      scheduler->drift_servo_warmup = 0;
+      measure_reset(scheduler, true);
       step_reset(scheduler);
+      /* The start itself lands where the anchor says. */
+      scheduler->anchor_reset_pending = false;
     } else {
       /* fallback_after_us is an elapsed-time timeout.  Both timestamps
        * must use the same monotonic local clock.  preroll_started_us is set
@@ -675,7 +884,7 @@ size_t audio_scheduler_render(audio_scheduler_t *scheduler,
       }
       if (fallback_due &&
           audio_timeline_find_contiguous_from(
-              timeline, scheduler->epoch, wanted_rtp, fallback_samples,
+              timeline, scheduler->epoch, target_rtp, fallback_samples,
               AUDIO_V2_BLOCK_SAMPLES, &start_rtp)) {
         scheduler->cursor_rtp = start_rtp;
         /* O(1) recovery jump: skipped READY slots are reclaimed lazily. */
@@ -683,16 +892,9 @@ size_t audio_scheduler_render(audio_scheduler_t *scheduler,
                                           scheduler->cursor_rtp);
         scheduler->wait_reason = AUDIO_SCHED_WAIT_NONE;
         scheduler->state = AUDIO_SCHED_PLAYING;
-        scheduler->error_filter_valid = false;
-        scheduler->raw_playout_error_samples = 0;
-        scheduler->playout_error_samples = 0;
-        scheduler->filtered_playout_error_q16 = 0;
-        scheduler->drift_reference_error_q16 = 0;
-        scheduler->drift_reference_network_ns = 0;
-        scheduler->drift_servo_accum = 0;
-        scheduler->drift_servo_phase = 0;
-        scheduler->drift_servo_warmup = 0;
+        measure_reset(scheduler, true);
         step_reset(scheduler);
+        scheduler->anchor_reset_pending = false;
       } else {
         scheduler->state = AUDIO_SCHED_PREROLL;
         scheduler->wait_reason = fallback_due ? AUDIO_SCHED_WAIT_FALLBACK_DATA
@@ -715,24 +917,19 @@ size_t audio_scheduler_render(audio_scheduler_t *scheduler,
     scheduler->state = AUDIO_SCHED_RECOVERING;
     scheduler->wait_reason = AUDIO_SCHED_WAIT_FALLBACK_DATA;
     scheduler->preroll_started_us = esp_timer_get_time();
-    scheduler->error_filter_valid = false;
-    scheduler->raw_playout_error_samples = 0;
-    scheduler->playout_error_samples = 0;
-    scheduler->filtered_playout_error_q16 = 0;
-    scheduler->drift_reference_error_q16 = 0;
-    scheduler->drift_reference_network_ns = 0;
-    scheduler->drift_servo_accum = 0;
-    scheduler->drift_servo_phase = 0;
-    scheduler->drift_servo_warmup = 0;
+    measure_reset(scheduler, true);
     step_reset(scheduler);
     scheduler->silent_render_calls++;
     output_silence(out, samples, channels);
     return samples;
   }
 
+  const uint32_t first_rtp = scheduler->cursor_rtp;
   if (step_active(scheduler)) {
-    return step_render(scheduler, timeline, out, samples, channels,
-                       concealed_samples);
+    const size_t stepped = step_render(scheduler, timeline, out, samples,
+                                       channels, concealed_samples);
+    fas_gate(scheduler, out, first_rtp, samples, channels);
+    return stepped;
   }
 
   /* Stretch: read one sample fewer and resample it to the full block, so the
@@ -775,5 +972,6 @@ size_t audio_scheduler_render(audio_scheduler_t *scheduler,
       *concealed_samples += spare_concealed;
     }
   }
+  fas_gate(scheduler, out, first_rtp, samples, channels);
   return produced;
 }

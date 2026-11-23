@@ -191,18 +191,6 @@ bool audio_stream_process_accepted_frame(audio_receiver_state_t *state,
     return false;
   }
 
-  // Deferred FLUSHBUFFERED boundary, as the buffered decode path applies it.
-  // audio_timing_read() used to own this for the realtime stream; the check
-  // has to live wherever the PCM is queued now.
-  uint32_t flush_until_ts = 0;
-  if (audio_timing_take_deferred_flush(&state->timing, timestamp,
-                                       &flush_until_ts)) {
-    (void)audio_engine_v2_deferred_flush(
-        &state->engine_v2, audio_epoch_get(&state->engine_v2.epoch),
-        flush_until_ts);
-    state->blocks_read_in_sequence = 0;
-  }
-
   state->stats.packets_decoded++;
   return audio_stream_push_timeline_pcm(state, timestamp, decode_buffer,
                                         (size_t)decoded_samples, channels);
@@ -218,9 +206,27 @@ bool audio_stream_process_frame(audio_receiver_state_t *state,
                                              audio_len);
 }
 
+// FLUSHBUFFERED decides each buffered packet in stream order, here, just
+// before it would be decoded: the decode queue can hold many seconds of
+// packets that arrived before the flush did.
+static bool flush_drops(audio_receiver_state_t *state, uint32_t seq) {
+  taskENTER_CRITICAL(&state->flush_lock);
+  const bool drop = audio_flush_queue_should_drop(&state->flush_queue, seq);
+  taskEXIT_CRITICAL(&state->flush_lock);
+  return drop;
+}
+
 bool audio_stream_decode_encoded_packet(audio_receiver_state_t *state,
                                         const audio_encoded_packet_t *packet) {
   if (!state || !packet || !packet->payload || packet->payload_len == 0) {
+    return false;
+  }
+
+  // Read before the flush check: a sweep that lands after it bumps the
+  // generation, and the publish below then fails and asks again.
+  uint32_t flush_generation =
+      audio_engine_v2_flush_generation(&state->engine_v2);
+  if (flush_drops(state, packet->seq)) {
     return false;
   }
 
@@ -299,28 +305,29 @@ bool audio_stream_decode_encoded_packet(audio_receiver_state_t *state,
   (void)__atomic_add_fetch(&state->engine_v2.diag_decode_ok, 1U,
                            __ATOMIC_RELAXED);
 
-  // Deferred FLUSHBUFFERED boundary: cut the timeline here so this packet and
-  // its successors replace the tail of the outgoing track.  Applied before the
-  // push so the freed slots are immediately reusable.
-  uint32_t flush_until_ts = 0;
-  if (audio_timing_take_deferred_flush(&state->timing, packet->rtp_timestamp,
-                                       &flush_until_ts)) {
-    (void)audio_engine_v2_deferred_flush(&state->engine_v2, packet->epoch,
-                                         flush_until_ts);
-    state->blocks_read_in_sequence = 0;
-  }
-
   // Re-check the gates: a concurrent seek can have armed them while this
   // frame was in the decoder.
   if (timestamp_is_gated(state, packet->rtp_timestamp)) {
     return false;
   }
 
-  if (!audio_engine_v2_push_pcm_wait(&state->engine_v2, packet->epoch,
-                                     packet->rtp_timestamp, decode_buffer,
-                                     (size_t)decoded_samples, (uint8_t)channels,
-                                     AUDIO_DECODE_PUSH_TIMEOUT_MS)) {
-    return false;
+  for (;;) {
+    const audio_engine_push_result_t pushed = audio_engine_v2_push_pcm_seq_wait(
+        &state->engine_v2, packet->epoch, packet->rtp_timestamp, packet->seq,
+        flush_generation, decode_buffer, (size_t)decoded_samples,
+        (uint8_t)channels, AUDIO_DECODE_PUSH_TIMEOUT_MS);
+    if (pushed == AUDIO_ENGINE_PUSH_OK) {
+      break;
+    }
+    if (pushed != AUDIO_ENGINE_PUSH_FLUSHED) {
+      return false;
+    }
+    // A FLUSHBUFFERED swept the timeline while this block was decoded or
+    // waiting for room: it applies to this one too.
+    flush_generation = audio_engine_v2_flush_generation(&state->engine_v2);
+    if (flush_drops(state, packet->seq)) {
+      return false;
+    }
   }
 
   // The arrival was already counted by the TCP reader that enqueued it; this

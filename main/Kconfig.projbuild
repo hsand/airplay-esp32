@@ -190,6 +190,18 @@ menu "Airplay ESP Configuration"
                 when needed.
     endchoice
 
+    config AUDIO_OUTPUT_EXTRA_LATENCY_US
+        int "Output latency beyond the DMA ring (us)"
+        range 0 100000
+        default 5000
+        help
+            Delay between a sample leaving the I2S DMA ring and it being
+            heard: task scheduling, the resampler and the DAC's own group
+            delay. The playback task schedules every block this much early,
+            and RECORD reports it to the sender as part of Audio-Latency.
+            5000 has always been used; it has not been measured on any DAC,
+            so a scope or loopback measurement of a board is a better value.
+
     config SOFTWARE_EQ
         bool "Software parametric EQ"
         depends on AUDIO_OUTPUT_I2S && !DAC_TAS58XX && !DAC_TAS57XX

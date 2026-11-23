@@ -18,6 +18,18 @@ static const char *TAG = "audio_v2";
  * consumer never signals. */
 #define AUDIO_V2_PUSH_WAIT_SLICE_MS 50U
 
+/* A rate-1 anchor that puts the RTP being played within this of where the
+ * current timeline has it is the same timeline restated, and is left alone.
+ * Senders re-anchor with values computed from their own clock reading, so
+ * the restatement is never bit-exact; a millisecond covers that and is still
+ * far below anything audible as a sync error.  [I] Apple's hose ignores a
+ * rate-1 re-anchor while running outright; this only does so when it is
+ * consistent, and otherwise moves playout onto the new timeline. */
+#define ANCHOR_CONSISTENT_US 1000
+
+static void control_lock(audio_engine_v2_t *engine);
+static void control_unlock(audio_engine_v2_t *engine);
+
 /* Startup watchdog: first report, then the interval between repeats. */
 #define START_STALL_AFTER_US  3000000LL
 #define START_STALL_REPEAT_US 10000000LL
@@ -38,6 +50,11 @@ esp_err_t audio_engine_v2_init(audio_engine_v2_t *engine,
       audio_timeline_init(&engine->timeline, capacity, frame_samples);
   if (err != ESP_OK) {
     return err;
+  }
+  engine->control_mutex = xSemaphoreCreateMutex();
+  if (!engine->control_mutex) {
+    audio_timeline_deinit(&engine->timeline);
+    return ESP_ERR_NO_MEM;
   }
 
   engine->format = *format;
@@ -61,6 +78,9 @@ void audio_engine_v2_deinit(audio_engine_v2_t *engine) {
     return;
   }
   audio_timeline_deinit(&engine->timeline);
+  if (engine->control_mutex) {
+    vSemaphoreDelete(engine->control_mutex);
+  }
   memset(engine, 0, sizeof(*engine));
 }
 
@@ -76,8 +96,10 @@ uint32_t audio_engine_v2_begin_epoch(audio_engine_v2_t *engine,
   /* Outside the critical section: waking a producer blocked on a full
    * timeline has to happen with interrupts enabled. */
   audio_timeline_signal_space(&engine->timeline);
+  control_lock(engine);
   audio_clock_map_reset(&engine->clock_map);
   audio_scheduler_begin_epoch(&engine->scheduler, next, now_us);
+  control_unlock(engine);
   engine->concealed_samples = 0;
   engine->blocks_inserted = 0;
   engine->blocks_rejected = 0;
@@ -114,9 +136,11 @@ void audio_engine_v2_set_format(audio_engine_v2_t *engine,
       format->channels > AUDIO_V2_MAX_CHANNELS) {
     return;
   }
+  control_lock(engine);
   engine->format = *format;
   engine->scheduler.preroll_samples =
       (uint32_t)((uint64_t)format->sample_rate * 180U / 1000U);
+  control_unlock(engine);
 }
 
 bool audio_engine_v2_set_frame_samples(audio_engine_v2_t *engine,
@@ -142,6 +166,18 @@ bool audio_engine_v2_set_frame_samples(audio_engine_v2_t *engine,
  * START_STALL_REPEAT_US for as long as it stays stuck.  Called from the
  * render path and from every anchor, so a stall still shows when nothing is
  * rendering. */
+static void control_lock(audio_engine_v2_t *engine) {
+  if (engine->control_mutex) {
+    (void)xSemaphoreTake(engine->control_mutex, portMAX_DELAY);
+  }
+}
+
+static void control_unlock(audio_engine_v2_t *engine) {
+  if (engine->control_mutex) {
+    (void)xSemaphoreGive(engine->control_mutex);
+  }
+}
+
 static void start_watchdog_check(audio_engine_v2_t *engine, int64_t now_us) {
   if (!engine->start_watchdog_armed ||
       engine->start_watchdog_epoch != engine->scheduler.epoch ||
@@ -202,6 +238,7 @@ bool audio_engine_v2_set_anchor(audio_engine_v2_t *engine, uint32_t anchor_rtp,
   if (!engine || !engine->initialized) {
     return false;
   }
+  control_lock(engine);
   bool ok = audio_clock_map_set(
       &engine->clock_map, (uint32_t)engine->format.sample_rate, anchor_rtp,
       anchor_network_ns, playout_offset_ns);
@@ -222,8 +259,129 @@ bool audio_engine_v2_set_anchor(audio_engine_v2_t *engine, uint32_t anchor_rtp,
       engine->start_watchdog_epoch = engine->scheduler.epoch;
       engine->start_watchdog_anchor_rtp = anchor_rtp;
     }
-    start_watchdog_check(engine, now_us);
   }
+  control_unlock(engine);
+  if (ok) {
+    /* Outside the lock: it may log, and the playback task must never wait
+     * behind a log line. */
+    start_watchdog_check(engine, esp_timer_get_time());
+  }
+  return ok;
+}
+
+audio_engine_anchor_result_t
+audio_engine_v2_set_rate_anchor(audio_engine_v2_t *engine,
+                                const audio_engine_anchor_t *anchor) {
+  if (!engine || !engine->initialized || !anchor ||
+      anchor->network_ns > (uint64_t)INT64_MAX ||
+      engine->format.sample_rate <= 0) {
+    return AUDIO_ENGINE_ANCHOR_REJECTED;
+  }
+  const uint32_t sample_rate = (uint32_t)engine->format.sample_rate;
+  audio_engine_anchor_result_t result = AUDIO_ENGINE_ANCHOR_INSTALLED;
+
+  control_lock(engine);
+  audio_scheduler_t *scheduler = &engine->scheduler;
+  audio_clock_map_t *map = &engine->clock_map;
+  const bool playing = scheduler->state == AUDIO_SCHED_PLAYING;
+  if (playing && map->valid && map->sample_rate == sample_rate &&
+      (map->timeline_id == anchor->timeline_id || map->timeline_id == 0 ||
+       anchor->timeline_id == 0)) {
+    /* Where the current timeline plays the anchor's RTP, against where the
+     * new anchor wants it. */
+    int64_t current_ns = 0;
+    (void)audio_clock_map_rtp_to_network(map, anchor->rtp, &current_ns);
+    const int64_t wanted_ns =
+        (int64_t)anchor->network_ns + anchor->playout_offset_ns;
+    const int64_t diff_ns = wanted_ns - current_ns;
+    if (diff_ns <= ANCHOR_CONSISTENT_US * 1000LL &&
+        diff_ns >= -ANCHOR_CONSISTENT_US * 1000LL) {
+      result = AUDIO_ENGINE_ANCHOR_CONSISTENT;
+    }
+  }
+
+  if (result == AUDIO_ENGINE_ANCHOR_CONSISTENT) {
+    /* The timeline being played already says this.  The first audible sample
+     * is not re-applied either: what it gates has long been rendered or sits
+     * inside audio the sender has already committed to. */
+    engine->anchors_consistent++;
+  } else {
+    (void)audio_clock_map_set(map, sample_rate, anchor->rtp, anchor->network_ns,
+                              anchor->playout_offset_ns);
+    map->timeline_id = anchor->timeline_id;
+    audio_scheduler_new_anchor(scheduler, playing);
+    /* The first audible sample gates a start.  Under a stream that is already
+     * playing, the move onto the new timeline is the reset step; muting up
+     * to a first audible sample that lies ahead of the cursor as well would
+     * cut a hole into audio that is meant to carry on.  [I] Apple's legacy
+     * path would gate there too; its default hose path only trims the one
+     * buffer still to be enqueued that holds it. */
+    audio_scheduler_set_first_audible(scheduler, anchor->fas_valid && !playing,
+                                      anchor->fas_rtp);
+    if (scheduler->state == AUDIO_SCHED_WAIT_ANCHOR) {
+      scheduler->state = AUDIO_SCHED_PREROLL;
+      scheduler->wait_reason = AUDIO_SCHED_WAIT_PREROLL;
+      scheduler->preroll_started_us = esp_timer_get_time();
+    }
+    engine->anchors_installed++;
+    const int64_t now_us = esp_timer_get_time();
+    if (!engine->start_watchdog_armed ||
+        engine->start_watchdog_epoch != scheduler->epoch) {
+      engine->start_watchdog_armed = true;
+      engine->start_watchdog_anchor_us = now_us;
+      engine->start_watchdog_report_us = 0;
+      engine->start_watchdog_epoch = scheduler->epoch;
+      engine->start_watchdog_anchor_rtp = anchor->rtp;
+    }
+  }
+  control_unlock(engine);
+  return result;
+}
+
+void audio_engine_v2_stop(audio_engine_v2_t *engine) {
+  if (!engine || !engine->initialized) {
+    return;
+  }
+  control_lock(engine);
+  engine->playing = false;
+  engine->start_watchdog_armed = false;
+  audio_clock_map_reset(&engine->clock_map);
+  audio_scheduler_set_paused(&engine->scheduler, true);
+  audio_scheduler_set_first_audible(&engine->scheduler, false, 0);
+  audio_scheduler_new_anchor(&engine->scheduler, false);
+  control_unlock(engine);
+}
+
+size_t audio_engine_v2_flush_seq_range(audio_engine_v2_t *engine, bool has_from,
+                                       uint32_t from_seq, uint32_t until_seq) {
+  if (!engine || !engine->initialized) {
+    return 0U;
+  }
+  /* The generation moves first: a decode that checked the flush queue before
+   * the caller updated it then fails its publish and checks again, and one
+   * that published before this point is caught by the sweep below. */
+  portENTER_CRITICAL(&engine->publish_lock);
+  engine->flush_generation++;
+  const uint32_t epoch = audio_epoch_get(&engine->epoch);
+  portEXIT_CRITICAL(&engine->publish_lock);
+  return audio_timeline_discard_seq_range(&engine->timeline, epoch, has_from,
+                                          from_seq, until_seq);
+}
+
+uint32_t audio_engine_v2_flush_generation(const audio_engine_v2_t *engine) {
+  return engine ? __atomic_load_n(&engine->flush_generation, __ATOMIC_ACQUIRE)
+                : 0U;
+}
+
+bool audio_engine_v2_last_rendered_rtp(audio_engine_v2_t *engine,
+                                       uint32_t *rtp) {
+  if (!engine || !engine->initialized || !rtp) {
+    return false;
+  }
+  control_lock(engine);
+  const bool ok = engine->scheduler.rendered_samples > 0U;
+  *rtp = engine->scheduler.cursor_rtp;
+  control_unlock(engine);
   return ok;
 }
 
@@ -233,6 +391,7 @@ void audio_engine_v2_wait_for_anchor(audio_engine_v2_t *engine,
     return;
   }
 
+  control_lock(engine);
   audio_clock_map_reset(&engine->clock_map);
   engine->scheduler.state =
       engine->playing ? AUDIO_SCHED_WAIT_ANCHOR : AUDIO_SCHED_PAUSED;
@@ -250,6 +409,7 @@ void audio_engine_v2_wait_for_anchor(audio_engine_v2_t *engine,
   engine->scheduler.drift_servo_phase = 0;
   engine->scheduler.drift_servo_warmup = 0;
   engine->scheduler.preroll_started_us = now_us;
+  control_unlock(engine);
 }
 
 void audio_engine_v2_set_playing(audio_engine_v2_t *engine, bool playing) {
@@ -263,6 +423,7 @@ void audio_engine_v2_set_playing(audio_engine_v2_t *engine, bool playing) {
    * because playing was already true can leave a PAUSED/IDLE scheduler
    * stranded, while blindly calling set_paused(false) can kick a running
    * scheduler back to PREROLL. */
+  control_lock(engine);
   engine->playing = playing;
 
   if (!playing) {
@@ -270,6 +431,7 @@ void audio_engine_v2_set_playing(audio_engine_v2_t *engine, bool playing) {
     if (engine->scheduler.state != AUDIO_SCHED_PAUSED) {
       audio_scheduler_set_paused(&engine->scheduler, true);
     }
+    control_unlock(engine);
     return;
   }
 
@@ -279,7 +441,7 @@ void audio_engine_v2_set_playing(audio_engine_v2_t *engine, bool playing) {
   case AUDIO_SCHED_PREROLL:
   case AUDIO_SCHED_RECOVERING:
     /* Already active for this epoch.  Do not disturb cursor/preroll. */
-    return;
+    break;
 
   case AUDIO_SCHED_PAUSED:
   case AUDIO_SCHED_IDLE:
@@ -293,8 +455,9 @@ void audio_engine_v2_set_playing(audio_engine_v2_t *engine, bool playing) {
                                         ? AUDIO_SCHED_WAIT_PREROLL
                                         : AUDIO_SCHED_WAIT_CLOCK_MAP;
     engine->scheduler.preroll_started_us = esp_timer_get_time();
-    return;
+    break;
   }
+  control_unlock(engine);
 }
 
 bool audio_engine_v2_is_nearly_full(audio_engine_v2_t *engine) {
@@ -313,30 +476,15 @@ bool audio_engine_v2_play_cursor(const audio_engine_v2_t *engine,
   return true;
 }
 
-size_t audio_engine_v2_deferred_flush(audio_engine_v2_t *engine, uint32_t epoch,
-                                      uint32_t flush_rtp) {
-  if (!engine || !engine->initialized) {
-    return 0U;
-  }
-
-  /* Deliberately not an epoch change.  A track transition keeps a continuous
-   * RTP timeline and the sender sends no fresh SETRATEANCHORTIME, so resetting
-   * the clock map here would leave the scheduler in WAIT_ANCHOR forever. */
-  const size_t dropped =
-      audio_timeline_discard_from(&engine->timeline, epoch, flush_rtp);
-  ESP_LOGI(TAG, "deferred flush at rtp=%" PRIu32 " dropped=%u remaining=%u",
-           flush_rtp, (unsigned)dropped,
-           (unsigned)audio_timeline_count(&engine->timeline));
-  return dropped;
-}
-
-bool audio_engine_v2_push_pcm(audio_engine_v2_t *engine, uint32_t epoch,
-                              uint32_t first_rtp, const int16_t *pcm,
-                              size_t samples, uint8_t channels) {
+/* `flush_generation` NULL: the block is not subject to FLUSHBUFFERED. */
+static audio_engine_push_result_t
+push_pcm(audio_engine_v2_t *engine, uint32_t epoch, uint32_t first_rtp,
+         uint32_t seq_tag, const uint32_t *flush_generation, const int16_t *pcm,
+         size_t samples, uint8_t channels) {
   if (!engine || !engine->initialized || !pcm || samples == 0U ||
       samples > engine->timeline.frame_samples || channels == 0U ||
       channels > AUDIO_V2_MAX_CHANNELS) {
-    return false;
+    return AUDIO_ENGINE_PUSH_FAILED;
   }
 
   audio_timeline_reservation_t reservation = {0};
@@ -350,14 +498,18 @@ bool audio_engine_v2_push_pcm(audio_engine_v2_t *engine, uint32_t epoch,
   if (!audio_epoch_matches(&engine->epoch, epoch)) {
     engine->blocks_rejected++;
     portEXIT_CRITICAL(&engine->publish_lock);
-    return false;
+    return AUDIO_ENGINE_PUSH_FAILED;
+  }
+  if (flush_generation && *flush_generation != engine->flush_generation) {
+    portEXIT_CRITICAL(&engine->publish_lock);
+    return AUDIO_ENGINE_PUSH_FLUSHED;
   }
 
-  if (!audio_timeline_reserve(&engine->timeline, epoch, first_rtp, &reservation,
-                              &timeline_pcm)) {
+  if (!audio_timeline_reserve(&engine->timeline, epoch, first_rtp, seq_tag,
+                              &reservation, &timeline_pcm)) {
     engine->blocks_rejected++;
     portEXIT_CRITICAL(&engine->publish_lock);
-    return false;
+    return AUDIO_ENGINE_PUSH_FAILED;
   }
 
   /* A retransmitted/duplicate block that is already READY needs no second
@@ -366,7 +518,7 @@ bool audio_engine_v2_push_pcm(audio_engine_v2_t *engine, uint32_t epoch,
     engine->blocks_inserted++;
     (void)__atomic_add_fetch(&engine->diag_pcm_inserted, 1U, __ATOMIC_RELAXED);
     portEXIT_CRITICAL(&engine->publish_lock);
-    return true;
+    return AUDIO_ENGINE_PUSH_OK;
   }
 
   portEXIT_CRITICAL(&engine->publish_lock);
@@ -391,29 +543,44 @@ bool audio_engine_v2_push_pcm(audio_engine_v2_t *engine, uint32_t epoch,
     audio_timeline_cancel(&engine->timeline, &reservation);
     engine->blocks_rejected++;
     portEXIT_CRITICAL(&engine->publish_lock);
-    return false;
+    return AUDIO_ENGINE_PUSH_FAILED;
+  }
+  /* A sweep since the check: it could not see this block, so it is not
+   * published until the caller has checked it against the new records. */
+  if (flush_generation && *flush_generation != engine->flush_generation) {
+    audio_timeline_cancel(&engine->timeline, &reservation);
+    portEXIT_CRITICAL(&engine->publish_lock);
+    return AUDIO_ENGINE_PUSH_FLUSHED;
   }
 
   if (!audio_timeline_commit(&engine->timeline, &reservation)) {
     /* commit() consumes/cancels a valid reservation on every terminal path. */
     engine->blocks_rejected++;
     portEXIT_CRITICAL(&engine->publish_lock);
-    return false;
+    return AUDIO_ENGINE_PUSH_FAILED;
   }
 
   engine->blocks_inserted++;
   (void)__atomic_add_fetch(&engine->diag_pcm_inserted, 1U, __ATOMIC_RELAXED);
 
   portEXIT_CRITICAL(&engine->publish_lock);
-  return true;
+  return AUDIO_ENGINE_PUSH_OK;
 }
 
-bool audio_engine_v2_push_pcm_wait(audio_engine_v2_t *engine, uint32_t epoch,
-                                   uint32_t first_rtp, const int16_t *pcm,
-                                   size_t samples, uint8_t channels,
-                                   uint32_t timeout_ms) {
+bool audio_engine_v2_push_pcm(audio_engine_v2_t *engine, uint32_t epoch,
+                              uint32_t first_rtp, const int16_t *pcm,
+                              size_t samples, uint8_t channels) {
+  return push_pcm(engine, epoch, first_rtp, 0U, NULL, pcm, samples, channels) ==
+         AUDIO_ENGINE_PUSH_OK;
+}
+
+static audio_engine_push_result_t
+push_pcm_wait(audio_engine_v2_t *engine, uint32_t epoch, uint32_t first_rtp,
+              uint32_t seq_tag, const uint32_t *flush_generation,
+              const int16_t *pcm, size_t samples, uint8_t channels,
+              uint32_t timeout_ms) {
   if (!engine || !engine->initialized) {
-    return false;
+    return AUDIO_ENGINE_PUSH_FAILED;
   }
 
   const int64_t deadline_us =
@@ -436,21 +603,36 @@ bool audio_engine_v2_push_pcm_wait(audio_engine_v2_t *engine, uint32_t epoch,
                  "Dropping rtp=%" PRIu32
                  ": another phase than the %u blocks held",
                  first_rtp, (unsigned)held);
-        return false;
+        return AUDIO_ENGINE_PUSH_FAILED;
       }
       ESP_LOGW(TAG, "Dropping %u blocks of another phase ahead of rtp=%" PRIu32,
                (unsigned)held, first_rtp);
       audio_timeline_clear(&engine->timeline);
     }
+    if (flush_generation &&
+        *flush_generation != audio_engine_v2_flush_generation(engine)) {
+      return AUDIO_ENGINE_PUSH_FLUSHED;
+    }
     if (!audio_timeline_phase_blocked(&engine->timeline, epoch, first_rtp) &&
         audio_timeline_free_slots(&engine->timeline) > 0U) {
-      return audio_engine_v2_push_pcm(engine, epoch, first_rtp, pcm, samples,
-                                      channels);
+      const audio_engine_push_result_t pushed =
+          push_pcm(engine, epoch, first_rtp, seq_tag, flush_generation, pcm,
+                   samples, channels);
+      if (pushed != AUDIO_ENGINE_PUSH_FAILED ||
+          !audio_epoch_matches(&engine->epoch, epoch)) {
+        return pushed;
+      }
+      /* A free slot is not necessarily this block's: the ring is addressed
+       * by RTP, so after a lost packet the free slot is the hole's, and this
+       * block maps onto one still holding unplayed audio.  Returning here
+       * dropped every packet until the hole came round -- 4.5 s of silence
+       * in tests/playout_sim lost_packet -- so it waits like a full
+       * timeline, and the sender is held back instead. */
     }
 
     const int64_t remaining_us = deadline_us - esp_timer_get_time();
     if (remaining_us <= 0) {
-      return false;
+      return AUDIO_ENGINE_PUSH_FAILED;
     }
 
     /* Block on the consumer instead of polling.  The timeline gives this
@@ -464,16 +646,39 @@ bool audio_engine_v2_push_pcm_wait(audio_engine_v2_t *engine, uint32_t epoch,
     }
     (void)audio_timeline_wait_for_space(&engine->timeline, wait_ms + 1U);
   }
-  return false;
+  return AUDIO_ENGINE_PUSH_FAILED;
 }
 
-size_t audio_engine_v2_render(audio_engine_v2_t *engine,
-                              int64_t output_network_ns, int16_t *out,
-                              size_t samples) {
-  if (!engine || !engine->initialized || !out || samples == 0U) {
-    return 0;
-  }
+bool audio_engine_v2_push_pcm_wait(audio_engine_v2_t *engine, uint32_t epoch,
+                                   uint32_t first_rtp, const int16_t *pcm,
+                                   size_t samples, uint8_t channels,
+                                   uint32_t timeout_ms) {
+  return push_pcm_wait(engine, epoch, first_rtp, 0U, NULL, pcm, samples,
+                       channels, timeout_ms) == AUDIO_ENGINE_PUSH_OK;
+}
+
+audio_engine_push_result_t audio_engine_v2_push_pcm_seq_wait(
+    audio_engine_v2_t *engine, uint32_t epoch, uint32_t first_rtp, uint32_t seq,
+    uint32_t flush_generation, const int16_t *pcm, size_t samples,
+    uint8_t channels, uint32_t timeout_ms) {
+  return push_pcm_wait(engine, epoch, first_rtp,
+                       AUDIO_TIMELINE_SEQ_VALID | (seq & 0xFFFFFFU),
+                       &flush_generation, pcm, samples, channels, timeout_ms);
+}
+
+/* Caller holds control_mutex.  have_clock false: no conversion of the output
+ * instant exists yet, so nothing may be scheduled against output_network_ns. */
+static size_t render_locked(audio_engine_v2_t *engine,
+                            int64_t output_network_ns, bool have_clock,
+                            int16_t *out, size_t samples) {
   __atomic_add_fetch(&engine->render_calls, 1, __ATOMIC_RELAXED);
+  if (engine->playing && !have_clock && engine->clock_map.valid) {
+    /* Hold position: silence now, and the cursor stays where it is for when
+     * the clock comes. */
+    engine->scheduler.wait_reason = AUDIO_SCHED_WAIT_PTP_TO_RTP;
+    memset(out, 0, samples * engine->format.channels * sizeof(int16_t));
+    return samples;
+  }
   if (!engine->playing) {
     memset(out, 0, samples * engine->format.channels * sizeof(int16_t));
     start_watchdog_check(engine, esp_timer_get_time());
@@ -554,15 +759,56 @@ size_t audio_engine_v2_render(audio_engine_v2_t *engine,
              "playout: raw=%s%" PRIu32 ".%03" PRIu32 " ms span=%" PRId32
              " us filt=%s%" PRIu32 ".%03" PRIu32 " ms (%" PRId32
              " smp) drift=%" PRId32 " ppm trims=%" PRIu32 "/s (%" PRIu32
-             ") steps=%" PRIu32 " buffered=%u concealed=%" PRIu64
-             " holes=%" PRIu64 " (+%" PRIu64 ")",
+             ") steps=%" PRIu32 " (anchor %" PRIu32 ") clock-holds=%" PRIu32
+             " buffered=%u concealed=%" PRIu64 " holes=%" PRIu64 " (+%" PRIu64
+             ")",
              raw_us < 0 ? "-" : "", raw_abs_us / 1000U, raw_abs_us % 1000U,
              span_us, filtered_us < 0 ? "-" : "", filtered_abs_us / 1000U,
              filtered_abs_us % 1000U, filtered_samples,
              engine->scheduler.estimated_drift_ppm, new_trims,
              engine->scheduler.drift_servo_trims, engine->scheduler.drift_steps,
+             engine->scheduler.anchor_resets, engine->scheduler.servo_holds,
              (unsigned)audio_timeline_count(&engine->timeline),
              engine->concealed_samples, engine->conceal_events, new_conceals);
   }
+  return produced;
+}
+
+size_t audio_engine_v2_render(audio_engine_v2_t *engine,
+                              int64_t output_network_ns, int16_t *out,
+                              size_t samples) {
+  if (!engine || !engine->initialized || !out || samples == 0U) {
+    return 0;
+  }
+  control_lock(engine);
+  audio_scheduler_set_clock_offset(&engine->scheduler, false, 0);
+  const size_t produced =
+      render_locked(engine, output_network_ns, true, out, samples);
+  control_unlock(engine);
+  return produced;
+}
+
+size_t audio_engine_v2_render_local(audio_engine_v2_t *engine,
+                                    int64_t output_local_ns,
+                                    audio_playout_clock_t *clock, int16_t *out,
+                                    size_t samples) {
+  if (!engine || !engine->initialized || !out || samples == 0U || !clock) {
+    return 0;
+  }
+  control_lock(engine);
+  int64_t network_ns = 0;
+  const bool have_clock =
+      engine->clock_map.valid &&
+      audio_playout_clock_convert(clock, &engine->clock_map, output_local_ns,
+                                  &network_ns);
+  /* Measured against the anchor, so a grandmaster change -- which moves the
+   * network time and the anchor alike -- is no jump. */
+  audio_scheduler_set_clock_offset(
+      &engine->scheduler, have_clock,
+      network_ns - (int64_t)engine->clock_map.anchor_network_ns -
+          output_local_ns);
+  const size_t produced =
+      render_locked(engine, network_ns, have_clock, out, samples);
+  control_unlock(engine);
   return produced;
 }

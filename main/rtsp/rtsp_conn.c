@@ -9,7 +9,6 @@
 
 #include "audio_receiver.h"
 #include "esp_log.h"
-#include "ptp_clock.h"
 #include "settings.h"
 
 static const char *TAG = "rtsp_conn";
@@ -109,8 +108,9 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn) {
   conn->event_port = 0;
   conn->buffered_port = 0;
 
-  // Clear PTP clock for fresh sync on next connection
-  ptp_clock_clear();
+  // The PTP clock is released by the caller, and only for the connection that
+  // owns the session (rtsp_server.c): a connection being replaced must not
+  // clear the clock its successor's SETUP has already started using.
 
   // Reset encryption state
   conn->encrypted_mode = false;
