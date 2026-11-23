@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Run the realtime stream's missing-packet tracker through losses on the host.
+"""Run the realtime stream's missing-packet tracker through losses on the host,
+against the v0.3.0 tracker kept in baseline/.
 
 Requires Python 3 and a C compiler; no ESP-IDF installation or hardware needed.
 Run from any directory with: python3 tests/rtp_resend/run.py
@@ -22,8 +23,11 @@ with tempfile.TemporaryDirectory(prefix="rtp-resend-tests-") as temporary:
         "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-g", "-O1",
         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
         "-I", str(ROOT / "main/audio"),
+        "-I", str(HERE),
         str(HERE / "test.c"), str(ROOT / "main/audio/rtp_resend.c"),
-        "-o", str(build / "test"),
+        # The v0.3.0 tracker, for the A/B loss simulation.
+        str(HERE / "v030.c"),
+        "-lm", "-o", str(build / "test"),
     ]
     print("RTP resend host tests", flush=True)
     subprocess.run(command, check=True)
