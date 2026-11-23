@@ -85,6 +85,15 @@ jobs:
       - name: Test the realtime stream's resend requests
         run: python3 tests/rtp_resend/run.py
 
+      - name: Test the realtime stream's sync-packet map
+        run: python3 tests/rtp_sync/run.py
+
+      - name: Test packet-loss concealment
+        run: python3 tests/audio_plc/run.py
+
+      - name: Simulate the AirPlay 1 NTP clock against v0.3.0
+        run: python3 tests/ntp_sim/run.py
+
       - name: Test AirPlay device names in binary plists
         run: python3 tests/bplist/run.py
 

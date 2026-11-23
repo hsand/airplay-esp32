@@ -164,6 +164,11 @@ esp_err_t audio_timeline_init(audio_timeline_t *t, uint16_t capacity,
     return ESP_ERR_NO_MEM;
   }
 
+  // Without its history a hole is silence, as it always was.
+  if (!audio_plc_init(&t->plc)) {
+    ESP_LOGW(TAG, "No memory for loss concealment; holes will be silent");
+  }
+
   t->capacity = capacity;
   t->lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
   return ESP_OK;
@@ -178,6 +183,7 @@ void audio_timeline_deinit(audio_timeline_t *t) {
   }
   free(t->desc);
   free(t->pcm_pool);
+  audio_plc_deinit(&t->plc);
   memset(t, 0, sizeof(*t));
 }
 
@@ -626,6 +632,13 @@ size_t audio_timeline_read(audio_timeline_t *t, uint32_t epoch, uint32_t start,
   uint32_t cursor = start;
   bool released_slot = false;
 
+  // A new epoch is another stream position: its holes must not repeat the
+  // audio of the last one.
+  if (t->plc_epoch != epoch) {
+    t->plc_epoch = epoch;
+    audio_plc_reset(&t->plc);
+  }
+
   while (produced < requested) {
     uint16_t index = UINT16_MAX;
     uint32_t block_start = 0U;
@@ -654,7 +667,7 @@ size_t audio_timeline_read(audio_timeline_t *t, uint32_t epoch, uint32_t start,
                               requested - produced);
       portEXIT_CRITICAL(&t->lock);
 
-      memset(&out[produced * channels], 0, n * channels * sizeof(int16_t));
+      audio_plc_conceal(&t->plc, &out[produced * channels], n, channels);
       produced += n;
       cursor += (uint32_t)n;
       if (concealed) {
@@ -707,6 +720,7 @@ size_t audio_timeline_read(audio_timeline_t *t, uint32_t epoch, uint32_t start,
       break;
     }
 
+    audio_plc_good(&t->plc, &out[produced * channels], n, channels);
     produced += n;
     cursor += (uint32_t)n;
   }

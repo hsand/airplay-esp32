@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "audio_plc.h"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
@@ -97,6 +98,11 @@ typedef struct {
   /* Signalled by the consumer whenever a slot is released, so producers can
    * block instead of polling for space. */
   SemaphoreHandle_t space_available;
+
+  /* Fills holes in what audio_timeline_read() returns with the audio before
+   * them (audio_plc.h).  Only the reader touches it. */
+  audio_plc_t plc;
+  uint32_t plc_epoch;
 
   portMUX_TYPE lock;
 } audio_timeline_t;

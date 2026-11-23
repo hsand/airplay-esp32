@@ -2,20 +2,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 /* Host tests for main/audio/rtp_resend.c, the realtime stream's record of
- * missing packets: which holes are asked for and when, which late packets are
- * taken, when a hole is given up on, and how much of a bursty loss comes back
- * compared with the 64-packet window it replaced. */
+ * missing packets: which holes are asked for and when, how the retry
+ * interval follows the round trip, when holes are given up on, and how much
+ * of a lossy stream comes back compared with the v0.3.0 tracker (baseline/,
+ * built beside it by v030.c). */
 
 #include "rtp_resend.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "v030.h"
+
 #define STEP     352U        /* frames in an ALAC packet */
 #define BASE_RTP 0xfff00000U /* so the RTP wraps during the longer runs */
-#define MAX_REQ  16
+#define MAX_REQ  RTP_RESEND_REQUESTS_PER_PACKET
+#define MS       1000LL
 
 static int failures;
 
@@ -31,17 +36,18 @@ static int failures;
 
 static rtp_resend_t r;
 static rtp_resend_range_t ranges[MAX_REQ];
+static int64_t now_us = 1000 * MS;
 
 static uint32_t rtp_at(uint32_t i) {
   return BASE_RTP + i * STEP;
 }
 
 static rtp_resend_verdict_t feed(uint32_t i) {
-  return rtp_resend_on_packet(&r, (uint16_t)i, rtp_at(i), false);
+  return rtp_resend_on_packet(&r, (uint16_t)i, rtp_at(i), false, now_us);
 }
 
 static rtp_resend_verdict_t resend(uint32_t i) {
-  return rtp_resend_on_packet(&r, (uint16_t)i, rtp_at(i), true);
+  return rtp_resend_on_packet(&r, (uint16_t)i, rtp_at(i), true, now_us);
 }
 
 // Packets first..last in order, without those in [hole, hole + holes).
@@ -54,20 +60,21 @@ static void feed_around(uint32_t first, uint32_t last, uint32_t hole,
   }
 }
 
-static size_t ask(uint32_t now_ms) {
-  return rtp_resend_collect(&r, now_ms, false, 0, ranges, MAX_REQ);
+// What the receive task does when a packet has arrived.
+static size_t ask(void) {
+  return rtp_resend_collect(&r, now_us, false, 0, ranges, MAX_REQ);
 }
 
 // As ask(), with playback at packet `playing`.
-static size_t ask_playing(uint32_t now_ms, uint32_t playing) {
-  return rtp_resend_collect(&r, now_ms, true, rtp_at(playing), ranges, MAX_REQ);
+static size_t ask_playing(uint32_t playing) {
+  return rtp_resend_collect(&r, now_us, true, rtp_at(playing), ranges, MAX_REQ);
 }
 
 // Every hole is filled, given up on, or still open.
 static bool balanced(void) {
   const rtp_resend_counts_t *c = &r.counts;
-  return c->skipped ==
-         c->resent + c->late + c->expired + rtp_resend_outstanding(&r);
+  return c->skipped == c->resent + c->late + c->expired + c->aborted +
+                           c->refused + rtp_resend_outstanding(&r);
 }
 
 static void test_in_order(void) {
@@ -75,76 +82,195 @@ static void test_in_order(void) {
   rtp_resend_reset(&r, STEP);
   for (uint32_t i = 0; i < 1000; i++) {
     CHECK(feed(i) == RTP_RESEND_NEWEST, "packet %u not the newest", i);
-    CHECK(ask(i * 8U) == 0, "asked for something at packet %u", i);
+    CHECK(ask() == 0, "asked for something at packet %u", i);
   }
   CHECK(r.counts.received == 1000 && r.counts.skipped == 0,
         "received %u, skipped %u", r.counts.received, r.counts.skipped);
 }
 
 static void test_one_hole(void) {
-  printf("one hole: asked for, again after 250 ms, filled once\n");
+  printf("one hole: asked at once, again every 100 ms, filled once\n");
   rtp_resend_reset(&r, STEP);
-  feed_around(0, 99, 50, 1);
-  size_t n = ask(1000);
+  feed_around(0, 51, 50, 1);
+  size_t n = ask();
   CHECK(n == 1 && ranges[0].first == 50 && ranges[0].count == 1,
         "first request: %zu ranges, from %u", n, n ? ranges[0].first : 0);
-  CHECK(ask(1100) == 0, "asked again 100 ms later");
-  n = ask(1300);
-  CHECK(n == 1 && ranges[0].first == 50, "not asked again 300 ms later");
+  now_us += 99 * MS;
+  CHECK(ask() == 0, "asked again within the retransmit timeout");
+  // 100 ms, rounded up to the 128 us the request times are kept in.
+  now_us += 1 * MS + RTP_RESEND_TICK_US;
+  n = ask();
+  CHECK(n == 1 && ranges[0].first == 50, "not asked again after 100 ms");
+  CHECK(r.asks[50] == 2, "asks %u", r.asks[50]);
   CHECK(resend(50) == RTP_RESEND_FILLED, "retransmission not taken");
   CHECK(resend(50) == RTP_RESEND_UNWANTED, "second copy taken");
-  CHECK(feed(60) == RTP_RESEND_UNWANTED, "duplicate taken");
-  CHECK(ask(2000) == 0, "asked for a filled hole");
+  CHECK(feed(51) == RTP_RESEND_UNWANTED, "duplicate taken");
+  CHECK(ask() == 0, "asked for a filled hole");
+  // Karn: an answer to the second request says nothing about the round trip.
+  CHECK(r.rtt_last_us == 0 && r.rto_us == 100000, "sample taken: rto %d",
+        r.rto_us);
   CHECK(r.counts.resent == 1 && r.counts.unwanted == 2 && r.counts.asked == 2 &&
             r.counts.requests == 2 && balanced(),
         "resent %u unwanted %u asked %u requests %u", r.counts.resent,
         r.counts.unwanted, r.counts.asked, r.counts.requests);
 }
 
-/* The old window was 64 packets long, and a newer gap outside it made it
- * forget the holes it held, and then throw their retransmissions away. */
-static void test_holes_far_apart(void) {
-  printf("holes 200 packets apart: all asked for and taken\n");
+static void test_no_limit_while_useful(void) {
+  printf("an unanswered hole: asked every timeout until it is due to play\n");
   rtp_resend_reset(&r, STEP);
-  for (uint32_t i = 0; i < 500; i++) {
-    if (i != 100 && i != 300 && i != 450) {
-      (void)feed(i);
-    }
+  feed_around(0, 10, 5, 1);
+  uint32_t asks = 0;
+  // 1 s of packets, one every 8 ms; playback reaches packet 5 at 800 ms.
+  for (uint32_t i = 11; i < 136; i++) {
+    now_us += 8 * MS;
+    (void)feed(i);
+    asks += (uint32_t)ask_playing(i * 8 < 800 ? 0 : 5 + (i * 8 - 800) / 8);
   }
-  const size_t n = ask(0);
-  CHECK(n == 3 && ranges[0].first == 100 && ranges[1].first == 300 &&
-            ranges[2].first == 450,
-        "%zu ranges", n);
-  CHECK(resend(100) == RTP_RESEND_FILLED, "oldest hole forgotten");
-  CHECK(resend(300) == RTP_RESEND_FILLED, "middle hole forgotten");
-  CHECK(resend(450) == RTP_RESEND_FILLED, "newest hole forgotten");
-  CHECK(rtp_resend_outstanding(&r) == 0 && balanced(), "%u still open",
-        rtp_resend_outstanding(&r));
+  // Every 100 ms, on the first packet after: 104 ms apart.
+  CHECK(asks >= 7 && asks <= 9, "asked %u times in 800 ms", asks);
+  CHECK(rtp_resend_outstanding(&r) == 0 && r.counts.expired == 1,
+        "open %u expired %u", rtp_resend_outstanding(&r), r.counts.expired);
+  CHECK(balanced(), "counts do not add up");
 }
 
-// The old code never asked for a gap of more than 64 packets, half a second.
-static void test_long_gap(void) {
-  printf("a 150-packet gap: asked for in one request\n");
+static void test_three_per_packet(void) {
+  printf("10 separate holes: 3 requests per arriving packet, oldest first\n");
   rtp_resend_reset(&r, STEP);
-  feed_around(0, 399, 200, 150);
-  const size_t n = ask(0);
-  CHECK(n == 1 && ranges[0].first == 200 && ranges[0].count == 150,
-        "%zu ranges, the first %u+%u", n, n ? ranges[0].first : 0,
+  for (uint32_t i = 0; i <= 20; i += 2) {
+    (void)feed(i);
+  }
+  size_t n = ask();
+  CHECK(n == 3 && ranges[0].first == 1 && ranges[1].first == 3 &&
+            ranges[2].first == 5,
+        "first packet: %zu, from %u", n, n ? ranges[0].first : 0);
+  n = ask();
+  CHECK(n == 3 && ranges[0].first == 7, "second packet: %zu, from %u", n,
+        n ? ranges[0].first : 0);
+  n = ask();
+  CHECK(n == 3 && ranges[0].first == 13, "third: %zu, from %u", n,
+        n ? ranges[0].first : 0);
+  n = ask();
+  CHECK(n == 1 && ranges[0].first == 19, "fourth: %zu, from %u", n,
+        n ? ranges[0].first : 0);
+  CHECK(ask() == 0, "asked again before the timeout");
+  // Without an arriving packet, nothing at all is asked.
+  now_us += 500 * MS;
+  CHECK(rtp_resend_collect(&r, now_us, false, 0, ranges, 0) == 0,
+        "asked on a timeout");
+  // A run of consecutive holes is one request.
+  rtp_resend_reset(&r, STEP);
+  feed_around(0, 60, 20, 30);
+  n = ask();
+  CHECK(n == 1 && ranges[0].first == 20 && ranges[0].count == 30,
+        "a run of 30: %zu ranges, %u+%u", n, n ? ranges[0].first : 0,
         n ? ranges[0].count : 0);
-  for (uint32_t i = 200; i < 350; i++) {
-    CHECK(resend(i) == RTP_RESEND_FILLED, "packet %u not taken", i);
-  }
-  CHECK(r.counts.resent == 150 && balanced(), "resent %u", r.counts.resent);
 }
 
-static void test_late_original(void) {
-  printf("an original that arrives late fills its hole\n");
+static void test_rtt_estimate(void) {
+  printf("retransmit timeout follows the round trip (Karn, new min/max "
+         "only bound it)\n");
   rtp_resend_reset(&r, STEP);
-  feed_around(0, 20, 5, 1);
-  CHECK(feed(5) == RTP_RESEND_FILLED, "late packet not taken");
-  CHECK(feed(5) == RTP_RESEND_UNWANTED, "its duplicate taken");
-  CHECK(r.counts.late == 1 && r.counts.resent == 0 && balanced(),
-        "late %u resent %u", r.counts.late, r.counts.resent);
+  CHECK(r.rto_us == 100000 && r.srtt_us == 100000, "initial rto %d", r.rto_us);
+  uint32_t seq = 0;
+  (void)feed(seq++);
+  // Answers after 4 ms, then 6 ms, then a run alternating 4 and 6 ms.
+  const int32_t rtts[] = {4000, 6000, 5000, 4000, 6000, 5000, 5000, 4000,
+                          6000, 5000, 4000, 6000, 5000, 5000, 4000, 6000,
+                          5000, 4000, 6000, 5000, 5000, 4000, 6000, 5000,
+                          4000, 6000, 5000, 5000, 4000, 6000};
+  const size_t n_rtts = sizeof(rtts) / sizeof(rtts[0]);
+  for (size_t k = 0; k < n_rtts; k++) {
+    const uint32_t hole = seq++;
+    (void)feed(seq++);
+    CHECK(ask() == 1 && ranges[0].first == (uint16_t)hole, "hole %u not asked",
+          hole);
+    now_us += rtts[k];
+    CHECK(resend(hole) == RTP_RESEND_FILLED, "hole %u not filled", hole);
+    if (k == 0) {
+      // Measured in 128 us steps.
+      CHECK(r.rtt_min_us >= 3968 && r.rtt_min_us <= 4096, "min %d",
+            r.rtt_min_us);
+      CHECK(r.srtt_us == 100000, "first sample moved srtt to %d", r.srtt_us);
+    }
+    now_us += 10 * MS;
+  }
+  // 28 samples inside [4, 6] ms from 100 ms: srtt ~ 100 x (7/8)^28 + 5.
+  CHECK(r.srtt_us > 5000 && r.srtt_us < 10000, "srtt %d", r.srtt_us);
+  CHECK(r.rto_us == 2 * r.srtt_us + 4 * r.rttvar_us && r.rto_us < 40000,
+        "rto %d = 2 x %d + 4 x %d", r.rto_us, r.srtt_us, r.rttvar_us);
+  // So a hole is now asked again after rto, not 100 ms.
+  const uint32_t hole = seq++;
+  (void)feed(seq++);
+  CHECK(ask() == 1, "hole not asked");
+  now_us += r.rto_us - 1000;
+  CHECK(ask() == 0, "asked before the timeout");
+  now_us += 1000 + RTP_RESEND_TICK_US;
+  CHECK(ask() == 1 && ranges[0].first == (uint16_t)hole,
+        "not asked after the timeout");
+  // A 300 ms answer is a new maximum: bounds only, srtt unmoved.
+  const int32_t srtt = r.srtt_us;
+  now_us += 300 * MS;
+  // Asked twice by now: Karn says no sample at all.
+  CHECK(resend(hole) == RTP_RESEND_FILLED, "late answer not taken");
+  CHECK(r.srtt_us == srtt, "a twice-asked answer moved srtt");
+  const uint32_t hole2 = seq++;
+  (void)feed(seq++);
+  CHECK(ask() == 1, "hole2 not asked");
+  now_us += 300 * MS;
+  CHECK(resend(hole2) == RTP_RESEND_FILLED, "hole2 not filled");
+  CHECK(r.srtt_us == srtt && r.rtt_max_us >= 299000, "max %d srtt %d",
+        r.rtt_max_us, r.srtt_us);
+  // The timeout never exceeds 100 ms however slow the answers.
+  for (int k = 0; k < 40; k++) {
+    const uint32_t h = seq++;
+    (void)feed(seq++);
+    (void)ask();
+    now_us += 250 * MS;
+    (void)resend(h);
+  }
+  CHECK(r.rto_us <= 100000, "rto %d", r.rto_us);
+}
+
+static void test_burst(void) {
+  printf("a gap over 128 packets: nothing asked, everything dropped\n");
+  rtp_resend_reset(&r, STEP);
+  feed_around(0, 20, 10, 3);
+  CHECK(rtp_resend_outstanding(&r) == 3, "open %u", rtp_resend_outstanding(&r));
+  // 128 lost is still asked for.
+  (void)feed(20 + 129);
+  CHECK(rtp_resend_outstanding(&r) == 131 && r.counts.bursts == 0,
+        "128 lost: open %u bursts %u", rtp_resend_outstanding(&r),
+        r.counts.bursts);
+  // 129 lost is a burst.
+  (void)feed(149 + 130);
+  CHECK(rtp_resend_outstanding(&r) == 0 && r.counts.bursts == 1 &&
+            r.counts.aborted == 131 + 129,
+        "129 lost: open %u bursts %u aborted %u", rtp_resend_outstanding(&r),
+        r.counts.bursts, r.counts.aborted);
+  CHECK(ask() == 0, "asked after a burst");
+  CHECK(resend(15) == RTP_RESEND_UNWANTED, "an aborted hole was filled");
+  CHECK(feed(280) == RTP_RESEND_NEWEST && balanced(), "stream did not go on");
+}
+
+static void test_refused(void) {
+  printf("the sender's 'cannot resend' drops holes up to its sequence\n");
+  rtp_resend_reset(&r, STEP);
+  for (uint32_t i = 65500; i <= 65560; i += 2) {
+    (void)feed(i); // holes at every odd number, across the wrap
+  }
+  const uint32_t open = rtp_resend_outstanding(&r);
+  const uint32_t dropped = rtp_resend_refused(&r, (uint16_t)65531);
+  CHECK(dropped == 16 && rtp_resend_outstanding(&r) == open - 16,
+        "dropped %u of %u", dropped, open);
+  CHECK(resend(65531) == RTP_RESEND_UNWANTED, "refused hole filled");
+  CHECK(resend(65533) == RTP_RESEND_FILLED, "later hole dropped");
+  const size_t n = ask();
+  CHECK(n == 3 && ranges[0].first == (uint16_t)65535, "asked from %u",
+        n ? ranges[0].first : 0);
+  // A sequence number from before the window drops nothing.
+  CHECK(rtp_resend_refused(&r, (uint16_t)(65560 - 2000)) == 0,
+        "an old seq dropped some");
+  CHECK(balanced(), "counts do not add up");
 }
 
 static void test_due_holes_dropped(void) {
@@ -152,13 +278,17 @@ static void test_due_holes_dropped(void) {
   rtp_resend_reset(&r, STEP);
   feed_around(0, 199, 100, 10);
   // Playback has reached packet 105, so 100-104 can no longer be heard.
-  const size_t n = ask_playing(0, 105);
+  const size_t n = ask_playing(105);
   CHECK(n == 1 && ranges[0].first == 105 && ranges[0].count == 5,
         "%zu ranges, the first %u+%u", n, n ? ranges[0].first : 0,
         n ? ranges[0].count : 0);
   CHECK(r.counts.expired == 5, "expired %u", r.counts.expired);
   CHECK(resend(102) == RTP_RESEND_UNWANTED, "a hole given up on was filled");
   CHECK(resend(107) == RTP_RESEND_FILLED, "an open hole was not filled");
+  // A receive timeout gives up on due holes too, without asking.
+  CHECK(rtp_resend_collect(&r, now_us, true, rtp_at(109), ranges, 0) == 0,
+        "asked on a timeout");
+  CHECK(rtp_resend_outstanding(&r) == 1, "open %u", rtp_resend_outstanding(&r));
   CHECK(balanced(), "counts do not add up");
 }
 
@@ -167,7 +297,7 @@ static void test_window_end(void) {
   rtp_resend_reset(&r, STEP);
   feed_around(0, 10 + RTP_RESEND_WINDOW - 1U, 10, 1);
   CHECK(rtp_resend_outstanding(&r) == 1, "hole gone before the window passed");
-  CHECK(ask(0) == 1 && ranges[0].first == 10, "last chance not taken");
+  CHECK(ask() == 1 && ranges[0].first == 10, "last chance not taken");
   (void)feed(10 + RTP_RESEND_WINDOW);
   CHECK(rtp_resend_outstanding(&r) == 0 && r.counts.expired == 1,
         "open %u, expired %u", rtp_resend_outstanding(&r), r.counts.expired);
@@ -175,52 +305,11 @@ static void test_window_end(void) {
   CHECK(balanced(), "counts do not add up");
 }
 
-static void test_gap_longer_than_window(void) {
-  printf("a gap longer than the window is not asked for\n");
-  rtp_resend_reset(&r, STEP);
-  feed_around(0, 9, 5, 1);
-  CHECK(feed(1000) == RTP_RESEND_NEWEST, "packet after the gap not taken");
-  CHECK(r.counts.skipped == 991 && r.counts.expired == 991 &&
-            rtp_resend_outstanding(&r) == 0,
-        "skipped %u expired %u open %u", r.counts.skipped, r.counts.expired,
-        rtp_resend_outstanding(&r));
-  CHECK(ask(0) == 0, "asked for part of it");
-  CHECK(feed(1001) == RTP_RESEND_NEWEST && balanced(), "stream did not go on");
-}
-
-static void test_request_cap(void) {
-  printf("50 separate holes: 12 requests a quarter second, oldest first\n");
-  rtp_resend_reset(&r, STEP);
-  for (uint32_t i = 0; i <= 100; i += 2) {
-    (void)feed(i);
-  }
-  size_t n = ask(0);
-  CHECK(n == 12 && ranges[0].first == 1 && ranges[11].first == 23,
-        "first pass: %zu, from %u", n, n ? ranges[0].first : 0);
-  CHECK(ask(0) == 0 && ask(200) == 0, "asked past the quarter's share");
-  n = ask(250);
-  CHECK(n == 12 && ranges[0].first == 25, "second quarter: %zu, from %u", n,
-        n ? ranges[0].first : 0);
-  // The oldest are due again by now, and come first.  Nothing has been
-  // resent, so this is the last of the 32 requests a silent sender gets.
-  n = ask(500);
-  CHECK(n == 8 && ranges[0].first == 1, "third quarter: %zu, from %u", n,
-        n ? ranges[0].first : 0);
-  CHECK(ask(750) == 0 && ask(2000) == 0, "asked a silent sender again");
-  n = ask(2500);
-  CHECK(n == RTP_RESEND_PROBE_REQUESTS, "probe: %zu", n);
-  CHECK(ask(2750) == 0, "asked again straight after the probe");
-  // One answer, and asking is back to the quarter's share.
-  CHECK(resend(1) == RTP_RESEND_FILLED, "answer refused");
-  n = ask(3000);
-  CHECK(n == 12, "after an answer: %zu", n);
-}
-
 static void test_wraparound(void) {
   printf("holes across the sequence number wrap\n");
   rtp_resend_reset(&r, STEP);
   feed_around(65500, 65600, 65530, 11);
-  const size_t n = ask(0);
+  const size_t n = ask();
   CHECK(n == 1 && ranges[0].first == 65530 && ranges[0].count == 11,
         "%zu ranges, the first %u+%u", n, n ? ranges[0].first : 0,
         n ? ranges[0].count : 0);
@@ -235,11 +324,12 @@ static void test_packet_length_learnt(void) {
   rtp_resend_reset(&r, STEP);
   for (uint32_t i = 0; i < 200; i++) {
     if (i < 50 || i > 59) {
-      (void)rtp_resend_on_packet(&r, (uint16_t)i, 5000U + i * 1024U, false);
+      (void)rtp_resend_on_packet(&r, (uint16_t)i, 5000U + i * 1024U, false,
+                                 now_us);
     }
   }
-  const size_t n =
-      rtp_resend_collect(&r, 0, true, 5000U + 55U * 1024U, ranges, MAX_REQ);
+  const size_t n = rtp_resend_collect(&r, now_us, true, 5000U + 55U * 1024U,
+                                      ranges, MAX_REQ);
   CHECK(n == 1 && ranges[0].first == 55 && ranges[0].count == 5 &&
             r.counts.expired == 5,
         "%zu ranges, the first %u+%u, expired %u", n, n ? ranges[0].first : 0,
@@ -253,424 +343,260 @@ static void test_reset(void) {
   feed_around(0, 9, 3, 1);
   rtp_resend_reset(&r, STEP);
   CHECK(rtp_resend_outstanding(&r) == 0, "hole kept through a reset");
-  CHECK(feed(500) == RTP_RESEND_NEWEST && ask(0) == 0,
+  CHECK(feed(500) == RTP_RESEND_NEWEST && ask() == 0,
         "stream after a reset not taken as new");
 }
 
-/* ---------- a lossy stream, against the tracker this replaced ---------- */
+/* ---------- a lossy stream, v0.3.0 against the current tracker ---------- */
 
-/* The receive task's bookkeeping before this file existed, as it was: holes
- * were kept in a 64-packet window from the oldest one, a gap that did not fit
- * replaced everything in it, a gap longer than the window was never asked
- * for, and only the oldest run of holes was asked for again. */
-#define OLD_WINDOW 64U
+/* A realtime stream at 44.1 kHz: a 352-frame packet every 7982 us.  Loss is
+ * a two-state (Gilbert-Elliott) chain, so it comes in bursts; requests and
+ * retransmissions cross the same network.  The sender answers a request
+ * after its round trip, packet by packet.  A hole is recovered if its
+ * retransmission arrives before its audio is due, `latency` after it was
+ * sent. */
+#define PACKET_US 7982LL
+#define SIM_S     120
 
 typedef struct {
-  bool valid;
-  uint16_t last_seq;
-  uint16_t first;
-  uint64_t mask;
-  int64_t last_request_ms;
-} old_tracker_t;
+  const char *name;
+  double good_to_bad, bad_to_good, loss_good, loss_bad;
+  int64_t latency_us;
+  double rtt_ms; // mean round trip of a request and its answer
+  bool answers;  // does the sender answer at all
+} loss_case_t;
 
-static uint64_t old_mask_for(uint32_t count) {
-  return count >= OLD_WINDOW ? UINT64_MAX : ((1ULL << count) - 1ULL);
+static const loss_case_t cases[] = {
+    {"bursty, 250 ms", 0.004, 0.05, 0.005, 0.5, 250 * MS, 6, true},
+    {"bursty, 2 s", 0.004, 0.05, 0.005, 0.5, 2000 * MS, 6, true},
+    {"5% random, 250 ms", 0, 1, 0.05, 0.05, 250 * MS, 6, true},
+    {"5% random, slow Wi-Fi", 0, 1, 0.05, 0.05, 250 * MS, 40, true},
+    {"no answers, bursty", 0.004, 0.05, 0.005, 0.5, 2000 * MS, 6, false},
+};
+
+static uint64_t rng;
+static double urand(void) {
+  rng ^= rng << 13;
+  rng ^= rng >> 7;
+  rng ^= rng << 17;
+  return (double)(rng >> 11) / 9007199254740992.0;
 }
 
-static bool old_mark_received(old_tracker_t *o, uint16_t seq) {
-  const uint16_t offset = (uint16_t)(seq - o->first);
-  if (o->mask == 0 || offset >= OLD_WINDOW ||
-      (o->mask & (1ULL << offset)) == 0) {
-    return false;
-  }
-  o->mask &= ~(1ULL << offset);
-  while (o->mask != 0 && (o->mask & 1ULL) == 0) {
-    o->mask >>= 1;
-    o->first++;
-  }
-  if (o->mask == 0) {
-    o->last_request_ms = -1;
-  }
-  return true;
-}
-
-static void old_track_missing(old_tracker_t *o, uint16_t first,
-                              uint16_t count) {
-  const uint16_t offset = (uint16_t)(first - o->first);
-  if (o->mask == 0 || offset >= OLD_WINDOW || offset + count > OLD_WINDOW) {
-    o->first = first;
-    o->mask = old_mask_for(count);
-    return;
-  }
-  o->mask |= old_mask_for(count) << offset;
-}
-
-// The sender, answering a request: defined with the simulation below.
-static void sender_request(int64_t now_ms, uint16_t first, uint16_t count);
-
-static void old_request(old_tracker_t *o, int64_t now_ms, uint16_t first,
-                        uint16_t count) {
-  sender_request(now_ms, first, count);
-  o->last_request_ms = now_ms;
-}
-
-static void old_retry_if_due(old_tracker_t *o, int64_t now_ms) {
-  if (o->mask == 0 ||
-      (o->last_request_ms >= 0 && now_ms - o->last_request_ms < 250)) {
-    return;
-  }
-  uint64_t mask = o->mask;
-  uint16_t first = o->first;
-  while ((mask & 1ULL) == 0) {
-    mask >>= 1;
-    first++;
-  }
-  uint16_t count = 0;
-  while ((mask & 1ULL) != 0 && count < OLD_WINDOW) {
-    count++;
-    mask >>= 1;
-  }
-  old_request(o, now_ms, first, count);
-}
-
-static bool old_on_packet(old_tracker_t *o, int64_t now_ms, uint16_t seq,
-                          bool retransmit) {
-  if (retransmit) {
-    if (!old_mark_received(o, seq)) {
-      return false;
-    }
-  } else if (!o->valid) {
-    o->valid = true;
-    o->last_seq = seq;
-  } else {
-    const uint16_t expected = (uint16_t)(o->last_seq + 1U);
-    const int16_t delta = (int16_t)(uint16_t)(seq - expected);
-    if (delta > 0) {
-      if ((uint16_t)delta <= OLD_WINDOW) {
-        old_track_missing(o, expected, (uint16_t)delta);
-        old_request(o, now_ms, expected, (uint16_t)delta);
-      }
-      o->last_seq = seq;
-    } else if (delta == 0) {
-      o->last_seq = seq;
-    } else if (!old_mark_received(o, seq)) {
-      return false;
-    }
-  }
-  old_retry_if_due(o, now_ms);
-  return true;
-}
-
-/* The network: bursts of heavy loss in a mostly clean stream, as a two-state
- * (Gilbert-Elliott) chain stepped every packet interval.  Whether a given
- * transmission is lost depends only on when it is sent and what it is, so
- * both trackers face the same network. */
-#define SIM_MS         120000
-#define PACKET_MS      8 /* 352 frames at 44.1 kHz, rounded */
-#define LATENCY_MS     2000
-#define ONE_WAY_MS     10
-#define RESEND_TURN_MS 20 /* sender's reaction to a request */
-#define SIM_PACKETS    (SIM_MS / PACKET_MS)
-#define GOOD_TO_BAD    0.002 /* per packet: a burst every ~4 s */
-#define BAD_TO_GOOD    0.01  /* a burst lasts ~0.8 s */
-#define LOSS_GOOD      0.005
-#define LOSS_BAD       0.7
-
-static bool bad_state[SIM_PACKETS + 1024];
-
-static uint32_t mix(uint32_t x) {
-  x ^= x >> 16;
-  x *= 0x7feb352dU;
-  x ^= x >> 15;
-  x *= 0x846ca68bU;
-  x ^= x >> 16;
-  return x;
-}
-
-static void make_network(void) {
-  uint32_t state = 12345;
-  bool bad = false;
-  for (size_t i = 0; i < sizeof(bad_state) / sizeof(bad_state[0]); i++) {
-    state = mix(state + 0x9e3779b9U);
-    const double u = (double)state / 4294967296.0;
-    bad = bad ? u >= BAD_TO_GOOD : u < GOOD_TO_BAD;
-    bad_state[i] = bad;
-  }
-}
-
-static bool lost(int64_t sent_ms, uint32_t what) {
-  const size_t tick = (size_t)(sent_ms / PACKET_MS);
-  const double p = bad_state[tick] ? LOSS_BAD : LOSS_GOOD;
-  const uint32_t h = mix(mix((uint32_t)sent_ms) ^ (what * 0x85ebca6bU));
-  return (double)h / 4294967296.0 < p;
-}
-
-/* Retransmissions in flight, by arrival time.  A small binary heap. */
 typedef struct {
-  int64_t at_ms;
-  uint32_t index; // packet number, unwrapped
+  int64_t at;
+  uint32_t index;
+  bool retransmit;
 } arrival_t;
 
-static arrival_t heap[1 << 16];
-static size_t heap_len;
+#define MAX_ARRIVALS 200000
+static arrival_t arrivals[MAX_ARRIVALS];
+static size_t n_arrivals;
 
-static void heap_push(arrival_t a) {
-  size_t i = heap_len++;
-  while (i > 0 && heap[(i - 1) / 2].at_ms > a.at_ms) {
-    heap[i] = heap[(i - 1) / 2];
+static void push(int64_t at, uint32_t index, bool retransmit) {
+  if (n_arrivals == MAX_ARRIVALS) {
+    return;
+  }
+  size_t i = n_arrivals++;
+  while (i > 0 && arrivals[(i - 1) / 2].at > at) {
+    arrivals[i] = arrivals[(i - 1) / 2];
     i = (i - 1) / 2;
   }
-  heap[i] = a;
+  arrivals[i] = (arrival_t){at, index, retransmit};
 }
 
-static arrival_t heap_pop(void) {
-  const arrival_t top = heap[0];
-  const arrival_t last = heap[--heap_len];
+static arrival_t pop(void) {
+  const arrival_t top = arrivals[0];
+  const arrival_t last = arrivals[--n_arrivals];
   size_t i = 0;
   for (;;) {
-    size_t child = 2 * i + 1;
-    if (child >= heap_len) {
+    size_t c = 2 * i + 1;
+    if (c >= n_arrivals) {
       break;
     }
-    if (child + 1 < heap_len && heap[child + 1].at_ms < heap[child].at_ms) {
-      child++;
+    if (c + 1 < n_arrivals && arrivals[c + 1].at < arrivals[c].at) {
+      c++;
     }
-    if (heap[child].at_ms >= last.at_ms) {
+    if (arrivals[c].at >= last.at) {
       break;
     }
-    heap[i] = heap[child];
-    i = child;
+    arrivals[i] = arrivals[c];
+    i = c;
   }
-  heap[i] = last;
+  arrivals[i] = last;
   return top;
 }
 
-static uint32_t sim_newest; // highest packet number sent so far
-static uint32_t sim_requests;
+#define N_PACKETS (SIM_S * 1000000LL / PACKET_US)
+static bool bad_at[N_PACKETS + 4096];
+static bool original_lost[N_PACKETS];
+static bool recovered[N_PACKETS];
 
-static uint32_t unwrap(uint16_t seq) {
-  return sim_newest - (uint16_t)((uint16_t)sim_newest - seq);
+static bool lost_at(int64_t t, const loss_case_t *lc) {
+  const int64_t tick = t / PACKET_US;
+  const bool bad =
+      tick >= 0 && tick < (int64_t)(sizeof(bad_at)) && bad_at[tick];
+  return urand() < (bad ? lc->loss_bad : lc->loss_good);
 }
 
-static void sender_request(int64_t now_ms, uint16_t first, uint16_t count) {
-  sim_requests++;
-  if (lost(now_ms, 0x10000000U + first)) {
-    return; // the request itself
+static double one_way_us(const loss_case_t *lc) {
+  return lc->rtt_ms * 1000.0 / 2.0 * (0.5 - 0.5 * log(urand() + 1e-12));
+}
+
+typedef struct {
+  uint32_t lost, recovered, requests, worst_second;
+} sim_result_t;
+
+static void sender_request(const loss_case_t *lc, int64_t t, uint16_t first,
+                           uint16_t count, uint32_t newest) {
+  if (!lc->answers || lost_at(t, lc)) {
+    return;
   }
+  const int64_t at_sender = t + (int64_t)one_way_us(lc);
   for (uint16_t k = 0; k < count; k++) {
-    const uint32_t index = unwrap((uint16_t)(first + k));
-    const int64_t sent = now_ms + ONE_WAY_MS + RESEND_TURN_MS + k;
-    if (index <= sim_newest && !lost(sent, 0x20000000U + index)) {
-      heap_push((arrival_t){sent + ONE_WAY_MS, index});
+    // Unwrap the sequence number against the newest packet.
+    const uint16_t seq = (uint16_t)(first + k);
+    const uint32_t index = newest - (uint16_t)(newest - seq);
+    if (lost_at(at_sender, lc)) {
+      continue;
     }
+    push(at_sender + 300 + (int64_t)one_way_us(lc), index, true);
   }
 }
 
-static bool heard[SIM_PACKETS];
-static int64_t asked_ms[SIM_PACKETS];
-
-static void new_service(int64_t now_ms) {
-  const int64_t playing = (now_ms - LATENCY_MS) / PACKET_MS;
-  rtp_resend_range_t req[MAX_REQ];
-  const size_t n = rtp_resend_collect(
-      &r, (uint32_t)now_ms, playing >= 0,
-      rtp_at((uint32_t)(playing > 0 ? playing : 0)), req, MAX_REQ);
-  for (size_t i = 0; i < n; i++) {
-    for (uint16_t k = 0; k < req[i].count; k++) {
-      const uint32_t index = unwrap((uint16_t)(req[i].first + k));
-      if (index < SIM_PACKETS && asked_ms[index] >= 0) {
-        CHECK(now_ms - asked_ms[index] >= 224,
-              "packet %u asked again after %lld ms", index,
-              (long long)(now_ms - asked_ms[index]));
-      }
-      if (index < SIM_PACKETS) {
-        asked_ms[index] = now_ms;
-      }
-    }
-    sender_request(now_ms, req[i].first, req[i].count);
+static sim_result_t simulate(const loss_case_t *lc, bool old) {
+  rng = 0x243F6A8885A308D3ULL;
+  bool bad = false;
+  for (size_t i = 0; i < sizeof(bad_at); i++) {
+    const double u = urand();
+    bad = bad ? u >= lc->bad_to_good : u < lc->good_to_bad;
+    bad_at[i] = bad;
   }
-}
-
-static void deliver(bool use_new, old_tracker_t *old, int64_t now_ms,
-                    uint32_t index, bool retransmit) {
-  bool taken;
-  if (use_new) {
-    taken = rtp_resend_on_packet(&r, (uint16_t)index, rtp_at(index),
-                                 retransmit) != RTP_RESEND_UNWANTED;
-    new_service(now_ms);
+  n_arrivals = 0;
+  memset(original_lost, 0, sizeof(original_lost));
+  memset(recovered, 0, sizeof(recovered));
+  for (uint32_t i = 0; i < N_PACKETS; i++) {
+    const int64_t sent = i * PACKET_US;
+    if (lost_at(sent, lc)) {
+      original_lost[i] = true;
+      continue;
+    }
+    push(sent + 2 * MS, i, false);
+  }
+  if (old) {
+    v030_reset(STEP);
   } else {
-    taken = old_on_packet(old, now_ms, (uint16_t)index, retransmit);
-  }
-  // Heard if it arrives before its audio is due.
-  if (taken && index < SIM_PACKETS &&
-      now_ms < (int64_t)index * PACKET_MS + LATENCY_MS) {
-    heard[index] = true;
-  }
-}
-
-// Plays the whole stream through one tracker; returns the packets heard.
-static uint32_t simulate(bool use_new, uint32_t *lost_on_the_way) {
-  old_tracker_t old = {.last_request_ms = -1};
-  rtp_resend_reset(&r, STEP);
-  memset(heard, 0, sizeof(heard));
-  for (size_t i = 0; i < SIM_PACKETS; i++) {
-    asked_ms[i] = -1;
-  }
-  heap_len = 0;
-  sim_requests = 0;
-  *lost_on_the_way = 0;
-
-  for (int64_t now = 0; now < SIM_MS + LATENCY_MS; now++) {
-    // The original, sent ONE_WAY_MS ago.
-    const int64_t sent = now - ONE_WAY_MS;
-    if (sent >= 0 && sent % PACKET_MS == 0 && sent / PACKET_MS < SIM_PACKETS) {
-      const uint32_t index = (uint32_t)(sent / PACKET_MS);
-      sim_newest = index;
-      if (lost(sent, index)) {
-        (*lost_on_the_way)++;
-      } else {
-        deliver(use_new, &old, now, index, false);
-      }
-    }
-    while (heap_len > 0 && heap[0].at_ms <= now) {
-      const arrival_t a = heap_pop();
-      deliver(use_new, &old, now, a.index, true);
-    }
-    // The receive loop's 100 ms socket timeout.
-    if (now % 100 == 0) {
-      if (use_new) {
-        new_service(now);
-      } else {
-        old_retry_if_due(&old, now);
-      }
-    }
+    rtp_resend_reset(&r, STEP);
   }
 
-  uint32_t heard_count = 0;
-  for (size_t i = 0; i < SIM_PACKETS; i++) {
-    heard_count += heard[i] ? 1U : 0U;
-  }
-  return heard_count;
-}
-
-static void test_bursty_loss(void) {
-  printf("bursty loss, 120 s: recovered against the 64-packet window\n");
-  make_network();
-  uint32_t lost_old = 0;
-  uint32_t lost_new = 0;
-  const uint32_t heard_old = simulate(false, &lost_old);
-  const uint32_t requests_old = sim_requests;
-  const uint32_t heard_new = simulate(true, &lost_new);
-  const uint32_t requests_new = sim_requests;
-  CHECK(lost_old == lost_new, "the two runs saw different networks");
-  const uint32_t back_old = heard_old - (SIM_PACKETS - lost_old);
-  const uint32_t back_new = heard_new - (SIM_PACKETS - lost_new);
-  printf("  %u of %u packets lost on the way\n", lost_new, SIM_PACKETS);
-  printf("  64-packet window: %u back in time (%.0f%%), %u requests\n",
-         back_old, 100.0 * back_old / lost_old, requests_old);
-  printf("  whole buffer:     %u back in time (%.0f%%), %u requests\n",
-         back_new, 100.0 * back_new / lost_new, requests_new);
-  CHECK(back_new > back_old, "no more packets recovered than before");
-  CHECK(balanced(), "counts do not add up after the run");
-}
-
-/* ---------- a sender that does not answer ---------- */
-
-/* What the receive task did to an ESP32 Audio Brick in the field: most
- * packets lost, none ever resent, and every open hole asked for again four
- * times a second.  The task spent its time sending requests, fell behind its
- * socket, and so lost more.  The work has to stay bounded whatever is lost. */
-static void test_silent_sender(void) {
-  printf("silent sender, 2 in 3 packets lost for 20 s: bounded asking\n");
-  rtp_resend_reset(&r, STEP);
-  uint32_t state = 12345;
-  uint32_t requests = 0;
-  uint32_t worst_second = 0;
+  sim_result_t res = {0};
+  uint32_t newest = 0;
+  int64_t last_event = 0;
+  int64_t second = 0;
   uint32_t this_second = 0;
-  for (uint32_t i = 0; i < 2500; i++) { // 125 packets a second
-    const uint32_t now_ms = i * 8U;
-    if (i % 125U == 0U) {
+  while (n_arrivals > 0) {
+    const arrival_t a = pop();
+    // v0.3.0 also asked on every 100 ms receive timeout.
+    while (old && a.at - last_event >= 100 * MS) {
+      last_event += 100 * MS;
+      const int64_t play = last_event - lc->latency_us;
+      uint16_t first[16], count[16];
+      const size_t n =
+          v030_collect((uint32_t)(last_event / 1000), play >= 0,
+                       (uint32_t)(play / PACKET_US) * STEP, first, count, 16);
+      for (size_t k = 0; k < n; k++) {
+        sender_request(lc, last_event, first[k], count[k], newest);
+      }
+      res.requests += (uint32_t)n;
+    }
+    last_event = a.at;
+    if (a.at / 1000000 != second) {
+      second = a.at / 1000000;
       this_second = 0;
     }
-    state = state * 1664525U + 1013904223U;
-    if (i != 0U && (state >> 16) % 3U != 0U) {
-      continue; // lost
-    }
-    (void)feed(i);
-    const size_t n = ask(now_ms);
-    requests += (uint32_t)n;
-    this_second += (uint32_t)n;
-    if (this_second > worst_second) {
-      worst_second = this_second;
-    }
-  }
-  printf("  %u requests for %u packets asked, worst second %u requests\n",
-         requests, r.counts.asked, worst_second);
-  CHECK(worst_second <= RTP_RESEND_REQUESTS_PER_SECOND,
-        "%u requests in one second", worst_second);
-  // Once the sender has shown it will not answer, asking all but stops.
-  CHECK(requests <= 20U * RTP_RESEND_REQUESTS_PER_SECOND / 4U,
-        "%u requests to a sender that never answered", requests);
-  CHECK(balanced(), "counts do not add up");
-}
-
-/* A hole is asked for a few times and then left alone, though it stays open
- * for a late answer. */
-static void test_ask_limit(void) {
-  printf("one hole, never answered: asked %u times, then left open\n",
-         RTP_RESEND_MAX_ASKS);
-  rtp_resend_reset(&r, STEP);
-  feed_around(0, 10, 5, 1);
-  uint32_t asks = 0;
-  for (uint32_t now = 0; now < 4000U; now += 50U) {
-    asks += (uint32_t)ask(now);
-  }
-  CHECK(asks == RTP_RESEND_MAX_ASKS, "asked %u times", asks);
-  CHECK(rtp_resend_outstanding(&r) == 1, "hole closed");
-  CHECK(resend(5) == RTP_RESEND_FILLED, "late answer refused");
-}
-
-/* An answering sender is asked as before, apart from the cap per second. */
-static void test_answering_sender_not_paused(void) {
-  printf("answering sender: asking goes on past the silence limit\n");
-  rtp_resend_reset(&r, STEP);
-  uint32_t filled = 0;
-  for (uint32_t i = 0; i < 4000U; i++) {
-    if (i % 4U == 1U) {
-      continue; // one packet in four lost: 31 holes a second
-    }
-    const uint32_t now_ms = i * 8U;
-    (void)feed(i);
-    const size_t n = ask(now_ms);
-    for (size_t k = 0; k < n; k++) {
-      for (uint16_t c = 0; c < ranges[k].count; c++) {
-        if (resend((uint16_t)(ranges[k].first + c)) == RTP_RESEND_FILLED) {
-          filled++;
-        }
+    const uint16_t seq = (uint16_t)a.index;
+    const uint32_t rtp = a.index * STEP;
+    const int64_t play = a.at - lc->latency_us;
+    const bool playing = play >= 0;
+    const uint32_t cursor = (uint32_t)(play / PACKET_US) * STEP;
+    bool taken;
+    size_t n;
+    uint16_t first[16], count[16];
+    if (old) {
+      taken = v030_on_packet(seq, rtp, a.retransmit);
+      n = v030_collect((uint32_t)(a.at / 1000), playing, cursor, first, count,
+                       16);
+    } else {
+      taken = rtp_resend_on_packet(&r, seq, rtp, a.retransmit, a.at) !=
+              RTP_RESEND_UNWANTED;
+      rtp_resend_range_t rr[MAX_REQ];
+      n = rtp_resend_collect(&r, a.at, playing, cursor, rr, MAX_REQ);
+      for (size_t k = 0; k < n; k++) {
+        first[k] = rr[k].first;
+        count[k] = rr[k].count;
       }
     }
+    if (!a.retransmit && a.index > newest) {
+      newest = a.index;
+    }
+    if (taken && a.retransmit && original_lost[a.index] &&
+        a.at < (int64_t)a.index * PACKET_US + lc->latency_us) {
+      recovered[a.index] = true;
+    }
+    for (size_t k = 0; k < n; k++) {
+      sender_request(lc, a.at, first[k], count[k], newest);
+    }
+    res.requests += (uint32_t)n;
+    this_second += (uint32_t)n;
+    if (this_second > res.worst_second) {
+      res.worst_second = this_second;
+    }
   }
-  CHECK(filled >= 990U, "only %u of 1000 holes filled", filled);
-  CHECK(balanced(), "counts do not add up");
+  for (uint32_t i = 0; i < N_PACKETS; i++) {
+    res.lost += original_lost[i];
+    res.recovered += recovered[i];
+  }
+  return res;
+}
+
+static void test_lossy_stream(void) {
+  printf("lossy streams, %d s each: v0.3.0 against the current tracker\n",
+         SIM_S);
+  printf("  %-24s %-7s %6s %10s %9s %8s\n", "case", "code", "lost", "recovered",
+         "requests", "worst/s");
+  for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    const sim_result_t o = simulate(&cases[c], true);
+    const sim_result_t n = simulate(&cases[c], false);
+    printf("  %-24s %-7s %6u %9.1f%% %9u %8u\n", cases[c].name, "v0.3.0",
+           o.lost, o.lost ? 100.0 * o.recovered / o.lost : 0, o.requests,
+           o.worst_second);
+    printf("  %-24s %-7s %6u %9.1f%% %9u %8u\n", "", "new", n.lost,
+           n.lost ? 100.0 * n.recovered / n.lost : 0, n.requests,
+           n.worst_second);
+    if (cases[c].answers) {
+      CHECK(n.recovered + n.lost / 100 >= o.recovered,
+            "%s: recovered %u, v0.3.0 %u", cases[c].name, n.recovered,
+            o.recovered);
+    }
+    // Never more than three requests per arriving packet.
+    CHECK(n.worst_second <= RTP_RESEND_REQUESTS_PER_PACKET * 126U,
+          "%s: %u requests in a second", cases[c].name, n.worst_second);
+  }
 }
 
 int main(void) {
   test_in_order();
   test_one_hole();
-  test_holes_far_apart();
-  test_long_gap();
-  test_late_original();
+  test_no_limit_while_useful();
+  test_three_per_packet();
+  test_rtt_estimate();
+  test_burst();
+  test_refused();
   test_due_holes_dropped();
   test_window_end();
-  test_gap_longer_than_window();
-  test_request_cap();
   test_wraparound();
   test_packet_length_learnt();
   test_reset();
-  test_bursty_loss();
-  test_silent_sender();
-  test_ask_limit();
-  test_answering_sender_not_paused();
+  test_lossy_stream();
   if (failures) {
     printf("%d check(s) failed\n", failures);
     return 1;

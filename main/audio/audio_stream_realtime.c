@@ -20,6 +20,7 @@
 
 #include "audio_crypto.h"
 #include "network/socket_utils.h"
+#include "rtp_sync.h"
 
 #define RTP_HEADER_SIZE 12
 // Must fit the ~11 KB largest free block that survives the Bluetooth teardown,
@@ -27,9 +28,14 @@
 #define AUDIO_RECV_STACK_SIZE   8192
 #define AUDIO_CTRL_STACK_SIZE   4096
 #define RESEND_ERROR_BACKOFF_US 300000 // Backoff after sendto failure
-// Requests per pass over the missing packets, one per run of them.
-#define RESEND_MAX_REQUESTS 16
-#define RESEND_REPORT_US    1000000
+#define RESEND_REPORT_US        1000000
+// The sender's answer that it cannot resend: 80 D6 then the sequence number
+// it gave up on in bytes 4-5.
+#define RESEND_REFUSED_LEN 8
+// How often the control task looks at the play position while a new sync
+// map waits for playback to reach its apply point.
+#define SYNC_POLL_US   10000
+#define SYNC_REPORT_US 10000000LL
 
 #if CONFIG_FREERTOS_UNICORE
 #define AUDIO_TASK_CORE 0
@@ -154,18 +160,21 @@ static void resend_report(audio_receiver_state_t *state, int64_t now) {
 
   rtp_resend_counts_t *c = &state->resend.counts;
   const uint32_t events = c->skipped + c->resent + c->late + c->expired +
-                          c->unwanted + state->resend_rejected;
+                          c->unwanted + c->refused + state->resend_rejected;
   if (events != 0U) {
-    ESP_LOGI(
-        TAG,
-        "loss: rx=%" PRIu32 " skipped=%" PRIu32 " resent=%" PRIu32
-        " late=%" PRIu32 " expired=%" PRIu32 " unwanted=%" PRIu32
-        " asked=%" PRIu32 " in %" PRIu32 " open=%" PRIu32 " gave_up=%" PRIu32
-        " ask_ms=%" PRIu32 " queue_max=%" PRIu32 " B rejected=%" PRIu32,
-        c->received, c->skipped, c->resent, c->late, c->expired, c->unwanted,
-        c->asked, c->requests, rtp_resend_outstanding(&state->resend),
-        c->gave_up, (uint32_t)(state->resend_send_us / 1000),
-        state->resend_queue_max, state->resend_rejected);
+    const rtp_resend_t *r = &state->resend;
+    ESP_LOGI(TAG,
+             "loss: rx=%" PRIu32 " skipped=%" PRIu32 " resent=%" PRIu32
+             " late=%" PRIu32 " expired=%" PRIu32 " unwanted=%" PRIu32
+             " asked=%" PRIu32 " in %" PRIu32 " open=%" PRIu32 " burst=%" PRIu32
+             "/%" PRIu32 " refused=%" PRIu32 " rtt=%" PRId32 " srtt=%" PRId32
+             " rttvar=%" PRId32 " rto=%" PRId32 " us ask_ms=%" PRIu32
+             " queue_max=%" PRIu32 " B rejected=%" PRIu32,
+             c->received, c->skipped, c->resent, c->late, c->expired,
+             c->unwanted, c->asked, c->requests, rtp_resend_outstanding(r),
+             c->bursts, c->aborted, c->refused, r->rtt_last_us, r->srtt_us,
+             r->rttvar_us, r->rto_us, (uint32_t)(state->resend_send_us / 1000),
+             state->resend_queue_max, state->resend_rejected);
   }
   memset(c, 0, sizeof(*c));
   state->resend_send_us = 0;
@@ -174,26 +183,30 @@ static void resend_report(audio_receiver_state_t *state, int64_t now) {
 }
 
 /* Asks for the missing packets that could still play and are due to be
- * asked for; rtp_resend.h has the limits.  Runs after every packet and on
- * every receive timeout, so a hole is asked for as soon as it opens.
+ * asked for; rtp_resend.h has the timing.  As in Apple's receiver, requests
+ * go out only when a packet has just arrived (`arrived`), a few at most; a
+ * receive timeout only gives up on holes that are due to play.
  *
  * Reading comes first: while packets wait on the socket (backlog), nothing
  * is asked for.  A request sent then delays the read that would have shown
- * the packet was already here, and lets the socket overflow. */
-static void resend_service(audio_receiver_state_t *state, bool backlog) {
+ * the packet was already here, and lets the socket overflow.  The next
+ * packet read asks instead. */
+static void resend_service(audio_receiver_state_t *state, bool arrived,
+                           bool backlog) {
   const int64_t now = esp_timer_get_time();
   const bool can_ask =
-      !backlog && state->retransmit_enabled && state->control_socket > 0 &&
+      arrived && !backlog && state->retransmit_enabled &&
+      state->control_socket > 0 &&
       (state->last_resend_error_time_us == 0 ||
        now - state->last_resend_error_time_us >= RESEND_ERROR_BACKOFF_US);
 
   uint32_t cursor_rtp = 0;
   const bool playing =
       audio_engine_v2_play_cursor(&state->engine_v2, &cursor_rtp);
-  rtp_resend_range_t ranges[RESEND_MAX_REQUESTS];
+  rtp_resend_range_t ranges[RTP_RESEND_REQUESTS_PER_PACKET];
   const size_t n =
-      rtp_resend_collect(&state->resend, (uint32_t)(now / 1000), playing,
-                         cursor_rtp, ranges, can_ask ? RESEND_MAX_REQUESTS : 0);
+      rtp_resend_collect(&state->resend, now, playing, cursor_rtp, ranges,
+                         can_ask ? RTP_RESEND_REQUESTS_PER_PACKET : 0);
   for (size_t i = 0; i < n; i++) {
     if (!send_resend_request(state, ranges[i].first, ranges[i].count)) {
       break;
@@ -248,7 +261,7 @@ static bool realtime_receive_packet(audio_stream_t *stream, uint8_t *packet,
   if (len < 0) {
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
       resend_sync(state);
-      resend_service(state, false);
+      resend_service(state, false, false);
       return true;
     }
     if (stream->running) {
@@ -272,6 +285,17 @@ static bool realtime_receive_packet(audio_stream_t *stream, uint8_t *packet,
   const uint8_t *rtp_data = packet;
   size_t rtp_len = (size_t)len;
 
+  /* The sender cannot resend (forwarded here by the control task, so the
+   * tracker keeps a single owner): stop asking for everything up to it. */
+  if (rtp_len == RESEND_REFUSED_LEN && (rtp_data[1] & 0x7F) == 0x56) {
+    resend_sync(state);
+    const uint16_t refused = (uint16_t)((rtp_data[4] << 8) | rtp_data[5]);
+    const uint32_t dropped = rtp_resend_refused(&state->resend, refused);
+    ESP_LOGD(TAG, "Sender cannot resend up to seq %u: %" PRIu32 " dropped",
+             refused, dropped);
+    return true;
+  }
+
   /* Retransmit packets (payload type 0x56, usually marker 0xD6) have a
      4-byte outer header before the inner RTP packet. Strip it and parse the
      inner RTP normally. */
@@ -293,9 +317,9 @@ static bool realtime_receive_packet(audio_stream_t *stream, uint8_t *packet,
   }
 
   resend_sync(state);
-  const rtp_resend_verdict_t verdict =
-      rtp_resend_on_packet(&state->resend, seq, timestamp, is_retransmit);
-  resend_service(state, queued > 0);
+  const rtp_resend_verdict_t verdict = rtp_resend_on_packet(
+      &state->resend, seq, timestamp, is_retransmit, esp_timer_get_time());
+  resend_service(state, true, queued > 0);
   if (verdict == RTP_RESEND_UNWANTED) {
     ESP_LOGD(TAG, "Dropping unwanted %s seq=%u",
              is_retransmit ? "retransmit" : "packet", seq);
@@ -383,6 +407,102 @@ static uint32_t nctoh32(const uint8_t *data) {
          ((uint32_t)data[2] << 8) | (uint32_t)data[3];
 }
 
+/* The sync packets' map (rtp_sync.h), owned by the control task.  Other
+ * tasks reset it the way they reset the resend tracker, by bumping
+ * resend_generation (start, flush, stop), and this task does the reset
+ * before it next touches the state. */
+static rtp_sync_t s_sync;
+static uint32_t s_sync_generation_seen;
+static int64_t s_sync_report_us;
+static bool s_sync_polling;
+
+static void sync_check_reset(audio_receiver_state_t *state) {
+  const uint32_t generation =
+      __atomic_load_n(&state->resend_generation, __ATOMIC_ACQUIRE);
+  if (generation != s_sync_generation_seen) {
+    s_sync_generation_seen = generation;
+    rtp_sync_reset(&s_sync);
+  }
+}
+
+static void sync_publish(const rtp_sync_anchor_t *anchor) {
+  audio_receiver_set_anchor_time(s_sync.timeline, anchor->network_ns,
+                                 anchor->rtp);
+}
+
+// A new map waiting for its apply point: hand it over once playback is there.
+static void sync_poll(audio_receiver_state_t *state) {
+  if (!s_sync.pending) {
+    return;
+  }
+  uint32_t cursor_rtp = 0;
+  const bool playing =
+      audio_engine_v2_play_cursor(&state->engine_v2, &cursor_rtp);
+  rtp_sync_anchor_t anchor;
+  if (rtp_sync_poll(&s_sync, playing, cursor_rtp, &anchor)) {
+    ESP_LOGI(TAG,
+             "Sync: new map applied at play position %" PRIu32
+             " (apply %" PRIu32 ")",
+             playing ? cursor_rtp : 0U, s_sync.apply_rtp);
+    sync_publish(&anchor);
+  }
+}
+
+// While a map is pending the socket wait is short, so the switch is on time.
+static void sync_set_wait(audio_receiver_state_t *state) {
+  const bool polling = s_sync.pending;
+  if (polling == s_sync_polling) {
+    return;
+  }
+  s_sync_polling = polling;
+  struct timeval tv = {.tv_sec = polling ? 0 : 1,
+                       .tv_usec = polling ? SYNC_POLL_US : 0};
+  setsockopt(state->control_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
+static void sync_report(void) {
+  const int64_t now = esp_timer_get_time();
+  if (s_sync.announces == 0U || now - s_sync_report_us < SYNC_REPORT_US) {
+    return;
+  }
+  s_sync_report_us = now;
+  ESP_LOGI(TAG,
+           "rt sync: announces=%" PRIu32 " err=%" PRId32 " max=%" PRId32
+           " avg=%" PRId32 " samples nudges=%" PRIu32 " flush_resets=%" PRIu32
+           " jumps=%" PRIu32 " applied=%" PRIu32 " forced=%" PRIu32
+           " pending=%d",
+           s_sync.announces, s_sync.last_error, s_sync.max_error,
+           s_sync.average, s_sync.nudges, s_sync.resets, s_sync.jumps,
+           s_sync.applied, s_sync.forced, s_sync.pending ? 1 : 0);
+  s_sync.max_error = 0;
+}
+
+static void sync_announce(audio_receiver_state_t *state,
+                          const audio_stream_t *stream, uint64_t timeline,
+                          const uint8_t *packet, uint32_t rtp,
+                          uint64_t network_ns) {
+  sync_check_reset(state);
+  const uint32_t sample_rate = stream->format.sample_rate > 0
+                                   ? (uint32_t)stream->format.sample_rate
+                                   : 44100U;
+  rtp_sync_anchor_t anchor;
+  const rtp_sync_action_t action =
+      rtp_sync_announce(&s_sync, sample_rate, timeline, packet[0], rtp,
+                        network_ns, nctoh32(packet + 16), &anchor);
+  if (action == RTP_SYNC_PUBLISH) {
+    sync_publish(&anchor);
+  } else if (action == RTP_SYNC_DEFER) {
+    sync_poll(state);
+  } else if (state->engine_v2_ready && !state->engine_v2_anchor_pending &&
+             !state->engine_v2.clock_map.valid &&
+             rtp_sync_current(&s_sync, rtp, &anchor)) {
+    // The engine dropped its map without a reset reaching this task (a new
+    // epoch of its own): give it the one this segment still has.
+    sync_publish(&anchor);
+  }
+  sync_report();
+}
+
 static void control_receiver_task(void *pvParameters) {
   audio_stream_t *stream = (audio_stream_t *)pvParameters;
   audio_receiver_state_t *state = audio_stream_state(stream);
@@ -403,13 +523,17 @@ static void control_receiver_task(void *pvParameters) {
   }
   struct sockaddr_in src_addr;
   socklen_t addr_len = sizeof(src_addr);
+  s_sync_polling = false;
 
   while (stream->running) {
+    sync_set_wait(state);
     ssize_t len = recvfrom(state->control_socket, packet, MAX_RTP_PACKET_SIZE,
                            0, (struct sockaddr *)&src_addr, &addr_len);
 
     if (len < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        sync_check_reset(state);
+        sync_poll(state);
         continue;
       }
       if (stream->running) {
@@ -427,34 +551,32 @@ static void control_receiver_task(void *pvParameters) {
     switch (packet_type) {
     case 0x54: // AirPlay 1 sync packet (NTP timing)
       // Layout (per shairport-sync / Apple protocol documentation):
+      //   [0]    flags; 0x10 = first sync after a flush
       //   [4-7]  rtp_timestamp_less_latency  — the RTP frame PLAYING at the
       //          NTP time in [8-15].  This is the correct anchor RTP.
       //   [8-11] NTP seconds
       //   [12-15] NTP fraction
-      //   [16-19] sync_rtp_timestamp — the RTP frame currently being SENT
-      //           (ahead by the stream latency).  Do NOT use as anchor.
+      //   [16-19] the RTP frame currently being SENT (ahead by the stream
+      //           latency): not an anchor, but where a new map takes over
+      //           after a flush ("apply").
       if (len >= 20) {
-        uint32_t rtp_timestamp =
-            nctoh32(packet + 4); // rtp_timestamp_less_latency
         uint64_t ntp_secs = nctoh32(packet + 8);
         uint64_t ntp_frac = nctoh32(packet + 12);
         uint64_t network_time_ns =
             (ntp_secs * 1000000000ULL) + ((ntp_frac * 1000000000ULL) >> 32);
-        audio_receiver_set_anchor_time(0, network_time_ns, rtp_timestamp);
+        sync_announce(state, stream, 0, packet, nctoh32(packet + 4),
+                      network_time_ns);
       }
       break;
 
     case 0x57: // AirPlay 2 anchor timing packet (PTP timing)
-      // Format: [4] RTP frame, [8] PTP time ns, [16] RTP frame 2, [20] clock ID
+      // Format: [4] RTP frame, [8] PTP time ns, [16] apply RTP, [20] clock ID
       // The RTP timestamp at [4] is the frame that should play at the
       // PTP time — use it directly (matching the NTP anchor path).
       // compute_early_us handles hardware latency compensation.
       if (len >= 28) {
-        uint32_t frame_1 = nctoh32(packet + 4);
-        uint64_t network_time_ns = nctoh64(packet + 8);
-        uint64_t clock_id = nctoh64(packet + 20);
-
-        audio_receiver_set_anchor_time(clock_id, network_time_ns, frame_1);
+        sync_announce(state, stream, nctoh64(packet + 20), packet,
+                      nctoh32(packet + 4), nctoh64(packet + 8));
       }
       break;
 

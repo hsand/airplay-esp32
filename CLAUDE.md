@@ -99,10 +99,13 @@ main/
 │   ├── audio_stream.c      # Base stream abstraction
 │   ├── audio_stream_buffered.c   # AirPlay 2 AAC (deep jitter buffer)
 │   ├── audio_stream_realtime.c     # AirPlay 1 ALAC (low latency UDP)
+│   ├── rtp_resend.c        # Realtime retransmit requests (RTT-timed, Apple-style)
+│   ├── rtp_sync.c          # Realtime sync packets -> one smoothed anchor per segment
 │   ├── audio_decoder.c     # ALAC and AAC decoders
 │   ├── audio_decode_worker.c # Decoder task fed from the receive path
 │   ├── audio_buffer.c      # Decoder scratch space (the sorted PCM ring is gone)
 │   ├── audio_timeline.c    # RTP-addressed PCM store — holds the decoded audio
+│   ├── audio_plc.c         # Packet-loss concealment: fills timeline holes with a faded repeat
 │   ├── audio_engine_v2.c   # Owns the epoch, timeline, clock map and scheduler
 │   ├── audio_scheduler.c   # Anchor/preroll/play/pause/recover state machine + drift servo
 │   ├── audio_clock_map.c   # Sender time ↔ RTP mapping (PTP for AP2, NTP for AP1)
@@ -140,7 +143,7 @@ main/
 │   ├── ethernet.c          # W5500 SPI Ethernet driver
 │   ├── mdns_airplay.c      # mDNS AirPlay service advertisement
 │   ├── ptp_clock.c         # Precision Time Protocol clock
-│   ├── ntp_clock.c         # NTP time sync fallback
+│   ├── ntp_clock.c         # AirPlay 1 NTP client + PLL-disciplined software clock
 │   ├── web_server.c        # HTTP config/control server
 │   ├── ota.c               # OTA firmware updates
 │   ├── dns_server.c        # Captive portal DNS
@@ -239,7 +242,7 @@ scripts/lint.sh            # Run clang-tidy on all C/H files
 scripts/lint.sh --fix      # Attempt to auto-fix clang-tidy issues
 ```
 
-**Host tests**: `tests/pcm51xx/run.py`, `tests/tas5805m_rate/run.py`, `tests/ptp_clock/run.py`, `tests/audio_eq/run.py`, `tests/rtp_resend/run.py`, `tests/bplist/run.py`, `tests/husb238a/run.py`, `tests/audio_scheduler/run.py`, `tests/tas58xx_peak/run.py` and `tests/tas58xx_bq/run.py` compile the real driver, TAS5805M filter-rate, PTP filter, EQ, resend-tracker, binary-plist, USB-PD trigger, scheduler, filter-peak and TAS58xx filter-design code with the host C compiler, using small mocks where needed, and run in CI's `format-check` job. The TAS5805M suite also uses Node.js to check the actual EQ page and driver/UI round trips. `tests/bq_page/run.py` also needs Node.js: it lifts the filter code out of `data/www/bq.html` and checks the page draws exactly what the firmware designs. There is no test framework beyond that; everything else needs testing on hardware.
+**Host tests**: `tests/pcm51xx/run.py`, `tests/tas5805m_rate/run.py`, `tests/ptp_clock/run.py`, `tests/audio_eq/run.py`, `tests/rtp_resend/run.py`, `tests/rtp_sync/run.py`, `tests/audio_plc/run.py`, `tests/ntp_sim/run.py`, `tests/bplist/run.py`, `tests/husb238a/run.py`, `tests/audio_scheduler/run.py`, `tests/tas58xx_peak/run.py` and `tests/tas58xx_bq/run.py` compile the real driver, TAS5805M filter-rate, PTP filter, EQ, resend-tracker, sync-packet map, loss-concealment, NTP clock (a seeded simulation against the v0.3.0 copy in `tests/ntp_sim/baseline/`), binary-plist, USB-PD trigger, scheduler, filter-peak and TAS58xx filter-design code with the host C compiler, using small mocks where needed, and run in CI's `format-check` job. The TAS5805M suite also uses Node.js to check the actual EQ page and driver/UI round trips. `tests/bq_page/run.py` also needs Node.js: it lifts the filter code out of `data/www/bq.html` and checks the page draws exactly what the firmware designs. There is no test framework beyond that; everything else needs testing on hardware.
 
 ## Documentation site
 
