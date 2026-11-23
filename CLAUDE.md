@@ -142,7 +142,8 @@ main/
 │   ├── wifi.c              # WiFi AP+STA, captive portal, auto-reconnect
 │   ├── ethernet.c          # W5500 SPI Ethernet driver
 │   ├── mdns_airplay.c      # mDNS AirPlay service advertisement
-│   ├── ptp_clock.c         # Precision Time Protocol clock
+│   ├── ptp_clock.c         # Two-way gPTP slave (Delay_Req midpoints, offset+rate filter, BMCA)
+│   ├── ptp_lwip_hook.h     # lwIP IPv4 input hook: stamps PTP packets in the tcpip thread
 │   ├── ntp_clock.c         # AirPlay 1 NTP client + PLL-disciplined software clock
 │   ├── web_server.c        # HTTP config/control server
 │   ├── ota.c               # OTA firmware updates
@@ -242,7 +243,7 @@ scripts/lint.sh            # Run clang-tidy on all C/H files
 scripts/lint.sh --fix      # Attempt to auto-fix clang-tidy issues
 ```
 
-**Host tests**: `tests/pcm51xx/run.py`, `tests/tas5805m_rate/run.py`, `tests/ptp_clock/run.py`, `tests/audio_eq/run.py`, `tests/rtp_resend/run.py`, `tests/rtp_sync/run.py`, `tests/audio_plc/run.py`, `tests/ntp_sim/run.py`, `tests/bplist/run.py`, `tests/husb238a/run.py`, `tests/audio_scheduler/run.py`, `tests/tas58xx_peak/run.py` and `tests/tas58xx_bq/run.py` compile the real driver, TAS5805M filter-rate, PTP filter, EQ, resend-tracker, sync-packet map, loss-concealment, NTP clock (a seeded simulation against the v0.3.0 copy in `tests/ntp_sim/baseline/`), binary-plist, USB-PD trigger, scheduler, filter-peak and TAS58xx filter-design code with the host C compiler, using small mocks where needed, and run in CI's `format-check` job. The TAS5805M suite also uses Node.js to check the actual EQ page and driver/UI round trips. `tests/bq_page/run.py` also needs Node.js: it lifts the filter code out of `data/www/bq.html` and checks the page draws exactly what the firmware designs. There is no test framework beyond that; everything else needs testing on hardware.
+**Host tests**: `tests/pcm51xx/run.py`, `tests/tas5805m_rate/run.py`, `tests/ptp_clock/run.py`, `tests/audio_eq/run.py`, `tests/rtp_resend/run.py`, `tests/rtp_sync/run.py`, `tests/audio_plc/run.py`, `tests/ntp_sim/run.py`, `tests/ptp_sim/run.py`, `tests/bplist/run.py`, `tests/husb238a/run.py`, `tests/audio_scheduler/run.py`, `tests/tas58xx_peak/run.py` and `tests/tas58xx_bq/run.py` compile the real driver, TAS5805M filter-rate, PTP filter, EQ, resend-tracker, sync-packet map, loss-concealment, NTP clock (a seeded simulation against the v0.3.0 copy in `tests/ntp_sim/baseline/`), PTP clock (a seeded Wi-Fi network simulation against the v0.3.0 copy in `tests/ptp_sim/baseline/`), binary-plist, USB-PD trigger, scheduler, filter-peak and TAS58xx filter-design code with the host C compiler, using small mocks where needed, and run in CI's `format-check` job. The TAS5805M suite also uses Node.js to check the actual EQ page and driver/UI round trips. `tests/bq_page/run.py` also needs Node.js: it lifts the filter code out of `data/www/bq.html` and checks the page draws exactly what the firmware designs. There is no test framework beyond that; everything else needs testing on hardware.
 
 ## Documentation site
 
