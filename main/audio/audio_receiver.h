@@ -8,6 +8,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "audio_flush_queue.h"
+
 /**
  * Audio receiver for AirPlay RTP streams
  * Handles UDP packet reception and audio decoding
@@ -148,29 +150,84 @@ void audio_receiver_seek_flush(void);
 void audio_receiver_realtime_flush(bool until_valid, uint32_t until_rtp);
 
 /**
- * Arm a deferred flush for AirPlay 2 FLUSHBUFFERED with flushFromSeq.
+ * AirPlay 2 FLUSHBUFFERED, as Apple's receiver applies it (see
+ * audio_flush_queue.h): by sequence number, both to what is buffered and to
+ * what is still arriving.  An immediate flush (no flushFromSeq) also stops
+ * output until the next SETRATEANCHORTIME.
  *
- * Instead of discarding the buffer immediately, the decode task keeps queueing
- * normally until it sees a frame whose rtp_timestamp >= flush_until_ts, at
- * which point it drops what is held and starts a fresh epoch.
- *
- * @param flush_until_ts  RTP timestamp boundary from flushUntilTS plist key.
+ * @return true when the reply carries RTP-Info: rtptime=*reply_rtp (the
+ *         record was processed at once and something had been rendered).
  */
-void audio_receiver_set_deferred_flush(uint32_t flush_until_ts);
+bool audio_receiver_flush_buffered(const audio_flush_record_t *record,
+                                   uint32_t *reply_rtp);
 
 /**
- * Pause playback while preserving the timing anchor.
- * Flushes the audio buffer and resets playback-start state, but does NOT
- * call audio_timing_reset() so the anchor remains valid.  The pause start
- * time is recorded so that audio_receiver_set_playing(true) can compensate
- * for the pause duration on resume.
+ * SETRATEANCHORTIME rate=0 (and PAUSE): stop output, keep every buffered
+ * packet, forget the anchor.  The resume brings a new one.
  */
 void audio_receiver_pause(void);
 
 /**
- * Set the stream playout latency in samples, added to every frame's
- * anchor-scheduled play time.  Realtime streams (type 96): latencyMin from
- * SETUP (default 11025 = 250 ms).  Buffered streams (type 103): 0.
+ * A validated SETRATEANCHORTIME, rate 0 or 1.  For rate 1 every anchor field
+ * was present in the request; the first audible sample is optional.
+ */
+typedef struct {
+  uint32_t rate;
+  uint32_t rtp;
+  uint64_t network_ns;
+  uint64_t timeline_id;
+  uint32_t network_flags;
+  bool fas_valid;
+  uint32_t fas_rtp;
+} audio_rate_anchor_t;
+
+/**
+ * Apply a buffered stream's SETRATEANCHORTIME.  Rate 1 installs the anchor
+ * (or keeps the running timeline when it agrees with it) as soon as the clock
+ * can place it, and resumes; rate 0 is audio_receiver_pause().
+ */
+void audio_receiver_set_rate_anchor(const audio_rate_anchor_t *anchor);
+
+/**
+ * The AirPlay 2 session's timing protocol: PTP (true) or NTP.  Decides which
+ * clock a buffered anchor is read through.
+ */
+void audio_receiver_set_session_timing(bool ptp);
+
+/**
+ * Sender latency for the buffered stream, in samples: audioLatencyMs or
+ * latencyMin from its SETUP, 0 when it sent neither.
+ */
+void audio_receiver_set_buffered_latency_samples(uint32_t latency_samples);
+
+/**
+ * Numbers for the session status line (see rtsp_server.c).
+ */
+typedef struct {
+  uint32_t anchors_installed;
+  uint32_t anchors_consistent;
+  uint32_t anchor_resets;
+  uint32_t anchors_deferred;
+  uint32_t gm_rebases;
+  uint32_t gm_rebase_failures;
+  uint32_t freewheels;
+  bool freewheeling;
+  uint32_t steps;
+  uint32_t step_clock_deferrals;
+  uint32_t trims;
+  int32_t error_us;
+  uint32_t flushes_pending;
+  uint32_t flush_dropped;
+  uint32_t buffered_blocks;
+  const char *state;
+} audio_receiver_diag_t;
+
+void audio_receiver_get_diag(audio_receiver_diag_t *diag);
+
+/**
+ * Set the realtime stream's playout latency in samples, added to every
+ * frame's anchor-scheduled play time: latencyMin from SETUP (default 11025 =
+ * 250 ms).  Buffered streams use audio_receiver_set_buffered_latency_samples().
  */
 void audio_receiver_set_playout_latency_samples(uint32_t latency_samples);
 

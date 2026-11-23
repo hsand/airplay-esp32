@@ -1067,6 +1067,22 @@ static int port_rank(const ptp_port_t *p, uint64_t gm, uint32_t now) {
 static void select_port(ptp_actions_t *act) {
   const uint32_t now = now_ms();
   uint64_t gm = ptp.expected_clock_id;
+  if (gm != 0 && ptp.gm_id == gm) {
+    // The anchor's GM is a preference, not a pin.  Once the clock has been
+    // on it and no live port carries it any more -- a HomePod or Apple TV
+    // took over as GM mid-session -- follow BMCA the way Apple's kernel
+    // does.  The audio side sees the timeline change through
+    // ptp_clock_network_to_local() and carries its anchor across, instead of
+    // the clock freewheeling on a GM that is gone until the lock times out.
+    bool gm_live = false;
+    for (int i = 0; i < PTP_MAX_PORTS && !gm_live; i++) {
+      gm_live = port_live(&ptp.ports[i], now) &&
+                port_on_gm(&ptp.ports[i], gm, now);
+    }
+    if (!gm_live) {
+      gm = 0;
+    }
+  }
   if (gm == 0) {
     // The best GM by BMCA; the current one stays while it ranks as well
     // (same priority vector), so equal masters do not take turns.

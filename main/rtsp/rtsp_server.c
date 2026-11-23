@@ -4,6 +4,7 @@
 #include "rtsp_server.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdlib.h>
@@ -15,6 +16,7 @@
 #include "audio_output.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -53,7 +55,15 @@ typedef struct {
   int socket;
   volatile bool should_stop;
   volatile bool is_old; // Marked as old client being killed
+  // When the last request was dispatched (any method, /feedback included),
+  // for the session idle timeout, and when the status line last went out.
+  int64_t last_request_us;
+  int64_t last_status_us;
 } client_slot_t;
+
+// One status line for the session/audio side every this often, from the RTSP
+// task (never the playback task).
+#define SESSION_STATUS_INTERVAL_US 10000000LL
 
 static client_slot_t clients[2] = {0}; // Current and old
 static int current_slot = 0;
@@ -141,6 +151,7 @@ static void process_rtsp_buffer(client_slot_t *slot, uint8_t *buffer,
     // the message boundary (buffer capacity > total_len).
     uint8_t saved = buffer[total_len];
     buffer[total_len] = '\0';
+    slot->last_request_us = esp_timer_get_time();
     rtsp_dispatch(slot->socket, slot->conn, buffer, total_len);
     buffer[total_len] = saved;
     free(header_str);
@@ -150,6 +161,49 @@ static void process_rtsp_buffer(client_slot_t *slot, uint8_t *buffer,
     }
     *buf_len -= total_len;
   }
+}
+
+static void log_session_status(const client_slot_t *slot, int64_t now_us) {
+  audio_receiver_diag_t d;
+  audio_receiver_get_diag(&d);
+  ESP_LOGI(TAG,
+           "session: timing=%s idle=%llds/%ds state=%s err=%" PRId32
+           "us anchors installed=%" PRIu32 " same=%" PRIu32 " reset=%" PRIu32
+           " waited=%" PRIu32 " gm_rebases=%" PRIu32 " (failed %" PRIu32
+           ") freewheel=%" PRIu32 "%s steps=%" PRIu32
+           " (clock-deferred %" PRIu32 ") trims=%" PRIu32
+           " flush pending=%" PRIu32 " dropped=%" PRIu32 " blocks=%" PRIu32,
+           slot->conn->timing_ptp ? "PTP" : "NTP",
+           (long long)((now_us - slot->last_request_us) / 1000000LL),
+           rtsp_session_idle_limit_s(slot->conn), d.state, d.error_us,
+           d.anchors_installed, d.anchors_consistent, d.anchor_resets,
+           d.anchors_deferred, d.gm_rebases, d.gm_rebase_failures, d.freewheels,
+           d.freewheeling ? " (now)" : "", d.steps, d.step_clock_deferrals,
+           d.trims, d.flushes_pending, d.flush_dropped, d.buffered_blocks);
+}
+
+// Once a second or so, between reads: the session idle timeout and the
+// status line.  False when the session has gone idle for too long; Apple's
+// receiver then terminates it, and so does this one, through the same
+// cleanup as a closed connection.  Only an AirPlay 2 session that has done
+// its session SETUP is timed: an AirPlay 1 sender has no /feedback to keep it
+// alive.
+static bool client_tick(client_slot_t *slot) {
+  const rtsp_conn_t *conn = slot->conn;
+  if (!conn || conn->protocol_version != 2 || conn->event_port == 0) {
+    return true;
+  }
+  const int64_t now_us = esp_timer_get_time();
+  const int limit_s = rtsp_session_idle_limit_s(conn);
+  if (now_us - slot->last_request_us > (int64_t)limit_s * 1000000LL) {
+    ESP_LOGW(TAG, "Idle timeout after %d seconds with no activity", limit_s);
+    return false;
+  }
+  if (now_us - slot->last_status_us >= SESSION_STATUS_INTERVAL_US) {
+    slot->last_status_us = now_us;
+    log_session_status(slot, now_us);
+  }
+  return true;
 }
 
 // Client task
@@ -208,6 +262,12 @@ static void client_task(void *pvParameters) {
   int nodelay = 1;
   setsockopt(slot->socket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
+  // A peer that vanished (phone off Wi-Fi) is noticed by TCP keepalive; a
+  // buffered stream lengthens it (see handle_setup()).
+  rtsp_set_keepalive(slot->socket, rtsp_session_idle_limit_s(conn) / 5);
+  slot->last_request_us = esp_timer_get_time();
+  slot->last_status_us = slot->last_request_us;
+
   while (server_running && !slot->should_stop) {
     if (conn->encrypted_mode) {
       // Encrypted mode
@@ -229,6 +289,9 @@ static void client_task(void *pvParameters) {
 
         int block_len = rtsp_crypto_read_block(
             slot->socket, conn, buffer + buf_len, buf_capacity - buf_len);
+        if (!client_tick(slot)) {
+          goto cleanup;
+        }
         if (block_len <= 0) {
           if (slot->should_stop || (errno != EAGAIN && errno != EWOULDBLOCK)) {
             goto cleanup;
@@ -259,6 +322,9 @@ static void client_task(void *pvParameters) {
 
     ssize_t recv_len =
         recv(slot->socket, buffer + buf_len, buf_capacity - buf_len, 0);
+    if (!client_tick(slot)) {
+      break;
+    }
     if (recv_len <= 0) {
       if (recv_len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         continue;
@@ -371,6 +437,9 @@ cleanup:
   // When being replaced by a new client (is_old), skip global state changes —
   // the new session's SETUP already manages PTP and the event port task.
   if (!slot->is_old) {
+    // The session is over: its timing peers and PTP session go with it.  A
+    // replaced connection leaves them to its successor.
+    rtsp_session_end_clock();
     ptp_clock_init(); // Restart PTP (stopped during v1 SETUP to free sockets)
     rtsp_stop_event_port_task();
   } else if (rtsp_event_port_listen_socket() >= 0 &&

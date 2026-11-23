@@ -405,6 +405,137 @@ static void test_step_hold_ends(void) {
   CHECK(bad_steps == 0, "%d holds without exactly one step", bad_steps);
 }
 
+/* Render `renders` blocks from render `from` on, with playout knocked off by
+ * jump_ns and the clock offset the caller reports moved by offset_ns from
+ * render `at` on.  Returns the render at which the first step began, or -1. */
+static int64_t run_until_step(audio_scheduler_t *scheduler, int64_t from,
+                              int64_t renders, int64_t at, int64_t jump_ns,
+                              int64_t offset_ns) {
+  int16_t block[BLOCK * AUDIO_V2_MAX_CHANNELS];
+  for (int64_t i = from; i < from + renders; i++) {
+    const int64_t network_ns = (int64_t)clock_map.anchor_network_ns +
+                               i * BLOCK * 1000000000LL / RATE +
+                               (i >= at ? jump_ns : 0);
+    audio_scheduler_set_clock_offset(scheduler, true, i >= at ? offset_ns : 0);
+    const uint32_t steps = scheduler->drift_steps;
+    (void)audio_scheduler_render(scheduler, &timeline, &clock_map, network_ns,
+                                 block, BLOCK, AUDIO_V2_MAX_CHANNELS, NULL);
+    if (scheduler->drift_steps != steps) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/* The step's premise changed in this tree: it used to fire after 4 renders
+ * (32 ms) past 5 ms.  Now an error of the audio path's own -- the clock
+ * offset steady -- is stepped once it has held DRIFT_STEP_CONFIRM_MS past
+ * DRIFT_STEP_MS, and not before. */
+static void test_step_persistence(void) {
+  printf("step persistence: 15 ms off with the clock steady\n");
+  drift_ppm = 0.0;
+  audio_scheduler_t scheduler;
+  start(&scheduler);
+  const int64_t at = DRIFT_SERVO_WARMUP_RENDERS + 50;
+  const int64_t step =
+      run_until_step(&scheduler, 1, at + 400, at, 15000000LL, 0);
+  const double after_ms = (double)(step - at) * BLOCK * 1000.0 / RATE;
+  printf("  stepped %.0f ms after the error appeared\n", after_ms);
+  CHECK(step > 0, "no step");
+  /* Plus the few renders the 1/8 filter takes to cross DRIFT_STEP_MS. */
+  CHECK(after_ms >= DRIFT_STEP_CONFIRM_MS &&
+            after_ms <= DRIFT_STEP_CONFIRM_MS + 80,
+        "stepped after %.0f ms", after_ms);
+}
+
+/* The same error, made by the clock: the offset jumped with it.  Nothing is
+ * stepped while the clock may jump back (CLOCK_JUMP_HOLD_MS), the servo does
+ * not chase it, and an excursion that ends inside that leaves no trace. */
+static void test_step_clock_excursion(void) {
+  printf("clock excursion: 15 ms for 1.5 s, then back\n");
+  drift_ppm = 0.0;
+  audio_scheduler_t scheduler;
+  start(&scheduler);
+  const int64_t at = DRIFT_SERVO_WARMUP_RENDERS + 50;
+  const int64_t excursion = (int64_t)(1.5 * RATE / BLOCK);
+  const uint32_t trims = scheduler.drift_servo_trims;
+  int64_t step = run_until_step(&scheduler, 1, at + excursion - 1, at,
+                                15000000LL, 15000000LL);
+  CHECK(step < 0, "stepped at render %lld during the excursion",
+        (long long)step);
+  step = run_until_step(&scheduler, at + excursion, 600, at + excursion + 600,
+                        0, 0);
+  CHECK(step < 0, "stepped at render %lld after it", (long long)step);
+  CHECK(scheduler.drift_servo_trims - trims <= 1, "%u trims chasing the clock",
+        (unsigned)(scheduler.drift_servo_trims - trims));
+  CHECK(scheduler.servo_holds == 2, "%u holds",
+        (unsigned)scheduler.servo_holds);
+
+  printf("clock step: 15 ms for good\n");
+  start(&scheduler);
+  step = run_until_step(&scheduler, 1, at + 800, at, 15000000LL, 15000000LL);
+  const double after_ms = (double)(step - at) * BLOCK * 1000.0 / RATE;
+  printf("  stepped %.0f ms after the clock moved\n", after_ms);
+  CHECK(step > 0 && after_ms >= CLOCK_JUMP_HOLD_MS + DRIFT_STEP_CONFIRM_MS - 20,
+        "stepped after %.0f ms", after_ms);
+}
+
+/* A new anchor that moved the timeline under a playing stream: the first
+ * measurement goes there at once, as Apple re-sets its offset on the first
+ * measurement after an anchor.  Within ANCHOR_RESET_MIN_US it is left to the
+ * servo. */
+static void test_anchor_reset(void) {
+  printf("anchor reset: the first measurement after a moving anchor\n");
+  drift_ppm = 0.0;
+  audio_scheduler_t scheduler;
+  start(&scheduler);
+  const int64_t at = DRIFT_SERVO_WARMUP_RENDERS + 50;
+  (void)run_until_step(&scheduler, 1, at - 1, at, 0, 0);
+  audio_scheduler_new_anchor(&scheduler, true);
+  int64_t step = run_until_step(&scheduler, at, 3, at, 30000000LL, 0);
+  CHECK(step == at, "reset at render %lld, not %lld", (long long)step,
+        (long long)at);
+  CHECK(scheduler.anchor_resets == 1, "%u resets",
+        (unsigned)scheduler.anchor_resets);
+
+  start(&scheduler);
+  (void)run_until_step(&scheduler, 1, at - 1, at, 0, 0);
+  audio_scheduler_new_anchor(&scheduler, true);
+  step = run_until_step(&scheduler, at, 100, at, 1000000LL, 0);
+  CHECK(step < 0 && scheduler.anchor_resets == 0, "a 1 ms move is the servo's");
+}
+
+/* First audible sample: silence up to it, the tone from exactly it. */
+static void test_first_audible(void) {
+  printf("first audible sample\n");
+  drift_ppm = 0.0;
+  audio_scheduler_t scheduler;
+  audio_scheduler_init(&scheduler, RATE / 4, 0);
+  audio_scheduler_begin_epoch(&scheduler, 1, mock_now_us);
+  const uint32_t fas = clock_map.anchor_rtp + 1000U;
+  audio_scheduler_set_first_audible(&scheduler, true, fas);
+  int16_t block[BLOCK * AUDIO_V2_MAX_CHANNELS];
+  int64_t first_sound = -1;
+  for (int64_t i = 0; i < 5 && first_sound < 0; i++) {
+    const int64_t network_ns =
+        (int64_t)clock_map.anchor_network_ns + i * BLOCK * 1000000000LL / RATE;
+    (void)audio_scheduler_render(&scheduler, &timeline, &clock_map, network_ns,
+                                 block, BLOCK, AUDIO_V2_MAX_CHANNELS, NULL);
+    for (size_t k = 0; k < BLOCK; k++) {
+      if (block[k * AUDIO_V2_MAX_CHANNELS] != 0 ||
+          block[k * AUDIO_V2_MAX_CHANNELS + 1] != 0) {
+        first_sound = i * BLOCK + (int64_t)k;
+        CHECK(block[k * AUDIO_V2_MAX_CHANNELS] == tone_sample(fas, 0),
+              "first sound is not the first audible sample");
+        break;
+      }
+    }
+  }
+  CHECK(first_sound == 1000, "first sound at frame %lld, wanted 1000",
+        (long long)first_sound);
+  CHECK(!scheduler.fas_valid, "gate still armed");
+}
+
 int main(void) {
   test_kernel();
   test_block(-1);
@@ -416,6 +547,10 @@ int main(void) {
   test_step(40.0);
   test_step(-40.0);
   test_step_hold_ends();
+  test_step_persistence();
+  test_step_clock_excursion();
+  test_anchor_reset();
+  test_first_audible();
   if (failures) {
     printf("%d check(s) failed\n", failures);
     return 1;

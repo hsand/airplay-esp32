@@ -14,6 +14,9 @@
 typedef struct {
   uint32_t epoch;
   uint32_t rtp_timestamp;
+  /* The buffered stream's 24-bit sequence number: FLUSHBUFFERED is keyed on
+   * it, not on the timestamp. */
+  uint32_t seq;
   const uint8_t *payload;
   size_t payload_len;
   /* Sampled at ingress, where the block counters are coherent: by the time the

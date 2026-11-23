@@ -62,6 +62,12 @@ struct rtsp_conn {
   //   1 = classic RAOP (Apple-Challenge / rsaaeskey / Transport: header)
   //   2 = AirPlay 2 (HAP / bplist streams)
   uint8_t protocol_version;
+
+  // AirPlay 2 session timing from the session SETUP's timingProtocol: PTP, or
+  // NTP when the key is absent or says so (Apple's default).
+  bool timing_ptp;
+  // The buffered stream SETUP's keys have been logged for this session.
+  bool stream_keys_logged;
 };
 
 /**

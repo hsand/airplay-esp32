@@ -3,6 +3,8 @@
 
 #include "audio_timeline.h"
 
+#include "audio_flush_queue.h"
+
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
@@ -145,6 +147,19 @@ esp_err_t audio_timeline_init(audio_timeline_t *t, uint16_t capacity,
     return ESP_ERR_NO_MEM;
   }
 
+  const size_t tag_bytes = (size_t)t->max_capacity * sizeof(*t->seq_tag);
+#ifdef CONFIG_SPIRAM
+  t->seq_tag =
+      heap_caps_calloc(1, tag_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
+  if (!t->seq_tag) {
+    t->seq_tag = calloc(1, tag_bytes);
+  }
+  if (!t->seq_tag) {
+    audio_timeline_deinit(t);
+    return ESP_ERR_NO_MEM;
+  }
+
   const size_t pcm_bytes = t->pool_pcm_samples * sizeof(int16_t);
 #ifdef CONFIG_SPIRAM
   t->pcm_pool =
@@ -182,6 +197,7 @@ void audio_timeline_deinit(audio_timeline_t *t) {
     vSemaphoreDelete(t->space_available);
   }
   free(t->desc);
+  free(t->seq_tag);
   free(t->pcm_pool);
   audio_plc_deinit(&t->plc);
   memset(t, 0, sizeof(*t));
@@ -327,6 +343,45 @@ size_t audio_timeline_discard_from(audio_timeline_t *t, uint32_t epoch,
   return dropped;
 }
 
+size_t audio_timeline_discard_seq_range(audio_timeline_t *t, uint32_t epoch,
+                                        bool has_from, uint32_t from_seq,
+                                        uint32_t until_seq) {
+  if (!t || !t->desc || !t->seq_tag) {
+    return 0U;
+  }
+  const audio_flush_record_t range = {
+      .has_from = has_from,
+      .from_seq = from_seq & AUDIO_SEQ24_MASK,
+      .until_seq = until_seq & AUDIO_SEQ24_MASK,
+  };
+
+  size_t dropped = 0U;
+  portENTER_CRITICAL(&t->lock);
+  for (uint16_t i = 0; i < t->capacity; ++i) {
+    audio_timeline_desc_t *d = &t->desc[i];
+    const uint32_t tag = t->seq_tag[i];
+    if (!d->used || d->epoch != epoch || !(tag & AUDIO_TIMELINE_SEQ_VALID)) {
+      continue;
+    }
+    /* A block being copied out goes too: audio_timeline_read() sees it is no
+     * longer valid when it lets go and replaces what it copied with silence,
+     * so the flushed audio is never heard. */
+    if (audio_flush_record_covers(&range, tag & AUDIO_SEQ24_MASK)) {
+      d->used = false;
+      if (t->count > 0U) {
+        t->count--;
+      }
+      dropped++;
+    }
+  }
+  portEXIT_CRITICAL(&t->lock);
+
+  if (dropped > 0U && t->space_available) {
+    xSemaphoreGive(t->space_available);
+  }
+  return dropped;
+}
+
 size_t audio_timeline_trim_before(audio_timeline_t *t, uint32_t epoch,
                                   uint32_t rtp) {
   if (!t || !t->desc) {
@@ -411,7 +466,7 @@ void audio_timeline_set_playback_floor(audio_timeline_t *t, uint32_t epoch,
 }
 
 bool audio_timeline_reserve(audio_timeline_t *t, uint32_t epoch,
-                            uint32_t rtp_start,
+                            uint32_t rtp_start, uint32_t seq_tag,
                             audio_timeline_reservation_t *reservation,
                             int16_t **pcm_out) {
   if (!t || !t->desc || !reservation || !pcm_out) {
@@ -471,6 +526,7 @@ bool audio_timeline_reserve(audio_timeline_t *t, uint32_t epoch,
   desc->rtp_start = rtp_start;
   desc->used = false;
   desc->writing = true;
+  t->seq_tag[idx] = seq_tag;
   t->writing_count++;
 
   reservation->slot_index = idx;

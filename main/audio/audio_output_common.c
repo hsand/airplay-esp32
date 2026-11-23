@@ -20,12 +20,15 @@
 
 #include "audio_output.h"
 
+#include "sdkconfig.h"
+
 #include "audio_receiver.h"
 #include "led.h"
 
-// ~5 ms of scheduling + write delay between this call and the samples
-// reaching the backend.  Mirrors PIPELINE_LATENCY_US in audio_timing.c.
-#define OUTPUT_PIPELINE_LATENCY_US 5000
+// Scheduling, resampler and DAC delay between the DMA ring and the ear, 5 ms
+// unless a board says otherwise.  Mirrors PIPELINE_LATENCY_US in
+// audio_timing.c, and is reported to the sender in RECORD's Audio-Latency.
+#define OUTPUT_PIPELINE_LATENCY_US CONFIG_AUDIO_OUTPUT_EXTRA_LATENCY_US
 
 // Alternate renderer, or NULL for the AirPlay receiver.  Written by the
 // arbitration path once the previous owner has been stopped and read once per
@@ -64,6 +67,10 @@ int64_t audio_output_get_next_playout_time_ns(int64_t now_us) {
   }
   return (sampled_us + (int64_t)pipeline_us + OUTPUT_PIPELINE_LATENCY_US) *
          1000LL;
+}
+
+uint32_t audio_output_get_platform_latency_us(void) {
+  return audio_output_get_hardware_latency_us() + OUTPUT_PIPELINE_LATENCY_US;
 }
 
 __attribute__((weak)) bool audio_output_get_pipeline_us(int64_t *now_us,

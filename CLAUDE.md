@@ -103,6 +103,8 @@ main/
 │   ├── rtp_sync.c          # Realtime sync packets -> one smoothed anchor per segment
 │   ├── audio_decoder.c     # ALAC and AAC decoders
 │   ├── audio_decode_worker.c # Decoder task fed from the receive path
+│   ├── audio_flush_queue.c # FLUSHBUFFERED records, keyed on 24-bit sequence numbers
+│   ├── audio_playout_clock.c # Local -> sender time per render: rate+anchor, GM re-base, freewheel
 │   ├── audio_buffer.c      # Decoder scratch space (the sorted PCM ring is gone)
 │   ├── audio_timeline.c    # RTP-addressed PCM store — holds the decoded audio
 │   ├── audio_plc.c         # Packet-loss concealment: fills timeline holes with a faded repeat
@@ -123,6 +125,7 @@ main/
 │   ├── rtsp_server.c       # RTSP connection handler
 │   ├── rtsp_conn.c         # Connection management
 │   ├── rtsp_handlers.c     # RTSP method handlers (OPTIONS, SETUP, PLAY, etc.)
+│   ├── rtsp_anchor.c       # SETRATEANCHORTIME / FLUSHBUFFERED request validation
 │   ├── rtsp_crypto.c       # RTSP-level encryption
 │   ├── rtsp_fairplay.c     # Apple FairPlay integration
 │   └── rtsp_rsa.c          # RSA crypto
@@ -243,7 +246,7 @@ scripts/lint.sh            # Run clang-tidy on all C/H files
 scripts/lint.sh --fix      # Attempt to auto-fix clang-tidy issues
 ```
 
-**Host tests**: `tests/pcm51xx/run.py`, `tests/tas5805m_rate/run.py`, `tests/ptp_clock/run.py`, `tests/audio_eq/run.py`, `tests/rtp_resend/run.py`, `tests/rtp_sync/run.py`, `tests/audio_plc/run.py`, `tests/ntp_sim/run.py`, `tests/ptp_sim/run.py`, `tests/bplist/run.py`, `tests/husb238a/run.py`, `tests/audio_scheduler/run.py`, `tests/tas58xx_peak/run.py` and `tests/tas58xx_bq/run.py` compile the real driver, TAS5805M filter-rate, PTP filter, EQ, resend-tracker, sync-packet map, loss-concealment, NTP clock (a seeded simulation against the v0.3.0 copy in `tests/ntp_sim/baseline/`), PTP clock (a seeded Wi-Fi network simulation against the v0.3.0 copy in `tests/ptp_sim/baseline/`), binary-plist, USB-PD trigger, scheduler, filter-peak and TAS58xx filter-design code with the host C compiler, using small mocks where needed, and run in CI's `format-check` job. The TAS5805M suite also uses Node.js to check the actual EQ page and driver/UI round trips. `tests/bq_page/run.py` also needs Node.js: it lifts the filter code out of `data/www/bq.html` and checks the page draws exactly what the firmware designs. There is no test framework beyond that; everything else needs testing on hardware.
+**Host tests**: `tests/pcm51xx/run.py`, `tests/tas5805m_rate/run.py`, `tests/ptp_clock/run.py`, `tests/audio_eq/run.py`, `tests/rtp_resend/run.py`, `tests/rtp_sync/run.py`, `tests/audio_plc/run.py`, `tests/ntp_sim/run.py`, `tests/ptp_sim/run.py`, `tests/bplist/run.py`, `tests/husb238a/run.py`, `tests/audio_scheduler/run.py`, `tests/tas58xx_peak/run.py`, `tests/tas58xx_bq/run.py` and `tests/airplay_control/run.py` (FLUSHBUFFERED ranges, anchor validation, timing peers) compile the real driver, TAS5805M filter-rate, PTP filter, EQ, resend-tracker, sync-packet map, loss-concealment, NTP clock (a seeded simulation against the v0.3.0 copy in `tests/ntp_sim/baseline/`), PTP clock (a seeded Wi-Fi network simulation against the v0.3.0 copy in `tests/ptp_sim/baseline/`), binary-plist, USB-PD trigger, scheduler, filter-peak and TAS58xx filter-design code with the host C compiler, using small mocks where needed, and run in CI's `format-check` job. The TAS5805M suite also uses Node.js to check the actual EQ page and driver/UI round trips. `tests/bq_page/run.py` also needs Node.js: it lifts the filter code out of `data/www/bq.html` and checks the page draws exactly what the firmware designs. `tests/playout_sim/run.py` drives the real engine, scheduler, timeline and clock map through a simulated sender, TCP link, DMA ring and DAC, against the v0.3.0 copies in `tests/playout_sim/baseline/`, and prints old against new per scenario (drift, stalls, clock glitches, a grandmaster change, pause, skip, loss). There is no test framework beyond that; everything else needs testing on hardware.
 
 ## Documentation site
 

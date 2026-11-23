@@ -16,6 +16,10 @@ typedef struct {
   uint32_t anchor_rtp;
   uint64_t anchor_network_ns;
   int64_t playout_offset_ns;
+  /* PTP grandmaster/timeline the anchor's network time is on, 0 when unknown
+   * (NTP, Sendspin).  When the grandmaster changes the anchor is re-expressed
+   * on the new timeline rather than dropped; see audio_playout_clock.c. */
+  uint64_t timeline_id;
 } audio_clock_map_t;
 
 void audio_clock_map_reset(audio_clock_map_t *map);

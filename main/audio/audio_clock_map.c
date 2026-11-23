@@ -23,6 +23,7 @@ bool audio_clock_map_set(audio_clock_map_t *map, uint32_t sample_rate,
   map->anchor_rtp = anchor_rtp;
   map->anchor_network_ns = anchor_network_ns;
   map->playout_offset_ns = playout_offset_ns;
+  map->timeline_id = 0;
   map->valid = true;
   return true;
 }

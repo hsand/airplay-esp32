@@ -20,9 +20,15 @@
 
 #define BUFFERED_AUDIO_PACKET_SIZE 8192
 #define AUDIO_BUFFERED_STACK_SIZE  4096
-// Bounded hand-off to the decode worker.  Long enough to ride out a decode
-// hiccup, short enough that a wedged decoder cannot block stream teardown.
-#define BUFFERED_ENQUEUE_TIMEOUT_MS 200U
+// One slice of the hand-off to the decode worker.  A full queue is waited out
+// slice after slice -- the reader stops reading, the TCP window closes and the
+// sender is held back, as Apple's receiver does -- and the slice only bounds
+// how quickly a stop or a flush is noticed.  Dropping the packet after a
+// timeout instead cut a hole the sender would never fill: there is no
+// retransmission on the buffered stream.
+#define BUFFERED_ENQUEUE_SLICE_MS 200U
+// Data connection timeout while playing: Apple's tcpAudioDataTimeout.
+#define BUFFERED_DATA_TIMEOUT_S 120
 // The lwIP core; core 1 is reserved for decode and I2S playback.
 #define AUDIO_BUFFERED_TASK_CORE 0
 
@@ -81,7 +87,7 @@ static void buffered_audio_task(void *pvParameters) {
 
     state->buffered_client_socket = client_sock;
 
-    struct timeval tv = {.tv_sec = 30, .tv_usec = 0};
+    struct timeval tv = {.tv_sec = BUFFERED_DATA_TIMEOUT_S, .tv_usec = 0};
     setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     // Socket receive buffer: match lwIP's TCP receive window so the kernel
@@ -189,13 +195,20 @@ static void buffered_audio_task(void *pvParameters) {
       const audio_encoded_packet_t encoded = {
           .epoch = epoch,
           .rtp_timestamp = timestamp,
+          .seq = seq_no,
           .payload = decrypted,
           .payload_len = (size_t)decrypted_len,
           .prime_mute = audio_stream_aac_prime_mute_wanted(state),
       };
 
-      const audio_decode_enqueue_result_t enq = audio_decode_worker_enqueue(
-          state->decode_worker, &encoded, BUFFERED_ENQUEUE_TIMEOUT_MS);
+      audio_decode_enqueue_result_t enq = audio_decode_worker_enqueue(
+          state->decode_worker, &encoded, BUFFERED_ENQUEUE_SLICE_MS);
+      while (enq == AUDIO_DECODE_ENQUEUE_RETRY && stream->running) {
+        (void)__atomic_add_fetch(&state->engine_v2.diag_enqueue_retries, 1U,
+                                 __ATOMIC_RELAXED);
+        enq = audio_decode_worker_enqueue(state->decode_worker, &encoded,
+                                          BUFFERED_ENQUEUE_SLICE_MS);
+      }
       if (enq == AUDIO_DECODE_ENQUEUE_OK) {
         (void)__atomic_add_fetch(&state->engine_v2.diag_enqueue_ok, 1U,
                                  __ATOMIC_RELAXED);
