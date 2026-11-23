@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Run the PTP offset filter through clock steps and delayed SYNCs on the host.
+"""Run the PTP clock through clock steps, delayed SYNCs, Delay_Req exchanges,
+grandmaster changes and the lwIP timestamp hook on the host.
 
 Requires Python 3 and a C compiler; no ESP-IDF installation or hardware needed.
 Run from any directory with: python3 tests/ptp_clock/run.py
@@ -18,7 +19,7 @@ ROOT = HERE.parents[1]
 # Only ESP-IDF/platform dependencies are replaced. test.c includes
 # ptp_clock.c itself, so it can feed the filter samples directly.
 SHIMS = (
-    "esp_err.h", "esp_log.h", "esp_timer.h", "freertos/FreeRTOS.h",
+    "esp_err.h", "esp_log.h", "esp_timer.h", "esp_mac.h", "freertos/FreeRTOS.h",
     "freertos/task.h", "spiram_task.h",
 )
 
@@ -36,7 +37,7 @@ with tempfile.TemporaryDirectory(prefix="ptp-clock-tests-") as temporary:
         "-Wno-unused-parameter",
         "-I", str(build), "-I", str(HERE),
         "-I", str(ROOT / "main/network"),
-        str(HERE / "test.c"),
+        str(HERE / "test.c"), "-lm",
         "-o", str(build / "test"),
     ]
     print("PTP clock host tests", flush=True)

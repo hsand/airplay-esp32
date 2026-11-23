@@ -3,18 +3,31 @@
 
 #pragma once
 
-#include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 /**
- * Simple PTP (IEEE 1588) slave for AirPlay time synchronization.
- * Listens for SYNC/FOLLOW_UP messages and tracks offset to PTP master.
+ * gPTP (IEEE 1588 / 802.1AS) slave for AirPlay 2 time synchronization,
+ * modelled on Apple's own receiver:
+ *
+ *  - Two-way end-to-end measurement: a unicast Delay_Req answers every Sync
+ *    from the chosen master port, and the (t1+t4)/2 vs (t2+t3)/2 midpoints
+ *    cancel the symmetric part of the path delay.
+ *  - A lag-compensated two-stage IIR per timeline gives offset *and* rate,
+ *    so local <-> network conversions are anchor + rate, not offset only.
+ *  - Masters that never answer Delay_Req are followed passively, from the
+ *    least delayed one-way samples, with a retry of two-way every 10 s.
+ *  - The grandmaster is tracked from Announce and the Follow_Up TLVs; every
+ *    network time carries the GM it is on, and a GM change resets the clock.
+ *
+ * The board never becomes master and never sends Announce.
  */
 
 /**
  * Initialize and start PTP clock synchronization.
- * Creates a task that listens for PTP multicast messages.
+ * Creates a task that listens for PTP messages on UDP 319/320.
  */
 esp_err_t ptp_clock_init(void);
 
@@ -25,14 +38,15 @@ void ptp_clock_stop(void);
 
 /**
  * Clear PTP clock synchronization state.
- * Resets offset and lock status without stopping the clock.
- * Used when a new session cannot safely reuse the previous clock state.
+ * Resets offset, rate, lock, master filter and peer list without stopping
+ * the clock.  Used when a new session cannot safely reuse the previous
+ * clock state.
  */
 void ptp_clock_clear(void);
 
 /**
  * Called at TEARDOWN.  If the master is still sending (an accepted sample
- * within the last 2 s), keep the offset, lock and master filter, so the next
+ * within the last 2 s), keep the model, lock and master filter, so the next
  * session from the same master starts without re-locking;
  * otherwise behave like ptp_clock_clear().
  */
@@ -45,29 +59,24 @@ void ptp_clock_end_session(void);
 bool ptp_clock_is_locked(void);
 
 /**
- * Get current PTP time in nanoseconds.
- * Returns local time adjusted by PTP offset.
- * @return PTP time in nanoseconds since epoch
+ * Get current PTP time in nanoseconds: local time through the offset + rate
+ * model.
  */
 uint64_t ptp_clock_get_time_ns(void);
 
 /**
- * Get current offset from local clock to PTP time in nanoseconds.
- * PTP_time = local_time + offset
+ * Get current offset from local clock to PTP time in nanoseconds, evaluated
+ * at "now" from the offset + rate model.  PTP_time = local_time + offset.
  */
 int64_t ptp_clock_get_offset_ns(void);
 
 /**
  * Notify the PTP clock that playback is resuming after a pause.
  *
- * If the pause lasted longer than PTP_LONG_PAUSE_THRESHOLD_MS, this
- * resets the asymmetric smoothing filter so the next received PTP sample is
- * accepted unconditionally — mirroring the nqptp "B" (begin) signal behaviour
- * described in nqptp-shm-structures.h.
- *
- * Without this, after a pause long enough for the local crystal to drift,
- * the 1/256-negative-jitter damping would take several minutes to re-converge,
- * causing audible multi-room sync loss on resume.
+ * The clock keeps measuring through a pause, so this only matters when the
+ * master went quiet meanwhile (a phone that slept): if the pause lasted at
+ * least 30 s and the samples are not current, the next sample re-seeds the
+ * filter instead of being gated against a stale model.
  *
  * @param pause_duration_ms  Wall-clock length of the pause in milliseconds.
  */
@@ -77,31 +86,32 @@ void ptp_clock_notify_resume(uint32_t pause_duration_ms);
  * Get synchronization statistics.
  */
 typedef struct {
-  uint32_t sync_count;        // Number of SYNC messages received
-  uint32_t followup_count;    // Number of FOLLOW_UP messages received
-  int64_t last_offset_ns;     // Last RAW measured offset (pre-smoothing)
-  int64_t filtered_offset_ns; // Filtered/averaged offset (what timing uses)
+  uint32_t sync_count;        // SYNCs received from the selected port
+  uint32_t followup_count;    // FOLLOW_UPs matched to them
+  int64_t last_offset_ns;     // Last RAW measured offset (pre-filter)
+  int64_t filtered_offset_ns; // Model offset at "now" (what timing uses)
   uint32_t lock_time_ms;      // Time since lock achieved (0 if not locked)
-  uint32_t outlier_count;     // Samples rejected as outliers since start
+  uint32_t outlier_count;     // Samples dropped by any gate since start
+  uint32_t delay_req_sent;
+  uint32_t delay_resp_received;
+  bool two_way; // the clock is on two-way samples (else passive)
+  int32_t rate_ppb;
+  uint64_t grandmaster_id;
 } ptp_stats_t;
 
 void ptp_clock_get_stats(ptp_stats_t *stats);
 
 /**
- * Restrict the PTP clock to a single master identified by its 8-byte
- * clockIdentity (the value carried in the AirPlay 2 0xD7 anchor packet at
- * offset +20, and in the PTP common-header sourcePortIdentity field at
- * bytes 20-27).
+ * Name the timeline the AirPlay anchor is on: the grandmaster clockIdentity
+ * carried in the 0xD7 anchor packet.  Pass 0 to clear the filter (choose the
+ * grandmaster by BMCA from Announce -- the default at startup).
  *
- * Pass 0 to clear the filter (accept any master — the default at startup).
+ * A port is on GM `id` when its Announce or Apple Follow_Up TLV names it, or
+ * when its own clockIdentity is `id` (the GM's direct port, preferred).
  *
- * When the expected clock_id changes, the filter resets samples and lock
- * state so a stale offset to a previous (possibly wrong) master is not
- * carried over -- unless every sample already came from the new master and
- * the latest, accepted, is under 2 s old, in which case they are kept.  On a
- * network with multiple PTP-speaking Apple devices (HomePods, AppleTVs, other
- * receivers), this is what prevents us from locking to the wrong master and
- * computing nonsense early/late deltas.
+ * When the GM changes, the model and lock are reset so a stale offset to a
+ * previous master is not carried over -- unless the clock is already on
+ * that GM and its latest sample, accepted, is under 2 s old.
  */
 void ptp_clock_set_master_clock_id(uint64_t clock_id);
 
@@ -109,3 +119,31 @@ void ptp_clock_set_master_clock_id(uint64_t clock_id);
  * Read the current expected master clock_id (0 if none / filter cleared).
  */
 uint64_t ptp_clock_get_master_clock_id(void);
+
+/**
+ * Peers from SETUP timingPeerInfo/timingPeerList and SETPEERS/SETPEERSX.
+ * IPv4 only; replaces the whole list.  While the list is non-empty, Sync
+ * from any other address is ignored.  count == 0 accepts every source.
+ */
+void ptp_clock_set_peers(const uint32_t *ipv4_addrs_net_order, size_t count);
+
+/**
+ * Local (esp_timer ns) -> network (PTP ns) using the offset + rate model.
+ * Returns false when not locked.  *gm_id (may be NULL) = the grandmaster /
+ * timeline the value is on.
+ */
+bool ptp_clock_local_to_network(int64_t local_ns, uint64_t *network_ns,
+                                uint64_t *gm_id);
+
+/**
+ * Network -> local.  Returns false when not locked or when gm_id is not the
+ * current grandmaster (the timeline changed): that is how the audio side
+ * detects a GM change and re-derives its anchor.
+ */
+bool ptp_clock_network_to_local(uint64_t network_ns, uint64_t gm_id,
+                                int64_t *local_ns);
+
+/**
+ * The grandmaster the clock is on; 0 if none.
+ */
+uint64_t ptp_clock_get_grandmaster_id(void);
