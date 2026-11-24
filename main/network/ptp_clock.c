@@ -349,6 +349,10 @@ static struct {
   bool model_valid;
 
   uint64_t expected_clock_id; // GM named by the anchor (0 = BMCA)
+  uint32_t expected_gm_seen_ms; // last time a live port carried it
+  // The anchor's GM was left for BMCA (handover or silence); stays set until
+  // the next anchor names a GM, so the pin does not re-assert and flap.
+  bool expected_released;
   ptp_servo_t tw;             // two-way estimator
   ptp_servo_t ow;             // passive (one-way) estimator
 
@@ -988,8 +992,13 @@ static uint64_t port_gm(const ptp_port_t *p, uint32_t now) {
   return p->clock_id;
 }
 
+// A port carries GM `gm` when that is what it announces (or, without a fresh
+// Announce, what its Apple TLV names or its own identity).  Its own identity
+// alone is not enough: a GM that hands over to another device keeps sending
+// SYNCs from the same port, now as a boundary clock carrying the *new* GM's
+// timeline, and only its Announce says so.
 static bool port_on_gm(const ptp_port_t *p, uint64_t gm, uint32_t now) {
-  return gm != 0 && (p->clock_id == gm || port_gm(p, now) == gm);
+  return gm != 0 && port_gm(p, now) == gm;
 }
 
 static bool peer_allowed(uint32_t ip) {
@@ -1067,20 +1076,37 @@ static int port_rank(const ptp_port_t *p, uint64_t gm, uint32_t now) {
 static void select_port(ptp_actions_t *act) {
   const uint32_t now = now_ms();
   uint64_t gm = ptp.expected_clock_id;
-  if (gm != 0 && ptp.gm_id == gm) {
-    // The anchor's GM is a preference, not a pin.  Once the clock has been
-    // on it and no live port carries it any more -- a HomePod or Apple TV
-    // took over as GM mid-session -- follow BMCA the way Apple's kernel
-    // does.  The audio side sees the timeline change through
-    // ptp_clock_network_to_local() and carries its anchor across, instead of
-    // the clock freewheeling on a GM that is gone until the lock times out.
-    bool gm_live = false;
-    for (int i = 0; i < PTP_MAX_PORTS && !gm_live; i++) {
-      gm_live = port_live(&ptp.ports[i], now) &&
-                port_on_gm(&ptp.ports[i], gm, now);
+  if (gm != 0 && ptp.expected_released) {
+    gm = 0;
+  } else if (gm != 0 && ptp.gm_id == gm) {
+    // The anchor's GM is a preference, not a pin, as in Apple's kernel, which
+    // always follows BMCA; the audio side sees the timeline change through
+    // ptp_clock_network_to_local() and carries its anchor across.  Leave it
+    //  - at once when the GM itself announces another GM (a HomePod or Apple
+    //    TV took over mid-session), or
+    //  - when no live port has carried it for an Announce receipt timeout,
+    //    so a few seconds of missing SYNCs do not flip the timeline.
+    bool carried = false, abdicated = false;
+    for (int i = 0; i < PTP_MAX_PORTS; i++) {
+      const ptp_port_t *p = &ptp.ports[i];
+      if (!port_live(p, now)) {
+        continue;
+      }
+      if (port_on_gm(p, gm, now)) {
+        carried = true;
+        // Time the silence from the GM's last SYNC, like Apple's Announce
+        // receipt timeout, not from when its port stopped counting as live.
+        if ((int32_t)(p->last_sync_ms - ptp.expected_gm_seen_ms) > 0) {
+          ptp.expected_gm_seen_ms = p->last_sync_ms;
+        }
+      } else if (p->clock_id == gm) {
+        abdicated = true;
+      }
     }
-    if (!gm_live) {
+    if (!carried && (abdicated ||
+               now - ptp.expected_gm_seen_ms >= PTP_ANNOUNCE_TIMEOUT_MS)) {
       gm = 0;
+      ptp.expected_released = true;
     }
   }
   if (gm == 0) {
@@ -2306,6 +2332,8 @@ void ptp_clock_set_master_clock_id(uint64_t clock_id) {
   const bool keep = clock_id != 0 && ptp.gm_id == clock_id &&
                     (samples_current() || !ptp.locked);
   ptp.expected_clock_id = clock_id;
+  ptp.expected_gm_seen_ms = now_ms();
+  ptp.expected_released = false;
   if (!keep) {
     // The model may describe another timeline.
     reset_timeline();

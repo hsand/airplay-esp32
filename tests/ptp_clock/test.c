@@ -735,6 +735,80 @@ static void test_bmca_and_gm_change(void) {
   CHECK(ptp.rejected_master_count > 0, "B's SYNCs not counted as rejected");
 }
 
+/* The anchor names A, then A hands GM over to B mid-session: A keeps sending
+ * SYNCs, now as a boundary clock, but its Announce names B.  The clock must
+ * follow at once (as Apple's kernel does through BMCA) and report the new
+ * timeline, rather than keep measuring through A's port under A's id. */
+static void test_anchor_gm_handover(void) {
+  printf("anchor GM hands over\n");
+  reset();
+  master_t a = master_a(), b = master_b();
+  ptp_clock_set_master_clock_id(MASTER_A);
+  send_announce(&a, MASTER_A, 248, 0);
+  send_announce(&b, MASTER_B, 248, 0);
+  for (int i = 0; i < 24; i++) {
+    exchange(&a, 1, 1);
+    exchange(&b, 1, 1);
+  }
+  CHECK(ptp_clock_get_grandmaster_id() == MASTER_A && ptp_clock_is_locked(),
+        "not locked on the anchor's GM before the handover");
+  /* A now relays B's time and says so. */
+  master_t a_relay = b;
+  a_relay.clock = MASTER_A;
+  a_relay.ip = IP_A;
+  a_relay.seq = a.seq;
+  send_announce(&a_relay, MASTER_B, 248, 1);
+  send_announce(&b, MASTER_B, 16, 0);
+  for (int i = 0; i < 40; i++) {
+    exchange(&a_relay, 1, 1);
+    exchange(&b, 1, 1);
+    if (i % 4 == 3) { /* Announces at 1 Hz, as real masters send them */
+      send_announce(&a_relay, MASTER_B, 248, 1);
+      send_announce(&b, MASTER_B, 16, 0);
+    }
+  }
+  CHECK(ptp_clock_get_grandmaster_id() == MASTER_B,
+        "still on %016llx after A announced B as GM",
+        (unsigned long long)ptp_clock_get_grandmaster_id());
+  CHECK(ptp_clock_is_locked() && llabs(error_ms(&b)) <= 1,
+        "not locked on B's timeline after the handover (%lld ms)",
+        (long long)error_ms(&b));
+}
+
+/* The anchor's GM merely goes quiet while another master keeps sending: hold
+ * it (freewheel) for the Announce receipt timeout, then follow BMCA. */
+static void test_anchor_gm_silence(void) {
+  printf("anchor GM goes quiet\n");
+  reset();
+  master_t a = master_a(), b = master_b();
+  ptp_clock_set_master_clock_id(MASTER_A);
+  send_announce(&a, MASTER_A, 248, 0);
+  send_announce(&b, MASTER_B, 248, 0);
+  for (int i = 0; i < 24; i++) {
+    exchange(&a, 1, 1);
+    exchange(&b, 1, 1);
+  }
+  CHECK(ptp_clock_get_grandmaster_id() == MASTER_A, "not on A to begin with");
+  /* About 6 s of B only: past A's 3 s port timeout, inside the 10 s Announce
+   * timeout. */
+  for (int i = 0; i < 48; i++) {
+    exchange(&b, 1, 1);
+    if (i % 8 == 0) {
+      send_announce(&b, MASTER_B, 248, 0);
+    }
+  }
+  CHECK(ptp_clock_get_grandmaster_id() == MASTER_A,
+        "left the anchor's GM after only a few seconds of silence");
+  for (int i = 0; i < 48; i++) {
+    exchange(&b, 1, 1);
+    if (i % 8 == 0) {
+      send_announce(&b, MASTER_B, 248, 0);
+    }
+  }
+  CHECK(ptp_clock_get_grandmaster_id() == MASTER_B,
+        "never followed BMCA after the anchor's GM went quiet for >10 s");
+}
+
 /* The GM's own port is preferred; a boundary port relaying it is the
  * fallback when the direct one goes quiet, without a reset of the
  * timeline. */
@@ -993,6 +1067,10 @@ static void test_concurrent_packets_and_sessions(void) {
     (void)ptp_clock_local_to_network(now_ns(), &net, &gm);
     (void)ptp_clock_network_to_local(net, gm, &local);
     portENTER_CRITICAL(&ptp_state_mux);
+    /* Mock time is fixed here, so the anchor's GM can only be left when
+     * that GM itself announces another one -- which this worker never
+     * does.  (Leaving it on a handover or after 10 s of silence is covered
+     * by the anchor GM tests.) */
     CHECK(ptp.expected_clock_id == 0 || ptp.gm_id == 0 ||
               ptp.gm_id == ptp.expected_clock_id,
           "clock on a GM the anchor did not name");
@@ -1135,6 +1213,8 @@ int main(void) {
   test_passive_fallback();
   test_passive_step();
   test_bmca_and_gm_change();
+  test_anchor_gm_handover();
+  test_anchor_gm_silence();
   test_relayed_port();
   test_time_base_and_tlv();
   test_peers();
