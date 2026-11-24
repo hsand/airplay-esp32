@@ -20,7 +20,7 @@ such as a PCM5102A.
 Change them under **Board Configuration → Pin Configuration** in `menuconfig`.
 
 The build assumes a PCM5102A with its normal filter (FLT low) when it works out its
-[output latency](../features/output-latency.md). With another DAC, pick its preset, or
+output latency. With another DAC, pick its preset, or
 calibrate with the trim on the Configuration page.
 
 ## Building
@@ -50,4 +50,3 @@ Prebuilt stable and beta firmware are available from the
 
 - [Build environments](../reference/build-environments.md)
 - [Custom board configuration](custom.md)
-- [Output latency](../features/output-latency.md)

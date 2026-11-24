@@ -30,7 +30,7 @@ Read with H on the left pad of each bridge and L on the right:
 
 | Bridge | Pin | Position | Effect |
 | --- | --- | --- | --- |
-| H1L | FLT | L | Normal interpolation filter, 22 samples of [output latency](../features/output-latency.md) |
+| H1L | FLT | L | Normal interpolation filter, 22 samples of output latency |
 | H2L | DEMP | L | De-emphasis off |
 | H3L | XSMT | H | Never soft-muted: there is no mute line to drive |
 | H4L | FMT | L | I2S data format |

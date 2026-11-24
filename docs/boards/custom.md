@@ -59,11 +59,10 @@ pio run -e myboard -t uploadfs
   `esp32s3` for S3-based boards.
 - With a plain I2S DAC other than a PCM5102A, set its output delay preset
   (`CONFIG_DAC_PLAIN_DELAY_*`), or `CONFIG_DAC_PLAIN_DELAY_UNKNOWN=y` and calibrate with the
-  trim; see [Output latency](../features/output-latency.md). The `esp32s3` and `esp32c5`
+  trim on the Configuration page. The `esp32s3` and `esp32c5`
   bases assume a PCM5102A with its normal filter.
 
 ## Related
 
 - [Build environments](../reference/build-environments.md)
 - [Architecture](../reference/architecture.md)
-- [Output latency](../features/output-latency.md)

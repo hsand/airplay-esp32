@@ -81,8 +81,7 @@ menu "DAC Configuration"
             on time. A DAC driver that reports its own delay (PCM512x)
             overrides this. Every figure is the datasheet's; anything after
             the DAC (an amplifier with DSP, an AV receiver) is left to the
-            output latency trim in the web UI. See
-            docs/features/output-latency.md.
+            output latency trim in the web UI.
 
         config DAC_PLAIN_DELAY_PCM510X_NORMAL
             bool "TI PCM5100A/5101A/5102A, normal filter (FLT low): 22 samples"

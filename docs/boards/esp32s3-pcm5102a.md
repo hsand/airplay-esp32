@@ -26,7 +26,7 @@ Pins can be changed under **Board Configuration → Pin Configuration** in `menu
 
 The build assumes the PCM5102A's normal filter (FLT low, as in the
 [shopping-list photo](../getting-started/shopping-list.md#check-the-dac-board)) when it
-works out its [output latency](../features/output-latency.md). Strap FLT high, or use a
+works out its output latency. Strap FLT high, or use a
 different DAC, and change the preset to match.
 
 !!! warning "Bridge VIN/VOUT"

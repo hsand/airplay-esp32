@@ -147,5 +147,5 @@ enables one. Set `CONFIG_LED_RGB_GPIO` to 12 (ESP32) or 9 (S3) if yours has one.
 - [Bluetooth A2DP](../features/bluetooth.md)
 - [Ethernet (W5500)](../features/ethernet.md)
 - [Build environments](../reference/build-environments.md)
-- [Output latency](../features/output-latency.md) — the PCM5100A's FLT pin is tied low on
-  these boards, so the build compensates its normal filter
+- The PCM5100A's FLT pin is tied low on these boards, so the build compensates its normal
+  filter's output latency

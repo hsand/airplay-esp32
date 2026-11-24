@@ -142,5 +142,3 @@ a PCM5102A board with XSMT bridged high among them — and a hard cut to silence
 board's amplifier enable or mute line is only switched off 80 ms after the stop, once the
 fade has left the DMA queue, and is switched on again before the first sample of the next
 start.
-
-See also [Output latency](output-latency.md).
