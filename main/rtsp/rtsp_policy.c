@@ -181,13 +181,39 @@ size_t airplay_txt_raop(const airplay_txt_input_t *in, airplay_txt_item_t *out,
 // ============================================================================
 
 rtsp_preempt_t rtsp_preempt_decide(const rtsp_preempt_input_t *in) {
-  if (!in->has_owner || in->owner_is_self) {
+  if (in->self_closing) {
+    return RTSP_PREEMPT_CLOSING;
+  }
+  if (in->has_owner && in->owner_is_self) {
+    // A later SETUP on the session's own connection updates it; Apple reads
+    // the session kind only from the first.
+    return RTSP_PREEMPT_PROCEED;
+  }
+  if (in->remote_control_only) {
+    return RTSP_PREEMPT_REMOTE_ONLY;
+  }
+  if (!in->has_owner) {
     return RTSP_PREEMPT_PROCEED;
   }
   if (in->owner_closed || in->owner_ended || in->same_sender) {
     return RTSP_PREEMPT_TAKEOVER;
   }
   return in->deny_interruptions ? RTSP_PREEMPT_REFUSE : RTSP_PREEMPT_TAKEOVER;
+}
+
+int rtsp_preempt_status(rtsp_preempt_t decision) {
+  switch (decision) {
+  case RTSP_PREEMPT_PROCEED:
+  case RTSP_PREEMPT_TAKEOVER:
+    return 0;
+  case RTSP_PREEMPT_REFUSE:
+    return 453;
+  case RTSP_PREEMPT_CLOSING:
+    return 455;
+  case RTSP_PREEMPT_REMOTE_ONLY:
+    return 403;
+  }
+  return 500;
 }
 
 airplay_route_t airplay_remote_route(int protocol_version,

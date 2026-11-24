@@ -118,7 +118,7 @@ static bool read_reply(int client, uint8_t *buf, size_t size) {
     }
     const int status = atoi((const char *)buf + 9);
     if (status >= 200 && status < 300) {
-      ESP_LOGI(TAG, "Sender replied: %s", (const char *)buf);
+      ESP_LOGD(TAG, "Sender replied: %s", (const char *)buf);
     } else {
       ESP_LOGW(TAG, "Sender refused the command: %s", (const char *)buf);
     }

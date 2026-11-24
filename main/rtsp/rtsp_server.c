@@ -497,9 +497,10 @@ cleanup:
   if (slot_owns_session(slot)) {
     end_owned_session(slot, conn);
   } else if (slot->is_old) {
-    // Taken over: rtsp_server_claim_session() already stopped this
-    // session's audio and told the listeners, so nothing global is left to
-    // undo -- and touching it now would hit the new session.
+    // Taken over: rtsp_server_claim_session() on the new connection is
+    // waiting for this task to finish, and then stops this session's audio
+    // and tells the listeners.  Touching anything global here would hit the
+    // new session.
     ESP_LOGI(TAG, "Slot %d: session taken over by another sender", slot_idx);
   }
   // A connection that never owned the session (/info, pairing, a refused
@@ -549,12 +550,16 @@ static void signal_client_stop(client_slot_t *slot, bool taken_over) {
   }
 }
 
+// Wait for the task the slot has now to finish.  Compared by handle, so a new
+// connection that lands in the freed slot meanwhile is not waited for too.
 static bool wait_client_stopped(const client_slot_t *slot, int timeout_ms) {
-  for (int waited = 0; slot->task != NULL && waited < timeout_ms;
+  const TaskHandle_t task = slot->task;
+  for (int waited = 0;
+       task != NULL && slot->task == task && waited < timeout_ms;
        waited += 100) {
     vTaskDelay(pdMS_TO_TICKS(100));
   }
-  return slot->task == NULL;
+  return task == NULL || slot->task != task;
 }
 
 static int slot_of(const rtsp_conn_t *conn) {
@@ -566,7 +571,7 @@ static int slot_of(const rtsp_conn_t *conn) {
   return -1;
 }
 
-int rtsp_server_claim_session(rtsp_conn_t *conn) {
+int rtsp_server_claim_session(rtsp_conn_t *conn, bool remote_control_only) {
   if (!conn || !s_owner_lock) {
     return 500;
   }
@@ -575,6 +580,11 @@ int rtsp_server_claim_session(rtsp_conn_t *conn) {
   const int owner = s_owner;
   const bool has_owner = owner >= 0 && clients[owner].task != NULL;
   const rtsp_preempt_input_t in = {
+      // A connection being closed (taken over, or swept) may not claim the
+      // session back while it winds down.
+      .self_closing =
+          self < 0 || clients[self].should_stop || clients[self].is_old,
+      .remote_control_only = remote_control_only,
       .has_owner = has_owner,
       .owner_is_self = has_owner && owner == self,
       .owner_closed = has_owner && clients[owner].socket < 0,
@@ -585,12 +595,17 @@ int rtsp_server_claim_session(rtsp_conn_t *conn) {
       .deny_interruptions = settings_airplay_deny_interruptions(),
   };
   const rtsp_preempt_t decision = rtsp_preempt_decide(&in);
-  if (self < 0 || decision == RTSP_PREEMPT_REFUSE) {
+  const int status = rtsp_preempt_status(decision);
+  if (status != 0) {
     owner_unlock();
-    if (self >= 0) {
+    if (decision == RTSP_PREEMPT_REFUSE) {
       ESP_LOGW(TAG, "SETUP refused: the session may not be interrupted");
+    } else if (decision == RTSP_PREEMPT_REMOTE_ONLY) {
+      ESP_LOGW(TAG, "Remote-control-only SETUP refused: not supported");
+    } else {
+      ESP_LOGW(TAG, "SETUP on a connection being closed: %d", status);
     }
-    return 453;
+    return status;
   }
   if (decision == RTSP_PREEMPT_PROCEED) {
     if (!in.owner_is_self) {
@@ -604,9 +619,13 @@ int rtsp_server_claim_session(rtsp_conn_t *conn) {
     return 0;
   }
 
-  // Takeover: the last sender wins, as on Apple's receiver.  The old
-  // session's audio stops here, before this SETUP goes on to start the new
-  // one, so the old task's cleanup has nothing global left to do.
+  // Takeover: the last sender wins, as on Apple's receiver, which destroys
+  // the old connection before the new session is set up.  From here the old
+  // connection no longer owns the session, so any session method it still
+  // sends gets 455 and a SETUP gets 455 above.  But a request it had already
+  // begun may still be running on its task, so the old session's audio is
+  // stopped only once that task has finished: stopped any earlier, that
+  // request could start or re-anchor audio again behind this SETUP's back.
   client_slot_t *old = &clients[owner];
   rtsp_conn_t *old_conn = old->conn;
   const bool was_live = !in.owner_closed;
@@ -621,6 +640,23 @@ int rtsp_server_claim_session(rtsp_conn_t *conn) {
 
   ESP_LOGI(TAG, "*** Session taken over: slot %d replaces slot %d%s", self,
            owner, was_live ? "" : " (closed)");
+  // This task holds no lock while it waits, and the old task never waits on
+  // this one, so the wait cannot deadlock; at worst it times out.
+  if (!wait_client_stopped(old, RTSP_TAKEOVER_WAIT_MS)) {
+    ESP_LOGW(TAG, "Slot %d still finishing; carrying on", owner);
+  }
+
+  // A third sender may have taken the session from this connection while it
+  // waited.  It then does the cleanup below, after this task has finished.
+  owner_lock();
+  const bool still_owner =
+      s_owner == self && !clients[self].is_old && !clients[self].should_stop;
+  owner_unlock();
+  if (!still_owner) {
+    ESP_LOGW(TAG, "Slot %d lost the session while taking it over", self);
+    return 455;
+  }
+
   rtsp_metadata_reset();
   if (was_live) {
     audio_receiver_stop();
@@ -630,9 +666,6 @@ int rtsp_server_claim_session(rtsp_conn_t *conn) {
     dacp_clear_session();
     playback_events_emit(PLAYBACK_SOURCE_AIRPLAY, PLAYBACK_EVENT_DISCONNECTED,
                          NULL);
-  }
-  if (!wait_client_stopped(old, RTSP_TAKEOVER_WAIT_MS)) {
-    ESP_LOGW(TAG, "Slot %d still finishing; carrying on", owner);
   }
   return 0;
 }

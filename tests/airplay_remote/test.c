@@ -89,29 +89,46 @@ static void print_hex(const char *label, const uint8_t *p, size_t n) {
 // ---------------------------------------------------------------------------
 
 static void test_preemption(void) {
-  // Every combination of the five inputs against the rule written out.
+  // Every combination of the eight inputs against the rule written out.
   int cases = 0;
-  for (int bits = 0; bits < 64; bits++) {
+  for (int bits = 0; bits < 256; bits++) {
     const rtsp_preempt_input_t in = {
         .has_owner = bits & 1,
-        .owner_is_self = bits & 2,
+        .owner_is_self = (bits & 1) && (bits & 2),
         .owner_closed = bits & 4,
         .owner_ended = bits & 8,
         .same_sender = bits & 16,
         .deny_interruptions = bits & 32,
+        .self_closing = bits & 64,
+        .remote_control_only = bits & 128,
     };
     rtsp_preempt_t want;
-    if (!in.has_owner || in.owner_is_self) {
+    if (in.self_closing) {
+      want = RTSP_PREEMPT_CLOSING;
+    } else if (in.owner_is_self) {
+      want = RTSP_PREEMPT_PROCEED;
+    } else if (in.remote_control_only) {
+      want = RTSP_PREEMPT_REMOTE_ONLY;
+    } else if (!in.has_owner) {
       want = RTSP_PREEMPT_PROCEED;
     } else if (in.owner_closed || in.owner_ended || in.same_sender) {
       want = RTSP_PREEMPT_TAKEOVER;
     } else {
-      want = in.deny_interruptions ? RTSP_PREEMPT_REFUSE
-                                   : RTSP_PREEMPT_TAKEOVER;
+      want =
+          in.deny_interruptions ? RTSP_PREEMPT_REFUSE : RTSP_PREEMPT_TAKEOVER;
     }
-    CHECK(rtsp_preempt_decide(&in) == want, "preempt case 0x%02x", bits);
+    const rtsp_preempt_t got = rtsp_preempt_decide(&in);
+    CHECK(got == want, "preempt case 0x%02x", bits);
+    // Only a SETUP that goes ahead gets 0; anything else is answered.
+    const int status = rtsp_preempt_status(got);
+    CHECK((status == 0) ==
+              (got == RTSP_PREEMPT_PROCEED || got == RTSP_PREEMPT_TAKEOVER),
+          "status for case 0x%02x", bits);
     cases++;
   }
+  CHECK(rtsp_preempt_status(RTSP_PREEMPT_REFUSE) == 453, "453");
+  CHECK(rtsp_preempt_status(RTSP_PREEMPT_CLOSING) == 455, "455");
+  CHECK(rtsp_preempt_status(RTSP_PREEMPT_REMOTE_ONLY) == 403, "403");
   // The cases that matter, spelled out.
   const rtsp_preempt_input_t idle = {0};
   CHECK(rtsp_preempt_decide(&idle) == RTSP_PREEMPT_PROCEED, "idle");
@@ -125,6 +142,32 @@ static void test_preemption(void) {
       .has_owner = true, .same_sender = true, .deny_interruptions = true};
   CHECK(rtsp_preempt_decide(&reconnect) == RTSP_PREEMPT_TAKEOVER,
         "the same phone reconnecting");
+  // Denied interruptions protect a session, not only a playing one: the
+  // decision has no "playing" input, as Apple's has none.
+  const rtsp_preempt_input_t paused_owner = {.has_owner = true,
+                                             .deny_interruptions = true};
+  CHECK(rtsp_preempt_decide(&paused_owner) == RTSP_PREEMPT_REFUSE,
+        "a paused session is protected too");
+  // The old connection, its session taken over, may not claim it back -- not
+  // even as the same sender, which would otherwise always win.
+  const rtsp_preempt_input_t taken_over = {
+      .self_closing = true, .has_owner = true, .same_sender = true};
+  CHECK(rtsp_preempt_decide(&taken_over) == RTSP_PREEMPT_CLOSING,
+        "a taken-over connection gets 455");
+  // A remote-control-only SETUP neither takes over nor gets 453, and does
+  // not claim an idle speaker either.
+  const rtsp_preempt_input_t rc_busy = {.remote_control_only = true,
+                                        .has_owner = true};
+  const rtsp_preempt_input_t rc_denied = {.remote_control_only = true,
+                                          .has_owner = true,
+                                          .deny_interruptions = true};
+  const rtsp_preempt_input_t rc_idle = {.remote_control_only = true};
+  CHECK(rtsp_preempt_decide(&rc_busy) == RTSP_PREEMPT_REMOTE_ONLY,
+        "remote-control-only does not take over");
+  CHECK(rtsp_preempt_decide(&rc_denied) == RTSP_PREEMPT_REMOTE_ONLY,
+        "remote-control-only is not refused as audio");
+  CHECK(rtsp_preempt_decide(&rc_idle) == RTSP_PREEMPT_REMOTE_ONLY,
+        "remote-control-only does not claim an idle speaker");
   printf("preemption decision table: %d cases\n", cases);
 }
 
@@ -157,13 +200,13 @@ static void test_route(void) {
         "unreachable");
 
   const char *want_4cc[] = {"play", "paus", "plps", "stop", "nitm", "pitm"};
-  const char *want_dacp[] = {"play",     "pause",    "playpause",
-                             "stop",     "nextitem", "previtem"};
+  const char *want_dacp[] = {"play", "pause",    "playpause",
+                             "stop", "nextitem", "previtem"};
   for (int c = 0; c <= AIRPLAY_MR_PREVIOUS; c++) {
     CHECK(strcmp(airplay_mr_fourcc((airplay_mr_command_t)c), want_4cc[c]) == 0,
           "4cc %d", c);
-    CHECK(strcmp(airplay_mr_dacp_word((airplay_mr_command_t)c),
-                 want_dacp[c]) == 0,
+    CHECK(strcmp(airplay_mr_dacp_word((airplay_mr_command_t)c), want_dacp[c]) ==
+              0,
           "dacp %d", c);
   }
   CHECK(airplay_mr_pauses_locally(AIRPLAY_MR_PAUSE) &&
@@ -310,9 +353,9 @@ static void test_progress(void) {
   const uint32_t current = start + 44100U * 61U; // wrapped
   const uint32_t end = start + 44100U * 200U;    // wrapped
   CHECK(current < start && end < start, "the test wraps");
-  CHECK(airplay_progress_seconds(start, current, end, 44100, &elapsed,
-                                 &duration),
-        "ok");
+  CHECK(
+      airplay_progress_seconds(start, current, end, 44100, &elapsed, &duration),
+      "ok");
   CHECK(elapsed == 61 && duration == 200, "wrap: %u/%u", elapsed, duration);
   // The stream's rate, not 44100.
   CHECK(airplay_progress_seconds(1000, 1000 + 48000 * 30, 1000 + 48000 * 90,
@@ -328,8 +371,7 @@ static void test_progress(void) {
 
   // What is being played wins when it lies in the track...
   CHECK(airplay_progress_current(start, end, current, true,
-                                 start + 44100U * 58U) ==
-            start + 44100U * 58U,
+                                 start + 44100U * 58U) == start + 44100U * 58U,
         "rendered");
   // ...not when it does not, or is unknown.
   CHECK(airplay_progress_current(start, end, current, true, start - 10U) ==
@@ -430,8 +472,7 @@ static void test_dmap_and_merge(void) {
   n = dmap_track(buf, "Song", "Artist", 245000, -1);
   rtsp_metadata_dmap(buf, n);
   CHECK(last_meta.position_secs == 23 && last_meta.duration_secs == 240,
-        "counting on: %u/%u", last_meta.position_secs,
-        last_meta.duration_secs);
+        "counting on: %u/%u", last_meta.position_secs, last_meta.duration_secs);
 
   // Paused (caps 2): the position freezes.
   n = dmap_track(buf, "Song", "Artist", 245000, 2);

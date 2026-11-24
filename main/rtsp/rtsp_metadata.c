@@ -216,7 +216,7 @@ void rtsp_metadata_progress(const char *text, uint32_t sample_rate) {
   }
   s_progress_duration_secs = duration;
   set_position(elapsed);
-  ESP_LOGI(TAG,
+  ESP_LOGD(TAG,
            "Progress: %" PRIu32 ":%02" PRIu32 " / %" PRIu32 ":%02" PRIu32
            " (%lu/%lu/%lu%s)",
            elapsed / 60, elapsed % 60, duration / 60, duration % 60, start,

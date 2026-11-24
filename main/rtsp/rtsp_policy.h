@@ -95,32 +95,53 @@ size_t airplay_txt_raop(const airplay_txt_input_t *in, airplay_txt_item_t *out,
 
 /** What a session SETUP (AirPlay 1: ANNOUNCE) from a connection may do. */
 typedef enum {
-  RTSP_PREEMPT_PROCEED,  // No other session, or this connection owns it.
-  RTSP_PREEMPT_TAKEOVER, // Another connection's session ends; this one wins.
-  RTSP_PREEMPT_REFUSE,   // 453: the active session may not be interrupted.
+  RTSP_PREEMPT_PROCEED,     // No other session, or this connection owns it.
+  RTSP_PREEMPT_TAKEOVER,    // Another connection's session ends; this one wins.
+  RTSP_PREEMPT_REFUSE,      // 453: the active session may not be interrupted.
+  RTSP_PREEMPT_CLOSING,     // 455: this connection is being closed.
+  RTSP_PREEMPT_REMOTE_ONLY, // 403: a remote-control-only session, not served.
 } rtsp_preempt_t;
 
 typedef struct {
-  bool has_owner;     // Some connection holds the session.
-  bool owner_is_self; // ...and it is this one.
-  bool owner_closed;  // Its socket is already gone (AirPlay 1 grace period).
-  bool owner_ended;   // It sent a full TEARDOWN and has no session left.
-  bool same_sender;   // Same sender address: the sender reconnecting.
+  bool self_closing; // This connection was taken over or is being closed.
+  bool remote_control_only; // The SETUP has isRemoteControlOnly set.
+  bool has_owner;           // Some connection holds the session.
+  bool owner_is_self;       // ...and it is this one.
+  bool owner_closed; // Its socket is already gone (AirPlay 1 grace period).
+  bool owner_ended;  // It sent a full TEARDOWN and has no session left.
+  bool same_sender;  // Same sender address: the sender reconnecting.
   bool deny_interruptions; // The "don't interrupt" setting.
 } rtsp_preempt_input_t;
 
 /**
- * Apple's hijack rule: the last sender wins, unless interruptions are denied,
- * in which case anyone else is refused with 453.  Only a session SETUP gets
- * here; /info, pairing and OPTIONS on another connection never touch the
- * session.  A connection that has torn its session down holds nothing worth
- * protecting.  Two departures from Apple: a session whose connection has
- * already closed is always taken over, and the same sender may always take its
- * own
- * session back (a phone reconnecting after a Wi-Fi drop would otherwise be
- * locked out by its own dead connection until keepalive noticed).
+ * Apple's hijack rule: the last sender wins, unless interruptions are denied
+ * (Apple's DenyInterruptions), in which case anyone else is refused with 453
+ * for as long as a session exists -- paused as well as playing, since Apple
+ * asks only whether the session slot is taken, not what it is doing.  Only a
+ * session SETUP gets here; /info, pairing and OPTIONS on another connection
+ * never touch the session.  A connection that has torn its session down holds
+ * nothing worth protecting.
+ *
+ * A remote-control-only SETUP never takes over and is never refused for the
+ * audio session's sake: Apple skips the hijack check for it and gives it a
+ * session of its own beside the media one.  This receiver has no
+ * remote-control channel to give it, so it is answered 403, the status
+ * Apple's receiver gives a session kind it does not serve, and the audio
+ * session is left alone.
+ *
+ * A connection that is being closed (its session already taken over) gets
+ * 455, as its other session methods do: it must not claim the session back
+ * while it winds down.
+ *
+ * Two departures from Apple: a session whose connection has already closed is
+ * always taken over, and the same sender may always take its own session back
+ * (a phone reconnecting after a Wi-Fi drop would otherwise be locked out by
+ * its own dead connection until keepalive noticed).
  */
 rtsp_preempt_t rtsp_preempt_decide(const rtsp_preempt_input_t *in);
+
+/** The RTSP status for a decision: 0 when the SETUP goes ahead. */
+int rtsp_preempt_status(rtsp_preempt_t decision);
 
 /** How a remote command reaches the sender. */
 typedef enum {

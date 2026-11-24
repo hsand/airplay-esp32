@@ -232,9 +232,10 @@ int rtsp_session_idle_limit_s(const rtsp_conn_t *conn) {
 void rtsp_set_keepalive(int socket, int idle_s) {
   int on = 1;
   int idle = idle_s;
-  // [I] The spec gives the idle time and the probe count; the interval
-  // between probes is taken as the idle time too, so a dead peer is noticed
-  // within about the session idle timeout.
+  // Apple's receiver sets the idle time (a fifth of the session timeout) and
+  // five probes.  Its interval between probes is not known; the idle time is
+  // used for it too, so a dead peer is noticed within about the session idle
+  // timeout.
   int interval = idle_s;
   int probes = RTSP_KEEPALIVE_PROBES;
   if (setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on)) != 0 ||
@@ -433,8 +434,12 @@ static bool conn_verified(const rtsp_conn_t *conn) {
 // Apple's verified-pairing gate ("Unverified RTSP request denied"), applied
 // where it can matter here: an AirPlay 2 SETUP, RECORD or SET_PARAMETER from a
 // connection that has not completed pairing.  AirPlay 1 (RSA, or none) never
-// pairs and is not gated, and neither is a transient pairing, which is
-// verified at pair-setup M4.
+// pairs and is not gated, even after a failed pairing attempt on the same
+// connection, and neither is a transient pairing, which is verified at
+// pair-setup M4.  protocol_version becomes 2 only when pairing succeeds, so
+// it is the SETUP's binary plist that marks an unpaired AirPlay 2 request; a
+// connection that never paired cannot SETUP an AirPlay 2 session, so its
+// RECORD or SET_PARAMETER gets 455 (no session) instead.
 static bool refuse_unverified(const rtsp_conn_t *conn,
                               const rtsp_request_t *req) {
   const bool setup = strcasecmp(req->method, "SETUP") == 0;
@@ -923,7 +928,7 @@ static void handle_command(int socket, rtsp_conn_t *conn,
     // Types Apple's receiver handles and this one accepts without acting on:
     // bit 50 (MediaRemote now-playing) is not advertised, and the volume and
     // fade ones are left to the sender's SET_PARAMETER volume.
-    ESP_LOGI(TAG, "/command %s (accepted, not used)", type);
+    ESP_LOGD(TAG, "/command %s (accepted, not used)", type);
   } else {
     ESP_LOGW(TAG, "/command %s not supported: 400", type);
     rtsp_send_response(socket, conn, 400, "Bad Request", req->cseq, NULL, NULL,
@@ -940,13 +945,16 @@ static void handle_post(int socket, rtsp_conn_t *conn,
   size_t body_len = req->body_len;
 
   if (strstr(req->path, "/pair-setup") || strstr(req->path, "/pair-verify")) {
-    conn->protocol_version = 2;
+    // The connection counts as AirPlay 2 only once pairing has succeeded
+    // (below).  A sender whose pairing fails may fall back to AirPlay 1 (RSA
+    // or no encryption) on the same connection, which is never gated.
+    //
     // The pairing type the sender asks for.  Absent means legacy pairing.
     const char *hkp = parse_raw_header(raw, raw_len, "X-Apple-HKP:");
     // NOLINTNEXTLINE(bugprone-unchecked-string-to-number-conversion)
     const int hkp_value = hkp ? atoi(hkp) : -1;
     if (hkp_value != conn->hkp) {
-      ESP_LOGI(TAG, "%s: X-Apple-HKP %s", req->path, hkp ? hkp : "absent");
+      ESP_LOGD(TAG, "%s: X-Apple-HKP %s", req->path, hkp ? hkp : "absent");
     }
     conn->hkp = hkp_value;
     if (!conn->hap_session) {
@@ -962,6 +970,10 @@ static void handle_post(int socket, rtsp_conn_t *conn,
       handle_pair_setup(socket, conn, req);
     } else {
       handle_pair_verify(socket, conn, req);
+    }
+    // Transient pair-setup M4, or pair-verify M4 (TLV8 or raw).
+    if (conn_verified(conn)) {
+      conn->protocol_version = 2;
     }
 
   } else if (strstr(req->path, "/fp-setup")) {
@@ -1182,16 +1194,21 @@ static void parse_sdp(rtsp_conn_t *conn, const char *sdp, size_t len) {
   }
 }
 
-// Take the session for this connection, or answer 453 as Apple does when the
-// active one may not be interrupted.  False when the request was answered.
+// Take the session for this connection, or answer as Apple does: 453 when the
+// active one may not be interrupted (see rtsp_server_claim_session() for the
+// others).  False when the request was answered.
 static bool claim_session_or_refuse(int socket, rtsp_conn_t *conn,
-                                    const rtsp_request_t *req) {
-  const int status = rtsp_server_claim_session(conn);
+                                    const rtsp_request_t *req,
+                                    bool remote_control_only) {
+  const int status = rtsp_server_claim_session(conn, remote_control_only);
   if (status == 0) {
     return true;
   }
-  rtsp_send_response(socket, conn, status, "Not Enough Bandwidth", req->cseq,
-                     NULL, NULL, 0);
+  const char *reason = status == 453   ? "Not Enough Bandwidth"
+                       : status == 455 ? "Method Not Valid in This State"
+                       : status == 403 ? "Forbidden"
+                                       : "Internal Error";
+  rtsp_send_response(socket, conn, status, reason, req->cseq, NULL, NULL, 0);
   return false;
 }
 
@@ -1203,7 +1220,7 @@ static void handle_announce(int socket, rtsp_conn_t *conn,
 
   // AirPlay 1's session starts here: a second sender's ANNOUNCE is what takes
   // the speaker over, as an AirPlay 2 session SETUP does.
-  if (!claim_session_or_refuse(socket, conn, req)) {
+  if (!claim_session_or_refuse(socket, conn, req, false)) {
     return;
   }
 
@@ -1280,8 +1297,8 @@ static void session_setup_timing(rtsp_conn_t *conn, const uint8_t *body,
   ptp_clock_set_peers(peers, count);
 }
 
-// One stream dict's keys on one line, for the hardware test: what senders put
-// in a buffered SETUP (latencyMin? audioLatencyMs?) is still an open question.
+// One stream dict's keys on one line, at debug level: which latency keys a
+// sender puts in a stream SETUP (latencyMin, audioLatencyMs) varies.
 static void log_stream_keys(const bplist_kv_info_t *kv, size_t count,
                             int64_t stream_type) {
   char line[512];
@@ -1297,7 +1314,7 @@ static void log_stream_keys(const bplist_kv_info_t *kv, size_t count,
                                (unsigned)kv[k].value_len);
     }
   }
-  ESP_LOGI(TAG, "%s", line);
+  ESP_LOGD(TAG, "%s", line);
 }
 
 // The sender's latency for a stream, in samples: audioLatencyMs when present
@@ -1339,14 +1356,22 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   const uint8_t *body = req->body;
   size_t body_len = req->body_len;
 
-  // Preemption happens here and nowhere else: another connection's /info,
-  // OPTIONS or pairing never touches a playing session (rtsp_server.c).
-  if (!claim_session_or_refuse(socket, conn, req)) {
-    return;
-  }
-
   bool is_bplist =
       strstr(req->content_type, "application/x-apple-binary-plist") != NULL;
+
+  // A remote-control-only session SETUP is not an audio session: it neither
+  // takes the speaker over nor is refused for its sake.
+  int64_t remote_control_only = 0;
+  if (is_bplist && body) {
+    (void)bplist_find_int(body, body_len, "isRemoteControlOnly",
+                          &remote_control_only);
+  }
+
+  // Preemption happens here and nowhere else: another connection's /info,
+  // OPTIONS or pairing never touches a playing session (rtsp_server.c).
+  if (!claim_session_or_refuse(socket, conn, req, remote_control_only != 0)) {
+    return;
+  }
 
   // Check for streams array
   bool request_has_streams = false;
@@ -1828,8 +1853,8 @@ static void handle_record(int socket, rtsp_conn_t *conn,
   // does, by scheduling every block that much early.  An Apple TV's buffered
   // session (the hose) answers 0; only realtime sessions report a figure,
   // and it leaves the I/O buffer out: the device latency past the DMA ring.
-  // [I] Whether senders act on it is not known; the tvOS sender has no code
-  // that reads it.  AirPlay 1 keeps the 0 it has always reported: nothing
+  // Whether senders act on it is not known; Apple's sender has no code that
+  // reads it.  AirPlay 1 keeps the 0 it has always reported: nothing
   // says how a RAOP sender would read it.
   char headers[128];
   const int sample_rate = conn->sample_rate > 0 ? conn->sample_rate : 44100;

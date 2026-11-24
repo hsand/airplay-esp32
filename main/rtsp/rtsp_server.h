@@ -54,12 +54,16 @@ void rtsp_server_request_resume(void);
 /**
  * A connection asks for the AirPlay session (AirPlay 2 SETUP, AirPlay 1
  * ANNOUNCE or SETUP).  Called on that connection's task.  If another
- * connection holds the session it is taken over -- its audio stopped and its
- * connection closed -- unless interruptions are denied (see
- * rtsp_preempt_decide()).
- * @return 0 when this connection now owns the session, 453 when refused
+ * connection holds the session it is taken over -- its connection closed, and
+ * once its task has finished, its audio stopped -- unless interruptions are
+ * denied (see rtsp_preempt_decide()).  A takeover blocks the caller until the
+ * old connection's task has finished, for at most a few seconds.
+ * @param remote_control_only the SETUP has isRemoteControlOnly set
+ * @return 0 when this connection now owns the session, else the RTSP status
+ *         to answer with: 453 refused, 455 this connection is being closed,
+ *         403 remote-control-only
  */
-int rtsp_server_claim_session(struct rtsp_conn *conn);
+int rtsp_server_claim_session(struct rtsp_conn *conn, bool remote_control_only);
 
 /** What the remote-control path needs to know about the session. */
 typedef struct {
