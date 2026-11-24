@@ -571,8 +571,8 @@ static void start_fade_arm(audio_scheduler_t *scheduler, uint32_t sample_rate) {
 
 /* The start's fade-in over a block whose first `muted` frames the first
  * audible sample silenced.  Apple ramps from the anchor's media time, so a
- * first audible sample more than 30 ms past the anchor starts hard there
- * [I]; ramping from the first audible frame instead fades every start. */
+ * first audible sample more than 30 ms past the anchor starts hard there;
+ * ramping from the first audible frame instead fades every start. */
 static void start_fade_apply(audio_scheduler_t *scheduler, int16_t *out,
                              size_t samples, uint8_t channels, size_t muted) {
   if (scheduler->start_fade_len == 0U || scheduler->fas_valid ||

@@ -252,9 +252,9 @@ static double network_of_true(double true_ns, bool second_gm) {
 }
 
 #ifndef BASELINE
-/* The PTP contract, as WP1 provides it: offset and rate tracked (the rate
- * exactly, here), tagged with the grandmaster.  After a grandmaster change it
- * is unlocked for gm_relock_s, then follows the new one. */
+/* The PTP contract, as ptp_clock.c provides it: offset and rate tracked (the
+ * rate exactly, here), tagged with the grandmaster.  After a grandmaster change
+ * it is unlocked for gm_relock_s, then follows the new one. */
 static bool contract_state(double true_ns, uint64_t *gm, bool *second) {
   if (!gm_changed(true_ns)) {
     *gm = GM1;

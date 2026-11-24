@@ -25,7 +25,7 @@ static const char *TAG = "audio_v2";
  * current timeline has it is the same timeline restated, and is left alone.
  * Senders re-anchor with values computed from their own clock reading, so
  * the restatement is never bit-exact; a millisecond covers that and is still
- * far below anything audible as a sync error.  [I] Apple's hose ignores a
+ * far below anything audible as a sync error.  Apple's receiver ignores a
  * rate-1 re-anchor while running outright; this only does so when it is
  * consistent, and otherwise moves playout onto the new timeline. */
 #define ANCHOR_CONSISTENT_US 1000
@@ -372,9 +372,9 @@ audio_engine_v2_set_rate_anchor(audio_engine_v2_t *engine,
     /* The first audible sample gates a start.  Under a stream that is already
      * playing, the move onto the new timeline is the reset step; muting up
      * to a first audible sample that lies ahead of the cursor as well would
-     * cut a hole into audio that is meant to carry on.  [I] Apple's legacy
-     * path would gate there too; its default hose path only trims the one
-     * buffer still to be enqueued that holds it. */
+     * cut a hole into audio that is meant to carry on.  Apple's receiver
+     * gates there too on its older output path; its default path only trims
+     * the one buffer still to be enqueued that holds it. */
     audio_scheduler_set_first_audible(scheduler, anchor->fas_valid && !playing,
                                       anchor->fas_rtp);
     if (scheduler->state == AUDIO_SCHED_WAIT_ANCHOR) {
