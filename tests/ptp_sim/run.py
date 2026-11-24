@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Simulate the v0.3.0 PTP clock and the current one on the same seeded
-networks and print an old-vs-new table.
+networks, print an old-vs-new table, and fail if the current clock does
+worse than the limits below.
 
 Requires Python 3 and a C compiler; no ESP-IDF installation or hardware.
 Run from any directory with: python3 tests/ptp_sim/run.py [--seeds N]
@@ -11,6 +12,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
@@ -42,6 +44,35 @@ SCENARIOS = [
     ("storm", "25 s storm: 20-60 ms delays, Delay_Resps lost/late"),
     ("answers-stop", "answers stop at 200 s, GM steps +50 ms at 300 s"),
 ]
+
+# Limits for this tree's clock ("new"), per scenario: |mean| error, worst
+# seed's p95 |error| and peak |error| (all us), and the worst seed's
+# recovery (s) where the scenario has an event.  Every scenario must also
+# lock within LOCK_S and stay locked through the steady state.  The limits
+# sit 30-50 % above the worst of 10 seeds, so a real regression fails and
+# a different seed count does not.
+LIMITS = {
+    "clean": (100, 150, 250, None),
+    "wifi": (300, 500, 700, None),
+    "wifi-fast50": (300, 500, 700, None),
+    "wifi-slow50": (300, 500, 700, None),
+    "wifi-nohook": (700, 900, 1100, None),
+    "wifi-no8021as": (300, 500, 700, None),
+    "clean-passive": (500, 600, 650, None),
+    "clean-passive-fast50": (500, 600, 650, None),
+    "clean-passive-slow50": (500, 600, 650, None),
+    "wifi-passive": (800, 1000, 1400, None),
+    "wifi-passive-fast50": (800, 1000, 1400, None),
+    "sleep": (300, 500, 700, 8),
+    "sleep-passive": (800, 1000, 1300, 5),
+    "gm-change": (300, 500, 700, 3),
+    "relay": (300, 500, 700, 2),
+    "multi": (300, 500, 700, None),
+    "storm": (300, 500, 1200, None),
+    "answers-stop": (300, 500, 800, 8),
+}
+LOCK_S = 3.0
+UNLOCKED_PCT = 0.5
 
 KEYS = ["mean_us", "p95_us", "p2p_us", "peak_us", "unlocked_pct", "lock_s",
         "settle_s", "recovery_s"]
@@ -85,6 +116,34 @@ def agg(rows, key):
     if key == "unlocked_pct":
         return "%.1f" % max(vals)
     return "%+.0f" % (sum(vals) / len(vals))
+
+
+def check(name, rows):
+    """Problems with this tree's clock in one scenario, as strings."""
+    mean_lim, p95_lim, peak_lim, rec_lim = LIMITS[name]
+    out = []
+    mean = sum(r["mean_us"] for r in rows) / len(rows)
+    if abs(mean) > mean_lim:
+        out.append("mean %+.0f us, limit +-%d" % (mean, mean_lim))
+    for key, lim in (("p95_us", p95_lim), ("peak_us", peak_lim)):
+        worst = max(r[key] for r in rows)
+        if worst < 0 or worst > lim:
+            out.append("%s %.0f, limit %d" % (key, worst, lim))
+    unlocked = max(r["unlocked_pct"] for r in rows)
+    if unlocked > UNLOCKED_PCT:
+        out.append("unlocked %.1f %% of the steady state" % unlocked)
+    lock = [r["lock_s"] for r in rows]
+    if min(lock) < 0:
+        out.append("never locked")
+    elif max(lock) > LOCK_S:
+        out.append("locked after %.1f s, limit %.0f" % (max(lock), LOCK_S))
+    if rec_lim is not None:
+        rec = [r["recovery_s"] for r in rows]
+        if min(rec) < 0 or max(rec) > rec_lim:
+            out.append("recovery %s, limit %d s" %
+                       ("never" if min(rec) < 0 else "%.1f s" % max(rec),
+                        rec_lim))
+    return out
 
 
 def main():
@@ -148,6 +207,18 @@ def main():
     print()
     for name, desc in scen:
         print("  %-20s %s" % (name, desc))
+
+    failed = []
+    for name, _ in scen:
+        failed += ["%s: %s" % (name, p) for p in
+                   check(name, results[(name, "new")])]
+    print()
+    if failed:
+        print("FAIL (this tree's clock):")
+        for f in failed:
+            print("  " + f)
+        sys.exit(1)
+    print("all scenarios within limits")
 
 
 if __name__ == "__main__":
