@@ -68,6 +68,33 @@ struct rtsp_conn {
   bool timing_ptp;
   // The buffered stream SETUP's keys have been logged for this session.
   bool stream_keys_logged;
+
+  // This connection holds the AirPlay session (rtsp_server_claim_session());
+  // only it may start, pause or flush audio.  Other connections may still
+  // ask for /info and pair, as on Apple's receiver.
+  bool owns_session;
+  // ...and has since ended it with a full TEARDOWN: another sender's SETUP
+  // takes over even when interruptions are denied.
+  bool session_ended;
+
+  // The sender's sourceVersion from its session SETUP, as an integer
+  // (airplay_source_version_parse()); 0 when it did not say.
+  uint32_t sender_srcvers;
+
+  // X-Apple-HKP from the last pairing request: the pairing type the sender
+  // asked for (4 transient, 0/1 PIN, 3 system...), or -1 when absent.
+  int hkp;
+
+  // /command setSenderDisplayLatencyMs.  Apple subtracts it from its
+  // platform latency only for a home-theater session, which this receiver
+  // never is, so it is kept and logged but changes nothing.
+  bool has_sender_display_latency;
+  uint32_t sender_display_latency_ms;
+
+  // /command mute: the output is at -144 dB and sender_unmuted_db is the level
+  // unmute restores (a SET_PARAMETER volume while muted moves only that).
+  bool sender_muted;
+  float sender_unmuted_db;
 };
 
 /**

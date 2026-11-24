@@ -11,6 +11,7 @@
 #include "hap.h"
 #include "mdns_airplay.h"
 #include "rtsp_handlers.h"
+#include "rtsp_policy.h"
 #include "rtsp_server.h"
 #include "wifi.h"
 #include "settings.h"
@@ -21,31 +22,28 @@ static const char *TAG = "mdns_airplay";
 // MDNS_NAME_MAX_LEN, which is never smaller than this.
 #define MDNS_HOSTNAME_MAX_LEN 63
 
-// Feature flags are defined in rtsp_handlers.h (shared with /info handler)
+// Feature flags, the model and the AirPlay 2 TXT records come from
+// rtsp_policy.c (shared with /info and checked by tests/airplay_remote).
 
-// Only ever emitted on the AirPlay 2 records; the classic _raop._tcp TXT has
-// no vv field and _airplay._tcp is not registered at all in v1 mode.
-#define AIRPLAY_PROTOCOL_VERSION "2"
-#define AIRPLAY_SOURCE_VERSION   "377.40.00"
-
-// Flags: 0x4 = audio receiver
 #define AIRPLAY_FLAGS "0x4"
 
-// Metadata types advertised in the "md" txt record:
-//   0 = text (track title/artist/album), 1 = artwork (cover art images),
-//   2 = progress.
-// When artwork is disabled, drop "1" so senders do not transmit cover art
-// (which can stall the audio pipeline and cause drop-outs on realtime
-// streams) while still sending text and progress metadata.
 #ifdef CONFIG_ENABLE_AIRPLAY_ARTWORK
-#define AIRPLAY_METADATA_TYPES "0,1,2"
+#define AIRPLAY_ARTWORK true
 #else
-#define AIRPLAY_METADATA_TYPES "0,2"
+#define AIRPLAY_ARTWORK false
 #endif
 
-// Model identifier - AudioAccessory for speaker appearance
-// AppleTV3,2 = Apple TV, AudioAccessory5,1 = HomePod mini (speaker)
-#define AIRPLAY_MODEL "AudioAccessory5,1"
+// The most TXT items either AirPlay 2 record has.
+#define AIRPLAY_TXT_MAX 16
+
+static size_t to_mdns_txt(const airplay_txt_item_t *in, size_t count,
+                          mdns_txt_item_t *out) {
+  for (size_t i = 0; i < count; i++) {
+    out[i].key = in[i].key;
+    out[i].value = in[i].value;
+  }
+  return count;
+}
 
 // In classic mode the device must not look like an AirPlay 2 speaker at all:
 // AirPort4,107 is the first-generation AirPort Express and 105.1 is the source
@@ -78,7 +76,7 @@ void mdns_airplay_init(void) {
     snprintf(pk_str + (size_t)i * 2, 3, "%02x", pk[i]);
   }
 
-  // Format features as "hi,lo" hex string
+  // Format features as "lo,hi" hex string
   uint64_t features = airplay_features();
   snprintf(features_str, sizeof(features_str), "0x%X,0x%X",
            (unsigned)(features & 0xFFFFFFFF), (unsigned)(features >> 32));
@@ -105,32 +103,34 @@ void mdns_airplay_init(void) {
 
   const bool airplay_v1 = settings_airplay_v1();
 
-  if (!airplay_v1) {
-    // ========================================
-    // _airplay._tcp service
-    // Only registered for AirPlay 2 mode
-    // ========================================
-    mdns_txt_item_t airplay_txt[] = {
-        {"deviceid", device_id},
-        {"features", features_str},
-        {"flags", AIRPLAY_FLAGS},
-        {"model", AIRPLAY_MODEL},
-        {"pk", pk_str},
-        {"pi", "00000000-0000-0000-0000-000000000000"}, // Pairing identity UUID
-        {"srcvers", AIRPLAY_SOURCE_VERSION},
-        {"vv", AIRPLAY_PROTOCOL_VERSION},
-        {"acl", "0"},
-    };
+  char pi[37];
+  airplay_get_pairing_identity(pi);
+  const airplay_txt_input_t txt_in = {
+      .device_id = device_id,
+      .features = features_str,
+      .model = airplay_model(),
+      .pk_hex = pk_str,
+      .pi = pi,
+      .metadata_types = airplay_metadata_types(AIRPLAY_ARTWORK),
+  };
+  // Static: this runs on the main task, whose stack is small; mdns copies
+  // the items.
+  static airplay_txt_item_t items[AIRPLAY_TXT_MAX];
+  static mdns_txt_item_t txt[AIRPLAY_TXT_MAX];
 
-    esp_err_t err = mdns_service_add(
-        device_name, "_airplay", "_tcp", airplay_rtsp_port(), airplay_txt,
-        sizeof(airplay_txt) / sizeof(airplay_txt[0]));
+  if (!airplay_v1) {
+    // _airplay._tcp, only in AirPlay 2 mode.
+    const size_t n = to_mdns_txt(
+        items, airplay_txt_airplay(&txt_in, items, AIRPLAY_TXT_MAX), txt);
+    esp_err_t err = mdns_service_add(device_name, "_airplay", "_tcp",
+                                     airplay_rtsp_port(), txt, n);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Failed to add _airplay._tcp service: %s",
                esp_err_to_name(err));
     }
+    ESP_LOGI(TAG, "_airplay._tcp: model=%s pi=%s features=%s", txt_in.model, pi,
+             features_str);
   }
-
   // ========================================
   // _raop._tcp service
   // RAOP = Remote Audio Output Protocol
@@ -150,43 +150,27 @@ void mdns_airplay_init(void) {
         {"ek", "1"},    // Encryption key available
         {"et", "0,1"},  // Encryption types: none, RSA
         {"fv", esp_app_get_description()->version}, // Firmware version
-        {"md", AIRPLAY_METADATA_TYPES},             // Metadata types
-        {"pw", "false"},                            // No password required
-        {"sf", AIRPLAY_FLAGS},                      // Status flags
-        {"sr", "44100"},                            // Sample rate
-        {"ss", "16"},                               // Sample size (bits)
-        {"sv", "false"},                            // Server version (unused)
-        {"tp", "UDP"},                              // Transport protocol
-        {"vn", "65537"},                            // Version number
-        {"vs", AIRPLAY_V1_SOURCE_VERSION},          // Source version
-        {"txtvers", "1"},                           // TXT record version
+        {"md", airplay_metadata_types(AIRPLAY_ARTWORK)},
+        {"pw", "false"},                   // No password required
+        {"sf", AIRPLAY_FLAGS},             // Status flags
+        {"sr", "44100"},                   // Sample rate
+        {"ss", "16"},                      // Sample size (bits)
+        {"sv", "false"},                   // Server version (unused)
+        {"tp", "UDP"},                     // Transport protocol
+        {"vn", "65537"},                   // Version number
+        {"vs", AIRPLAY_V1_SOURCE_VERSION}, // Source version
+        {"txtvers", "1"},                  // TXT record version
     };
     err_raop =
         mdns_service_add(service_name, "_raop", "_tcp", airplay_rtsp_port(),
                          raop_txt, sizeof(raop_txt) / sizeof(raop_txt[0]));
   } else {
-    // Dual-mode: include et=1 (RSA) so RAOP-only clients (TuneBlade, AirMusic,
-    // shairtunes2, etc.) accept the advertisement, while keeping et=3,5 for
-    // AirPlay 2 FairPlay/MFi-SAP. ek=1 advertises that an RSA-encrypted key
-    // can be supplied via SDP rsaaeskey: at ANNOUNCE time.
-    mdns_txt_item_t raop_txt[] = {
-        {"am", AIRPLAY_MODEL},
-        {"cn", "0,1,2,3"},              // Audio codecs: PCM, ALAC, AAC, AAC-ELD
-        {"da", "true"},                 // Digest auth
-        {"ek", "1"},                    // Encryption key available (RSA)
-        {"et", "0,1,3,5"},              // Encryption types
-        {"ft", features_str},           // Features (same as airplay)
-        {"md", AIRPLAY_METADATA_TYPES}, // Metadata types
-        {"pk", pk_str},                 // Public key
-        {"sf", AIRPLAY_FLAGS},          // Status flags
-        {"tp", "UDP"},                  // Transport protocol
-        {"vn", "65537"},                // Version number
-        {"vs", AIRPLAY_SOURCE_VERSION},
-        {"vv", AIRPLAY_PROTOCOL_VERSION},
-    };
-    err_raop =
-        mdns_service_add(service_name, "_raop", "_tcp", airplay_rtsp_port(),
-                         raop_txt, sizeof(raop_txt) / sizeof(raop_txt[0]));
+    // Dual mode: et=1 and ek=1 keep RAOP-only clients (TuneBlade, AirMusic,
+    // shairtunes2...) working beside the AirPlay 2 records.
+    const size_t n = to_mdns_txt(
+        items, airplay_txt_raop(&txt_in, items, AIRPLAY_TXT_MAX), txt);
+    err_raop = mdns_service_add(service_name, "_raop", "_tcp",
+                                airplay_rtsp_port(), txt, n);
   }
   if (err_raop != ESP_OK) {
     ESP_LOGE(TAG, "Failed to add _raop._tcp service: %s",

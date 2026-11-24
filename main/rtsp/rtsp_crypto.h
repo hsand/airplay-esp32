@@ -42,3 +42,15 @@ int rtsp_crypto_read_block(int socket, rtsp_conn_t *conn, uint8_t *buffer,
  */
 int rtsp_crypto_write_frame(int socket, rtsp_conn_t *conn, const uint8_t *data,
                             size_t data_len);
+
+/**
+ * The same framing with an explicit key and nonce counter, for a channel
+ * other than the RTSP connection itself (the event channel has its own keys).
+ * The counter is advanced once per block.
+ */
+int rtsp_crypto_read_block_key(int socket, const uint8_t key[32],
+                               uint64_t *nonce_counter, uint8_t *buffer,
+                               size_t buffer_size);
+int rtsp_crypto_write_frame_key(int socket, const uint8_t key[32],
+                                uint64_t *nonce_counter, const uint8_t *data,
+                                size_t data_len);

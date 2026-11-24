@@ -163,11 +163,12 @@ main/
 │   ├── audio_output*.c         # I2S, S/PDIF and USB backends
 │   ├── audio_eq.c              # Software EQ for DACs without a DSP
 │   └── a2dp_sink.c             # Bluetooth A2DP sink
-├── rtsp/                       # RTSP server, handlers, crypto, FairPlay
+├── rtsp/                       # RTSP server, handlers, crypto, FairPlay,
+│                               # event channel, now-playing, advertisement policy
 ├── hap/                        # HomeKit pairing — SRP, Ed25519
 ├── plist/                      # Apple property list parsing
 ├── network/                    # WiFi, Ethernet, mDNS, PTP, NTP, web server, OTA
-├── dacp_client.c               # DACP remote commands
+├── dacp_client.c               # DACP remote commands (AirPlay 1, old senders)
 ├── playback_control.c          # Unified playback abstraction
 └── buttons.c                   # Debounced button input
 
@@ -186,7 +187,8 @@ components/
 
 | Module | Location | Purpose |
 | --- | --- | --- |
-| RTSP server | `main/rtsp/` | AirPlay control messages |
+| RTSP server | `main/rtsp/` | AirPlay control messages; one connection holds the session, others may probe and pair |
+| Remote control | `main/rtsp/rtsp_events.c`, `main/dacp_client.c` | Commands back to the sender: MediaRemote on the event channel, or DACP |
 | HAP pairing | `main/hap/` | Cryptographic device pairing |
 | Audio pipeline | `main/audio/` | Decoding, buffering, timing |
 | A2DP sink | `main/audio/` | Bluetooth audio receiver, ESP32 only |

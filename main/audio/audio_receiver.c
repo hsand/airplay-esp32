@@ -553,6 +553,13 @@ bool audio_receiver_is_playing(void) {
   return receiver.timing.playing;
 }
 
+bool audio_receiver_get_rendered_rtp(uint32_t *rtp) {
+  if (!rtp || !receiver.engine_v2_ready || !receiver.timing.playing) {
+    return false;
+  }
+  return audio_engine_v2_last_rendered_rtp(&receiver.engine_v2, rtp);
+}
+
 void audio_receiver_set_stream_type(audio_stream_type_t type) {
   if (!receiver.realtime_stream || !receiver.buffered_stream) {
     return;

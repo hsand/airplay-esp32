@@ -54,6 +54,15 @@ void plist_dict_int(plist_t *p, const char *key, int64_t value) {
   }
 }
 
+void plist_dict_real(plist_t *p, const char *key, double value) {
+  size_t remaining = p->capacity - p->size;
+  int len = snprintf(p->buffer + p->size, remaining,
+                     "<key>%s</key>\n<real>%.6f</real>\n", key, value);
+  if (len > 0 && (size_t)len < remaining) {
+    p->size += (size_t)len;
+  }
+}
+
 void plist_dict_uint(plist_t *p, const char *key, uint64_t value) {
   size_t remaining = p->capacity - p->size;
   int len =

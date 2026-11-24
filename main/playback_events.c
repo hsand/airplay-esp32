@@ -200,6 +200,7 @@ static void keep_metadata(playback_source_t source,
   }
   s_meta.position_secs = m->position_secs;
   s_meta.has_artwork = m->has_artwork;
+  s_meta.paused = m->paused;
 }
 
 void playback_events_emit(playback_source_t source, playback_event_t event,

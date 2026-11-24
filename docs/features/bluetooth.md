@@ -59,6 +59,9 @@ environment for the ESP32 one only. There is nothing to enable on the S3 revisio
 
 ## Buttons over Bluetooth
 
-Unlike AirPlay, [hardware buttons](buttons.md) work fully over Bluetooth regardless of
-protocol settings, because AVRCP passthrough carries play/pause and track-skip commands
-natively.
+[Hardware buttons](buttons.md) work fully over Bluetooth, because AVRCP passthrough
+carries play/pause and track-skip commands natively.
+
+When a Bluetooth device connects while an iPhone or Mac is playing over AirPlay 2, the
+speaker first asks the AirPlay sender to pause, as Apple's speakers do when another input
+takes over, so the phone stops instead of playing on into a speaker that no longer listens.

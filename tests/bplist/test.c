@@ -23,8 +23,22 @@ static unsigned int hex_digit(char ch) {
 
 static size_t build_info(uint8_t *out, size_t capacity, const char *name) {
   const uint8_t key[32] = {0};
-  return bplist_build_info_response(out, capacity, "12:34:56:78:9A:BC", name,
-                                    key, sizeof(key), 0x1e5a7ffff7ULL, 1);
+  const airplay_info_t info = {
+      .device_id = "12:34:56:78:9A:BC",
+      .device_name = name,
+      .model = "AudioAccessory5,1",
+      .pi = "6F1D2C3B-4A59-5867-8796-A5B4C3D2E1F0",
+      .source_version = "377.40.00",
+      .features_ex = "AEqcQAADBQ",
+      .pk = key,
+      .pk_len = sizeof(key),
+      .features = 0x1e5a7ffff7ULL,
+      .vv = 1,
+      .status_flags = 4,
+      .has_initial_volume = true,
+      .initial_volume_db = -12.5,
+  };
+  return bplist_build_info(out, capacity, &info);
 }
 
 int main(int argc, char **argv) {

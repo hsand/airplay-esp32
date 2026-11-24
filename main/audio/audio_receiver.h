@@ -277,6 +277,13 @@ void audio_receiver_set_playing(bool playing);
 bool audio_receiver_is_playing(void);
 
 /**
+ * The RTP timestamp being handed to the output now, while playing: what the
+ * now-playing position is computed from, as Apple's buffered receiver does.
+ * @return false when nothing is playing or nothing has been rendered yet
+ */
+bool audio_receiver_get_rendered_rtp(uint32_t *rtp);
+
+/**
  * Reset timing anchor (call when PTP clock changes, e.g., SETPEERS)
  */
 void audio_receiver_reset_timing(void);

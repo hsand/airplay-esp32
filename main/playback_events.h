@@ -57,6 +57,9 @@ typedef struct {
   uint32_t duration_secs;           // Total track duration in seconds
   uint32_t position_secs;           // Current playback position in seconds
   bool has_artwork;                 // Whether artwork is available
+  // The source says its playhead is not moving (AirPlay DMAP play state):
+  // a display should hold position_secs rather than count on from it.
+  bool paused;
 } playback_metadata_t;
 
 // ============================================================================

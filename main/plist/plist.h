@@ -46,6 +46,11 @@ void plist_dict_string(plist_t *p, const char *key, const char *value);
 void plist_dict_int(plist_t *p, const char *key, int64_t value);
 
 /**
+ * Add a real (floating-point) value to dictionary
+ */
+void plist_dict_real(plist_t *p, const char *key, double value);
+
+/**
  * Add unsigned integer to dictionary
  */
 void plist_dict_uint(plist_t *p, const char *key, uint64_t value);
@@ -313,22 +318,57 @@ size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
 size_t bplist_build_feedback_response(uint8_t *out, size_t capacity,
                                       int64_t stream_type, double sample_rate);
 
+/** The values a /info reply is built from. */
+typedef struct {
+  const char *device_id;   // MAC string, "AA:BB:CC:DD:EE:FF"
+  const char *device_name; // user-visible name, UTF-8
+  const char *model;
+  const char *pi;             // pairing identity UUID
+  const char *source_version; // "377.40.00"
+  const char *features_ex;    // base64 feature bytes, or NULL to omit
+  const uint8_t *pk;          // Ed25519 public key
+  size_t pk_len;
+  uint64_t features;
+  int64_t vv;
+  int64_t status_flags;
+  bool has_initial_volume;
+  double initial_volume_db; // current volume, dB, -30..0
+} airplay_info_t;
+
 /**
- * Build /info response bplist.
- * Mirrors the XML /info response for RTSP clients that require binary plists.
- * @param out Output buffer
- * @param capacity Buffer capacity
- * @param device_id Device MAC string
- * @param device_name User-visible AirPlay device name
- * @param public_key HAP Ed25519 public key
- * @param public_key_len Public key length
- * @param features AirPlay feature bitmask
- * @param protocol_version AirPlay protocol version value ("vv")
+ * Build the /info reply bplist: the keys this receiver always sent
+ * (deviceid, features, model, protovers, srcvers, vv, statusFlags, pk, pi,
+ * name, audioFormats, audioLatencies) and the names Apple's receiver uses
+ * (deviceID, protocolVersion, sourceVersion, featuresEx, initialVolume).
+ * @return Length of generated bplist, or 0 on error (including a name that is
+ *         not valid UTF-8, or too small a buffer)
+ */
+size_t bplist_build_info(uint8_t *out, size_t capacity,
+                         const airplay_info_t *info);
+
+/** A sendMediaRemoteCommand for the event channel. */
+typedef struct {
+  const char *fourcc; // AirPlay code: "plps", "dvlc", ...
+  int mr_command;     // MediaRemote command, or -1 for none (volume codes)
+  bool has_volume;    // dvlc: volume and isMuted
+  double volume;      // slider, 0..1
+  bool is_muted;
+} airplay_mr_command_plist_t;
+
+/**
+ * {type: "sendMediaRemoteCommand", value: <4CC>,
+ *  modernMediaRemoteCommand: "<n>"?, volume?, isMuted?, params?}, the body of
+ * the POST /command Apple's receiver sends the sender on the event channel.
  * @return Length of generated bplist, or 0 on error
  */
-size_t bplist_build_info_response(uint8_t *out, size_t capacity,
-                                  const char *device_id,
-                                  const char *device_name,
-                                  const uint8_t *public_key,
-                                  size_t public_key_len, uint64_t features,
-                                  int64_t protocol_version);
+size_t bplist_build_mr_command(uint8_t *out, size_t capacity,
+                               const airplay_mr_command_plist_t *cmd);
+
+/**
+ * An integer inside a dict held by a top-level key: {dict_key: {key: n}}
+ * (for example /command's params.value).
+ * @return true if found
+ */
+bool bplist_find_nested_int(const uint8_t *plist, size_t plist_len,
+                            const char *dict_key, const char *key,
+                            int64_t *out_value);
