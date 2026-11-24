@@ -30,10 +30,12 @@ class Sim:
         self.q = collections.deque()     # free buffers (indices)
         self.cur, self.rw = None, 0
         self.played = {}                 # tag -> play time
-        # cursor
-        self.submitted = self.sent = 0
-        self.lost = DESC * FRAME if fixed else 0   # after i2s_channel_enable()
-        self.sent_t = None
+        # cursor, as audio_output.c sets it up at i2s_channel_enable()
+        self.submitted = self.sent = self.lost = 0
+        self.eofs = 0
+        self.sent_t = 0 if fixed else None        # output_channel_enabled()
+        if fixed:
+            self.lost = self.ahead_of_new_writer()
 
     # -- DMA -----------------------------------------------------------------
     def advance(self, n):
@@ -48,6 +50,7 @@ class Sim:
                 self.ring[d] = [None] * FRAME           # auto_clear
                 self.sent += FRAME
                 self.sent_t = self.t
+                self.eofs = min(self.eofs + 1, DESC)
                 if len(self.q) == DESC - 1:
                     self.q.popleft()
                 self.q.append(d)
@@ -56,10 +59,14 @@ class Sim:
         self.advance(FRAME - self.t % FRAME)
 
     # -- cursor (audio_output.c) ----------------------------------------------
+    def ahead_of_new_writer(self):
+        return (DESC - min(DESC - 1, self.eofs)) * FRAME
+
     def queued(self):
         if self.sent > self.submitted + self.lost:
-            self.lost = self.sent - self.submitted + (FRAME if self.fixed else 0)
-            return FRAME if self.fixed else 0
+            ahead = self.ahead_of_new_writer() if self.fixed else 0
+            self.lost = self.sent - self.submitted + ahead
+            return ahead
         return min(self.submitted + self.lost - self.sent, DESC * FRAME)
 
     def pipeline(self):
@@ -71,7 +78,7 @@ class Sim:
     def restart_writer(self):
         """audio_output_start() on a ring that kept running."""
         self.submitted = self.sent = 0
-        self.lost = FRAME if self.fixed else 0
+        self.lost = self.ahead_of_new_writer() if self.fixed else 0
         self.cur, self.rw = None, 0
 
     # -- writer (i2s_channel_write) -------------------------------------------
@@ -95,6 +102,11 @@ def run(fixed, scenario):
     s = Sim(fixed)
     preds = {}
     tag = 0
+    if scenario.startswith("boot"):
+        # The playback task starts (audio_output_start) some EOFs after the
+        # enable in audio_output_init.
+        s.advance(int(scenario[4:]) * FRAME + 100)
+        s.restart_writer()
     for blk in range(400):
         if scenario == "stall" and blk == 150:
             s.advance(30000)                      # writer starved ~0.7 s
@@ -112,16 +124,19 @@ def run(fixed, scenario):
 
 def main():
     ok = True
-    for scen in ("enable", "stall", "restart"):
+    for scen in ("enable", "boot0", "boot2", "boot5", "boot40", "stall",
+                 "restart"):
         for fixed in (False, True):
             lo, hi, first = run(fixed, scen)
+            if fixed:   # the first blocks too, not just the steady state
+                lo, hi = min(lo, *first), max(hi, *first)
             ms = lambda f: f / 44.1
             tag = "new" if fixed else "old"
             print(f"{scen:8s} {tag}: true - predicted = {ms(lo):6.2f} .. {ms(hi):6.2f} ms"
                   f"  (first blocks {', '.join(f'{ms(e):.1f}' for e in first)})")
             if fixed and (lo < -2 or hi > 2):     # within 2 frames (45 us)
                 ok = False
-            if not fixed and scen == "enable" and hi < (DESC - 1) * FRAME - 2:
+            if not fixed and scen == "boot2" and hi < (DESC - 3) * FRAME - 2:
                 ok = False                         # the model must show the bug
     print("all passed" if ok else "FAILED")
     sys.exit(0 if ok else 1)
