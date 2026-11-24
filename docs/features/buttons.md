@@ -1,34 +1,35 @@
 # Hardware buttons
 
 Physical buttons can control playback directly from the device, with no phone involved.
-They work with both AirPlay and Bluetooth sources — but there is an important caveat for
-AirPlay, covered below.
+They work with AirPlay, Bluetooth, USB and Sendspin sources.
 
-## Read this first: the AirPlay v1 requirement
+## How the commands reach the phone
 
-Button-driven remote control (play/pause, next/previous track) relies on **DACP**, a
-protocol where iOS sends a session ID and port that the receiver uses to send commands
-back to the source. **iOS only sends DACP headers in AirPlay v1 (classic) mode.** In
-AirPlay 2 mode Apple uses MRP (Media Remote Protocol) instead, which this firmware does not
-implement.
+A speaker cannot pause a phone by itself: it has to ask the phone to pause. The receiver
+does it the way Apple's own receivers do, and picks the route from what the sender is:
 
-In practice:
-
-| Source | Volume | Play/pause and track skip |
+| Source | Play/pause and track skip | Volume |
 | --- | --- | --- |
-| **AirPlay 2** (default) | Works, applied locally on the DAC | Falls back to local mute — cannot control the source |
-| **AirPlay v1** (forced) | Works | Works fully via DACP |
-| **Bluetooth** | Works | Works fully via AVRCP passthrough |
+| **AirPlay 2** (iOS, macOS) | Sent to the phone as a MediaRemote command on the AirPlay event channel | Applied on the speaker; the phone's slider follows |
+| **AirPlay v1**, and old AirPlay 2 senders (source version below 354.54.6) | Sent over DACP | Applied on the speaker and sent over DACP |
+| **Bluetooth** | AVRCP passthrough | AVRCP absolute volume |
+| **USB speaker** | USB HID consumer keys | USB HID consumer keys |
 
-To get full button control over AirPlay, switch the receiver to v1 mode in the web
-interface: **Configuration → AirPlay → Mode → Legacy (v1)**, then restart the
-device.
+So the phone's Now Playing controls, the app and the speaker always agree: pressing pause
+pauses the app, and the phone's play button resumes it.
 
-!!! warning "Trade-off"
+On AirPlay 2 a pause also silences the speaker at once, without waiting for the phone's
+reply, as Apple's speakers do. The buffered audio is kept, so resuming is instant.
 
-    AirPlay v1 disables AirPlay 2 features: HomeKit pairing, encrypted transport and
-    multi-room sync. The device still appears in AirPlay menus on iOS, but as a classic
-    receiver. Bluetooth is unaffected.
+If the phone cannot be reached at all (for instance a third-party sender that opens no
+event channel and has no DACP remote), play/pause falls back to muting the speaker
+locally; press it again to unmute.
+
+!!! note "Older firmware"
+
+    Before this release the buttons could only control an AirPlay sender in v1 mode,
+    because iOS stopped sending DACP information to AirPlay 2 receivers long ago. That is
+    no longer needed: leave the speaker in AirPlay 2 mode.
 
 ## Supported actions
 
@@ -64,8 +65,8 @@ button is open.
   **external pull-up resistor**. The driver warns at boot if you use one of them.
 
 Input is interrupt-driven with a 50 ms software debounce, so there is no polling overhead.
-Actions are dispatched to whichever source is active: DACP for AirPlay v1, AVRCP
-passthrough for Bluetooth.
+Actions are dispatched to whichever source is active, as described
+[above](#how-the-commands-reach-the-phone).
 
 ### Rotary encoder
 

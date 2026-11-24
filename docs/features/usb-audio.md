@@ -17,7 +17,8 @@ consumer-control interface that sends media keys back to the host.
 
 - AirPlay and USB audio are **mutually exclusive at runtime**, much like
   [Bluetooth](bluetooth.md)
-- AirPlay is suspended as soon as the host starts streaming
+- AirPlay is suspended as soon as the host starts streaming; an AirPlay 2 phone that was
+  playing is asked to pause first, so it does not play on into a silent speaker
 - The output is handed back once the host stream has been idle for
   `CONFIG_USB_AUDIO_SINK_IDLE_MS`, 2000 ms by default
 - Host volume and mute follow the computer's own slider — on the DAC where it has a volume
