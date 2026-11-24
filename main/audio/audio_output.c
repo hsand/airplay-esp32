@@ -129,11 +129,38 @@ static bool IRAM_ATTR audio_output_on_sent(i2s_chan_handle_t handle,
   return false;
 }
 
-static void output_cursor_reset(void) {
+/* Where the writer's next frame lands, from how ESP-IDF's TX driver hands out
+ * buffers (esp_driver_i2s/i2s_common.c, v6.1).  The writer only ever gets a
+ * descriptor from a queue the DMA's EOF interrupt fills, i.e. one that has
+ * just been played, and the queue holds DESC_NUM - 1 of them (the oldest is
+ * dropped when it is full).  So the depth ahead of a write depends on how the
+ * writer joined the ring:
+ *
+ *   - after i2s_channel_enable() the queue is empty and the DMA starts at
+ *     desc[0]: the whole ring (DESC_NUM descriptors of silence or stale data)
+ *     plays before the first frame written;
+ *   - joining a ring that is already running with nobody writing (a restarted
+ *     playback task, or a writer that stalled until the ring ran dry): the
+ *     queue is full, its oldest entry is the descriptor after the one
+ *     playing, so only the rest of the current descriptor is ahead.
+ *
+ * The cursor used to start at zero in both cases.  In the first, the DMA's
+ * first EOF then read as an underrun and the DESC_NUM - 1 descriptors still
+ * ahead (40.6 ms at 44.1 kHz) were never counted, so every frame was
+ * scheduled that much late for as long as the channel stayed enabled. */
+#define OUTPUT_RING_FRAMES ((uint64_t)I2S_DMA_DESC_NUM * I2S_DMA_FRAME_NUM)
+
+/* Start the cursor with `ahead` frames queued in front of the next write.
+ * keep_sent_us: the DMA kept running, so the last EOF's timestamp is still
+ * valid and the interpolation in audio_output_get_pipeline_us() can charge
+ * off what has played of the current descriptor since. */
+static void output_cursor_restart(uint64_t ahead, bool keep_sent_us) {
   __atomic_store_n(&output_submitted_frames, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&output_sent_frames, 0, __ATOMIC_RELAXED);
-  __atomic_store_n(&output_lost_frames, 0, __ATOMIC_RELAXED);
-  __atomic_store_n(&output_sent_us, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&output_lost_frames, ahead, __ATOMIC_RELAXED);
+  if (!keep_sent_us) {
+    __atomic_store_n(&output_sent_us, 0, __ATOMIC_RELAXED);
+  }
 }
 
 /* Frames queued in the DMA ring ahead of the next write.  Called from the
@@ -146,11 +173,15 @@ static uint32_t output_queued_frames(void) {
   uint64_t sent = __atomic_load_n(&output_sent_frames, __ATOMIC_RELAXED);
 
   if (sent > submitted + lost) {
-    /* The ring ran dry: rebase so queued reads 0 and remember how much
-     * output time went out as silence. */
-    __atomic_store_n(&output_lost_frames, sent - submitted, __ATOMIC_RELAXED);
+    /* The ring ran dry: everything written has played and the driver's
+     * queue has filled with played descriptors, so the next write lands in
+     * the descriptor after the one playing (see above).  Rebase to one
+     * descriptor ahead; the caller's interpolation trims it to the part of
+     * the current one still to play. */
+    __atomic_store_n(&output_lost_frames,
+                     sent - submitted + I2S_DMA_FRAME_NUM, __ATOMIC_RELAXED);
     output_underruns++;
-    return 0;
+    return I2S_DMA_FRAME_NUM;
   }
 
   uint64_t queued = submitted + lost - sent;
@@ -570,7 +601,7 @@ esp_err_t audio_output_init(void) {
   ESP_RETURN_ON_ERROR(
       i2s_channel_register_event_callback(tx_handle, &callbacks, NULL), TAG,
       "event callback registration failed");
-  output_cursor_reset();
+  output_cursor_restart(OUTPUT_RING_FRAMES, false);
 
   ESP_RETURN_ON_ERROR(i2s_channel_enable(tx_handle), TAG,
                       "channel enable failed");
@@ -614,8 +645,10 @@ void audio_output_start(void) {
   playback_running = true;
   // The DMA has been free-running (A2DP, or plain silence) since the last
   // AirPlay session, so the cursor carries an arbitrary submitted/sent skew.
-  // Start the new session from a clean slate.
-  output_cursor_reset();
+  // Start the new session from a clean slate: nobody has been writing, so
+  // the driver's queue is full and the first write lands right after the
+  // descriptor now playing.
+  output_cursor_restart(I2S_DMA_FRAME_NUM, true);
   audio_delay_reset();
   xTaskCreatePinnedToCore(playback_task, "audio_play", 4096, NULL,
                           AUDIO_PLAYBACK_TASK_PRIORITY, &playback_task_handle,
@@ -729,7 +762,7 @@ void audio_output_set_sample_rate(uint32_t rate) {
   audio_eq_reset();
 #endif
   audio_delay_set_rate(rate);
-  output_cursor_reset();
+  output_cursor_restart(OUTPUT_RING_FRAMES, false);
   i2s_channel_enable(tx_handle);
   dac_on_i2s_started(rate);
 }
