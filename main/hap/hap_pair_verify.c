@@ -73,6 +73,9 @@ esp_err_t hap_pair_verify_m1(hap_session_t *session, const uint8_t *input,
     return ESP_ERR_INVALID_ARG;
   }
 
+  // A new verify never reuses the previous attempt's ephemeral key.
+  hap_session_reset_pairing(session);
+
   size_t client_pk_len = 0;
   const uint8_t *client_pk =
       tlv8_find(input, input_len, TLV_TYPE_PUBLIC_KEY, &client_pk_len);
@@ -173,6 +176,7 @@ esp_err_t hap_pair_verify_m3(hap_session_t *session, const uint8_t *input,
           decrypted, &decrypted_len, NULL, encrypted, encrypted_len, NULL, 0,
           nonce, session->encrypt_key) != 0) {
     ESP_LOGE(TAG, "M3 decryption failed");
+    hap_session_reset_pairing(session);
     tlv8_encoder_t enc;
     tlv8_encoder_init(&enc, output, output_capacity);
     tlv8_encode_byte(&enc, TLV_TYPE_STATE, PAIR_VERIFY_STATE_M4);
@@ -189,6 +193,9 @@ esp_err_t hap_pair_verify_m3(hap_session_t *session, const uint8_t *input,
                   HAP_X25519_KEY_SIZE,
                   (uint8_t *)"Control-Write-Encryption-Key", 28,
                   session->decrypt_key, 32);
+
+  memcpy(session->ikm, session->shared_secret, HAP_X25519_KEY_SIZE);
+  session->ikm_len = HAP_X25519_KEY_SIZE;
 
   tlv8_encoder_t enc;
   tlv8_encoder_init(&enc, output, output_capacity);
@@ -217,6 +224,8 @@ esp_err_t hap_pair_verify_m1_raw(hap_session_t *session, const uint8_t *input,
     return ESP_ERR_INVALID_ARG;
   }
 
+  // Fresh ephemeral key for every verify, as for the TLV flavour.
+  hap_session_reset_pairing(session);
   memcpy(session->client_public_key, client_epk, HAP_X25519_KEY_SIZE);
 
   if (crypto_scalarmult(session->shared_secret, session->session_secret_key,
@@ -342,6 +351,8 @@ esp_err_t hap_pair_verify_m3_raw(hap_session_t *session, const uint8_t *input,
 
   session->encrypt_nonce = 0;
   session->decrypt_nonce = 0;
+  memcpy(session->ikm, session->shared_secret, HAP_X25519_KEY_SIZE);
+  session->ikm_len = HAP_X25519_KEY_SIZE;
 
   *output_len = 0;
   session->pair_verify_state = PAIR_VERIFY_STATE_M4;

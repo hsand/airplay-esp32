@@ -56,6 +56,18 @@ with tempfile.TemporaryDirectory(prefix="bplist-tests-") as temporary:
         decoded = plistlib.loads(result.stdout)
         assert decoded["name"] == name, (name, decoded["name"])
         assert decoded["deviceid"] == "12:34:56:78:9A:BC"
+        # Apple's key names beside the old ones (airPlayDescription reads
+        # these), with the same values.
+        assert decoded["deviceID"] == decoded["deviceid"]
+        assert decoded["protocolVersion"] == decoded["protovers"] == "1.1"
+        assert decoded["sourceVersion"] == decoded["srcvers"] == "377.40.00"
+        assert decoded["featuresEx"] == "AEqcQAADBQ"
+        assert decoded["initialVolume"] == -12.5
+        assert decoded["features"] == 0x1e5a7ffff7
+        assert decoded["pi"] == "6F1D2C3B-4A59-5867-8796-A5B4C3D2E1F0"
+        assert decoded["vv"] == 1 and decoded["statusFlags"] == 4
+        assert decoded["audioFormats"][0]["type"] == 96
+        assert [l["type"] for l in decoded["audioLatencies"]] == [96, 103]
     for encoded in INVALID_NAMES:
         result = subprocess.run(
             [str(build / "test"), encoded], capture_output=True,

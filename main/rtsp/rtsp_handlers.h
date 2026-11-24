@@ -27,16 +27,16 @@
  */
 uint64_t airplay_features(void);
 
-// Audio buffer size for buffered streams (type 103).  The sender queues this
-// much audio ahead, and on a seek/skip every queued byte is stale but still has
-// to cross the link before the new track arrives.  Under BT coexistence the
-// link only manages ~0.6 Mbit/s, so 1 MB (5.9 s) cost ~2 s of pure drain per
-// seek.  512 KB (~3 s) still exceeds the ring's observed steady-state fill.
-#define AP2_AUDIO_BUFFER_SIZE (512 * 1024)
+/** The model string from the AirPlay settings (TXT model/am, /info). */
+const char *airplay_model(void);
 
-// Realtime (type 96) is paced over UDP and never queues ahead on the sender, so
-// none of the above applies to it.  Kept at the original advertisement.
-#define AP2_REALTIME_AUDIO_BUFFER_SIZE (1 * 1024 * 1024)
+// audioBufferSize for a buffered stream is sized per codec in
+// airplay_audio_buffer_size() (rtsp_policy.h), capped at the 512 KiB this
+// receiver used to advertise: the sender queues that much ahead, and on a
+// seek or skip every queued byte is stale but still has to cross the link
+// before the new position arrives.  Under BT coexistence the link only
+// manages ~0.6 Mbit/s, so 1 MB (5.9 s of PCM) cost ~2 s of pure drain per
+// seek.  Realtime (type 96) is paced over UDP and gets none, as on Apple.
 
 // Include for audio_format_t
 #include "audio_receiver.h"
@@ -95,6 +95,12 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
 void rtsp_get_device_id(char *device_id, size_t len);
 
 /**
+ * This unit's pairing identity ("pi" in TXT and /info): a UUID derived from
+ * the Wi-Fi MAC, stable across boots and different on every unit.
+ */
+void airplay_get_pairing_identity(char out[37]);
+
+/**
  * End of an AirPlay session (full TEARDOWN, connection closed, idle timeout):
  * drop the session's timing peers and end the PTP session.  Apple stops its
  * clock for the session only here, never on a stream TEARDOWN or a pause.
@@ -114,8 +120,3 @@ int rtsp_session_idle_limit_s(const rtsp_conn_t *conn);
  * them, idle_s apart.
  */
 void rtsp_set_keepalive(int socket, int idle_s);
-
-// Event port task management
-esp_err_t rtsp_start_event_port_task(int listen_socket);
-void rtsp_stop_event_port_task(void);
-int rtsp_event_port_listen_socket(void);

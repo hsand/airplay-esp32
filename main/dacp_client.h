@@ -12,11 +12,13 @@
  * Sends commands back to the AirPlay source device (iPhone/Mac) so its
  * UI reflects changes made via hardware buttons on the receiver.
  *
- * Only works with AirPlay 1 connections — modern iOS AirPlay 2 does not
- * send DACP-ID/Active-Remote headers and uses the Media Remote Protocol
- * (MRP) instead, which we do not implement.  When DACP headers are
- * present we discover the client's DACP port via mDNS (_dacp._tcp) and
- * authenticate our HTTP requests with the Active-Remote token.
+ * Only senders that send DACP-ID/Active-Remote headers use it: AirPlay 1, and
+ * AirPlay 2 senders older than 354.54.6.  A modern AirPlay 2 sender gets
+ * MediaRemote commands on the event channel instead (rtsp_server.c).  The
+ * sender's DACP service is resolved by its exact mDNS instance
+ * (iTunes_Ctrl_<DACP-ID>, 5 s timeout) when a command needs it, and requests
+ * are authenticated with the Active-Remote token.  A failed resolve or request
+ * is retried on the next command; nothing latches.
  *
  * Commands are HTTP GET requests to the client:
  *   GET /ctrl-int/1/playpause
@@ -47,6 +49,11 @@ void dacp_set_session(const char *dacp_id, const char *active_remote,
  * Clear the DACP session (on client disconnect).
  */
 void dacp_clear_session(void);
+
+/**
+ * Send a /ctrl-int/1/ command word ("playpause", "nextitem", "pause"...).
+ */
+void dacp_send_command(const char *command);
 
 /**
  * Send play/pause toggle command to the AirPlay client.

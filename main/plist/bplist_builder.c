@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "audio_stream.h"
@@ -550,223 +551,245 @@ size_t bplist_build_feedback_response(uint8_t *out, size_t capacity,
   return pos;
 }
 
-size_t bplist_build_info_response(uint8_t *out, size_t capacity,
-                                  const char *device_id,
-                                  const char *device_name,
-                                  const uint8_t *public_key,
-                                  size_t public_key_len, uint64_t features,
-                                  int64_t protocol_version) {
-  if (!out || !device_id || !device_name || !public_key ||
-      public_key_len == 0 || capacity < 512) {
+// ============================================================================
+// Generic writer: objects are appended as they are made and referenced by
+// index, so a builder reads top-down instead of by hand-numbered offsets.
+// One-byte object references: at most 255 objects.
+// ============================================================================
+
+#define BPW_MAX_OBJECTS 64
+
+typedef struct {
+  uint8_t *out;
+  size_t capacity;
+  size_t pos;
+  size_t offsets[BPW_MAX_OBJECTS];
+  size_t count;
+  bool ok;
+} bpw_t;
+
+static void bpw_init(bpw_t *w, uint8_t *out, size_t capacity) {
+  w->out = out;
+  w->capacity = capacity;
+  w->pos = 0;
+  w->count = 0;
+  w->ok = out != NULL && bplist_has_room(0, sizeof(BPLIST_MAGIC), capacity);
+  if (w->ok) {
+    memcpy(out, BPLIST_MAGIC, sizeof(BPLIST_MAGIC));
+    w->pos = sizeof(BPLIST_MAGIC);
+  }
+}
+
+// Reserve the next object index; 0 with w->ok cleared once full.
+static uint8_t bpw_begin(bpw_t *w) {
+  if (!w->ok || w->count >= BPW_MAX_OBJECTS) {
+    w->ok = false;
     return 0;
+  }
+  w->offsets[w->count] = w->pos;
+  return (uint8_t)w->count++;
+}
+
+static uint8_t bpw_string(bpw_t *w, const char *value) {
+  const uint8_t ref = bpw_begin(w);
+  w->ok = w->ok && value &&
+          bplist_write_utf8_string(w->out, w->capacity, &w->pos, value);
+  return ref;
+}
+
+static uint8_t bpw_int(bpw_t *w, int64_t value) {
+  const uint8_t ref = bpw_begin(w);
+  w->ok =
+      w->ok && bplist_write_int(w->out, w->capacity, &w->pos, (uint64_t)value);
+  return ref;
+}
+
+static uint8_t bpw_real(bpw_t *w, double value) {
+  const uint8_t ref = bpw_begin(w);
+  uint64_t bits;
+  memcpy(&bits, &value, sizeof(bits));
+  w->ok = w->ok && bplist_has_room(w->pos, 1, w->capacity);
+  if (w->ok) {
+    w->out[w->pos++] = 0x23; // real, 2^3 bytes
+    w->ok = bplist_write_u64(w->out, w->capacity, &w->pos, bits);
+  }
+  return ref;
+}
+
+static uint8_t bpw_bool(bpw_t *w, bool value) {
+  const uint8_t ref = bpw_begin(w);
+  w->ok = w->ok && bplist_has_room(w->pos, 1, w->capacity);
+  if (w->ok) {
+    w->out[w->pos++] = value ? 0x09 : 0x08;
+  }
+  return ref;
+}
+
+static uint8_t bpw_data(bpw_t *w, const uint8_t *data, size_t len) {
+  const uint8_t ref = bpw_begin(w);
+  w->ok = w->ok && data &&
+          bplist_write_data(w->out, w->capacity, &w->pos, data, len);
+  return ref;
+}
+
+static uint8_t bpw_array(bpw_t *w, const uint8_t *refs, size_t count) {
+  const uint8_t ref = bpw_begin(w);
+  w->ok =
+      w->ok && bplist_write_array(w->out, w->capacity, &w->pos, refs, count);
+  return ref;
+}
+
+static uint8_t bpw_dict(bpw_t *w, const uint8_t *keys, const uint8_t *values,
+                        size_t count) {
+  const uint8_t ref = bpw_begin(w);
+  w->ok = w->ok &&
+          bplist_write_dict(w->out, w->capacity, &w->pos, keys, values, count);
+  return ref;
+}
+
+static size_t bpw_finish(bpw_t *w, uint8_t top) {
+  if (!w->ok ||
+      !bplist_finish(w->out, w->capacity, &w->pos, w->offsets, w->count, top)) {
+    return 0;
+  }
+  return w->pos;
+}
+
+// A dict under construction: key and value references side by side.
+#define BPW_DICT_MAX 32
+typedef struct {
+  uint8_t keys[BPW_DICT_MAX];
+  uint8_t values[BPW_DICT_MAX];
+  size_t count;
+} bpw_dict_t;
+
+static void bpw_entry(bpw_t *w, bpw_dict_t *d, uint8_t key, uint8_t value) {
+  if (d->count >= BPW_DICT_MAX) {
+    w->ok = false;
+    return;
+  }
+  d->keys[d->count] = key;
+  d->values[d->count] = value;
+  d->count++;
+}
+
+size_t bplist_build_info(uint8_t *out, size_t capacity,
+                         const airplay_info_t *info) {
+  if (!out || !info || !info->device_id || !info->device_name || !info->model ||
+      !info->pi || !info->source_version || !info->pk || info->pk_len == 0) {
+    return 0;
+  }
+  bpw_t w;
+  bpw_init(&w, out, capacity);
+  bpw_dict_t top = {.count = 0};
+
+  // The keys this receiver always sent, for senders that read them...
+  bpw_entry(&w, &top, bpw_string(&w, "deviceid"),
+            bpw_string(&w, info->device_id));
+  const uint8_t features = bpw_int(&w, (int64_t)info->features);
+  bpw_entry(&w, &top, bpw_string(&w, "features"), features);
+  bpw_entry(&w, &top, bpw_string(&w, "model"), bpw_string(&w, info->model));
+  const uint8_t protocol = bpw_string(&w, "1.1");
+  bpw_entry(&w, &top, bpw_string(&w, "protovers"), protocol);
+  const uint8_t source = bpw_string(&w, info->source_version);
+  bpw_entry(&w, &top, bpw_string(&w, "srcvers"), source);
+  bpw_entry(&w, &top, bpw_string(&w, "vv"), bpw_int(&w, info->vv));
+  bpw_entry(&w, &top, bpw_string(&w, "statusFlags"),
+            bpw_int(&w, info->status_flags));
+  bpw_entry(&w, &top, bpw_string(&w, "pk"),
+            bpw_data(&w, info->pk, info->pk_len));
+  bpw_entry(&w, &top, bpw_string(&w, "pi"), bpw_string(&w, info->pi));
+  bpw_entry(&w, &top, bpw_string(&w, "name"),
+            bpw_string(&w, info->device_name));
+
+  // ...and the names Apple's receiver uses, which are the ones Apple's
+  // sender reads (airPlayDescription_SetEndpointInfo).
+  bpw_entry(&w, &top, bpw_string(&w, "deviceID"),
+            bpw_string(&w, info->device_id));
+  bpw_entry(&w, &top, bpw_string(&w, "protocolVersion"), protocol);
+  bpw_entry(&w, &top, bpw_string(&w, "sourceVersion"), source);
+  if (info->features_ex && info->features_ex[0]) {
+    bpw_entry(&w, &top, bpw_string(&w, "featuresEx"),
+              bpw_string(&w, info->features_ex));
+  }
+  if (info->has_initial_volume) {
+    bpw_entry(&w, &top, bpw_string(&w, "initialVolume"),
+              bpw_real(&w, info->initial_volume_db));
   }
 
-  size_t pos = 0;
-  size_t offsets[39];
-  size_t obj = 0;
-
-#define ADD_OFFSET()                                   \
-  do {                                                 \
-    if (obj >= sizeof(offsets) / sizeof(offsets[0])) { \
-      return 0;                                        \
-    }                                                  \
-    offsets[obj++] = pos;                              \
-  } while (0)
-
-  if (!bplist_has_room(pos, 8, capacity)) {
-    return 0;
-  }
-  memcpy(out + pos, BPLIST_MAGIC, sizeof(BPLIST_MAGIC));
-  pos += 8;
-
-  ADD_OFFSET(); // 0: "deviceid"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "deviceid")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 1: device id
-  if (!bplist_write_ascii_string(out, capacity, &pos, device_id)) {
-    return 0;
-  }
-  ADD_OFFSET(); // 2: "features"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "features")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 3: features
-  if (!bplist_write_int(out, capacity, &pos, features)) {
-    return 0;
-  }
-  ADD_OFFSET(); // 4: "model"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "model")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 5: model
-  if (!bplist_write_ascii_string(out, capacity, &pos, "AudioAccessory5,1")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 6: "protovers"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "protovers")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 7: protocol version string
-  if (!bplist_write_ascii_string(out, capacity, &pos, "1.1")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 8: "srcvers"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "srcvers")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 9: source version string
-  if (!bplist_write_ascii_string(out, capacity, &pos, "377.40.00")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 10: "vv"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "vv")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 11: vv value
-  if (!bplist_write_int(out, capacity, &pos, (uint64_t)protocol_version)) {
-    return 0;
-  }
-  ADD_OFFSET(); // 12: "statusFlags"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "statusFlags")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 13: statusFlags value
-  if (!bplist_write_int(out, capacity, &pos, 4)) {
-    return 0;
-  }
-  ADD_OFFSET(); // 14: "pk"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "pk")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 15: public key
-  if (!bplist_write_data(out, capacity, &pos, public_key, public_key_len)) {
-    return 0;
-  }
-  ADD_OFFSET(); // 16: "pi"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "pi")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 17: pairing identifier
-  if (!bplist_write_ascii_string(out, capacity, &pos,
-                                 "00000000-0000-0000-0000-000000000000")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 18: "name"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "name")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 19: device name
-  if (!bplist_write_utf8_string(out, capacity, &pos, device_name)) {
-    return 0;
-  }
-  ADD_OFFSET(); // 20: "audioFormats"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "audioFormats")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 21: "type"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "type")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 22: "audioInputFormats"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "audioInputFormats")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 23: "audioOutputFormats"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "audioOutputFormats")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 24: stream type 96
-  if (!bplist_write_int(out, capacity, &pos, 96)) {
-    return 0;
-  }
-  ADD_OFFSET(); // 25: format mask
-  if (!bplist_write_int(out, capacity, &pos, 0x01000000)) {
-    return 0;
-  }
-  ADD_OFFSET(); // 26: audio format dict
+  // audioFormats: [{type: 96, audioInputFormats, audioOutputFormats}]
+  const uint8_t type_key = bpw_string(&w, "type");
+  const uint8_t type96 = bpw_int(&w, 96);
+  const uint8_t mask = bpw_int(&w, 0x01000000);
   {
-    const uint8_t keys[] = {21, 22, 23};
-    const uint8_t values[] = {24, 25, 25};
-    if (!bplist_write_dict(out, capacity, &pos, keys, values, 3)) {
-      return 0;
-    }
+    bpw_dict_t f = {.count = 0};
+    bpw_entry(&w, &f, type_key, type96);
+    bpw_entry(&w, &f, bpw_string(&w, "audioInputFormats"), mask);
+    bpw_entry(&w, &f, bpw_string(&w, "audioOutputFormats"), mask);
+    const uint8_t dict = bpw_dict(&w, f.keys, f.values, f.count);
+    const uint8_t list = bpw_array(&w, &dict, 1);
+    bpw_entry(&w, &top, bpw_string(&w, "audioFormats"), list);
   }
-  ADD_OFFSET(); // 27: audioFormats array
+  // audioLatencies: zero for both stream types (see rtsp_handlers.c).
   {
-    const uint8_t refs[] = {26};
-    if (!bplist_write_array(out, capacity, &pos, refs, 1)) {
-      return 0;
+    const uint8_t audio_type_key = bpw_string(&w, "audioType");
+    const uint8_t input_key = bpw_string(&w, "inputLatencyMicros");
+    const uint8_t output_key = bpw_string(&w, "outputLatencyMicros");
+    const uint8_t audio_type = bpw_int(&w, 0x64);
+    const uint8_t zero = bpw_int(&w, 0);
+    const uint8_t types[2] = {type96, bpw_int(&w, 103)};
+    uint8_t dicts[2];
+    for (size_t i = 0; i < 2; i++) {
+      bpw_dict_t l = {.count = 0};
+      bpw_entry(&w, &l, type_key, types[i]);
+      bpw_entry(&w, &l, audio_type_key, audio_type);
+      bpw_entry(&w, &l, input_key, zero);
+      bpw_entry(&w, &l, output_key, zero);
+      dicts[i] = bpw_dict(&w, l.keys, l.values, l.count);
     }
-  }
-  ADD_OFFSET(); // 28: "audioLatencies"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "audioLatencies")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 29: "audioType"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "audioType")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 30: "inputLatencyMicros"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "inputLatencyMicros")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 31: "outputLatencyMicros"
-  if (!bplist_write_ascii_string(out, capacity, &pos, "outputLatencyMicros")) {
-    return 0;
-  }
-  ADD_OFFSET(); // 32: stream type 103
-  if (!bplist_write_int(out, capacity, &pos, 103)) {
-    return 0;
-  }
-  ADD_OFFSET(); // 33: audio type
-  if (!bplist_write_int(out, capacity, &pos, 0x64)) {
-    return 0;
-  }
-  ADD_OFFSET(); // 34: zero latency
-  if (!bplist_write_int(out, capacity, &pos, 0)) {
-    return 0;
-  }
-  ADD_OFFSET(); // 35: latency dict for realtime stream
-  {
-    const uint8_t keys[] = {21, 29, 30, 31};
-    const uint8_t values[] = {24, 33, 34, 34};
-    if (!bplist_write_dict(out, capacity, &pos, keys, values, 4)) {
-      return 0;
-    }
-  }
-  ADD_OFFSET(); // 36: latency dict for buffered stream
-  {
-    const uint8_t keys[] = {21, 29, 30, 31};
-    const uint8_t values[] = {32, 33, 34, 34};
-    if (!bplist_write_dict(out, capacity, &pos, keys, values, 4)) {
-      return 0;
-    }
-  }
-  ADD_OFFSET(); // 37: audioLatencies array
-  {
-    const uint8_t refs[] = {35, 36};
-    if (!bplist_write_array(out, capacity, &pos, refs, 2)) {
-      return 0;
-    }
-  }
-  ADD_OFFSET(); // 38: top-level info dict
-  {
-    const uint8_t keys[] = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 28};
-    const uint8_t values[] = {1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 27, 37};
-    if (!bplist_write_dict(out, capacity, &pos, keys, values, 12)) {
-      return 0;
-    }
+    const uint8_t list = bpw_array(&w, dicts, 2);
+    bpw_entry(&w, &top, bpw_string(&w, "audioLatencies"), list);
   }
 
-#undef ADD_OFFSET
+  const uint8_t root = bpw_dict(&w, top.keys, top.values, top.count);
+  return bpw_finish(&w, root);
+}
 
-  if (obj != sizeof(offsets) / sizeof(offsets[0]) ||
-      !bplist_finish(out, capacity, &pos, offsets, obj, 38)) {
+size_t bplist_build_mr_command(uint8_t *out, size_t capacity,
+                               const airplay_mr_command_plist_t *cmd) {
+  if (!out || !cmd || !cmd->fourcc) {
     return 0;
   }
-
-  return pos;
+  bpw_t w;
+  bpw_init(&w, out, capacity);
+  bpw_dict_t top = {.count = 0};
+  bpw_entry(&w, &top, bpw_string(&w, "type"),
+            bpw_string(&w, "sendMediaRemoteCommand"));
+  bpw_entry(&w, &top, bpw_string(&w, "value"), bpw_string(&w, cmd->fourcc));
+  if (cmd->mr_command >= 0) {
+    // A decimal string: the sender reads it with TextToInt32.
+    char number[12];
+    snprintf(number, sizeof(number), "%d", cmd->mr_command);
+    bpw_entry(&w, &top, bpw_string(&w, "modernMediaRemoteCommand"),
+              bpw_string(&w, number));
+  }
+  if (cmd->has_volume) {
+    // dvlc: the options are merged into the top level and also sent as
+    // params, as Apple's receiver does.
+    const uint8_t volume_key = bpw_string(&w, "volume");
+    const uint8_t volume = bpw_real(&w, cmd->volume);
+    const uint8_t muted_key = bpw_string(&w, "isMuted");
+    const uint8_t muted = bpw_bool(&w, cmd->is_muted);
+    bpw_dict_t params = {.count = 0};
+    bpw_entry(&w, &params, volume_key, volume);
+    bpw_entry(&w, &params, muted_key, muted);
+    bpw_entry(&w, &top, volume_key, volume);
+    bpw_entry(&w, &top, muted_key, muted);
+    bpw_entry(&w, &top, bpw_string(&w, "params"),
+              bpw_dict(&w, params.keys, params.values, params.count));
+  }
+  const uint8_t root = bpw_dict(&w, top.keys, top.values, top.count);
+  return bpw_finish(&w, root);
 }
 
 size_t bplist_build_session_setup(uint8_t *out, size_t capacity,

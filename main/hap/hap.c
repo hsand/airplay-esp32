@@ -99,6 +99,22 @@ hap_session_t *hap_session_create(void) {
   return session;
 }
 
+void hap_session_reset_pairing(hap_session_t *session) {
+  if (!session) {
+    return;
+  }
+  if (session->srp) {
+    srp_session_free(session->srp);
+    session->srp = NULL;
+  }
+  session->pair_verify_state = 0;
+  session->pair_setup_state = 0;
+  session->pair_setup_transient = false;
+  sodium_memzero(session->client_public_key,
+                 sizeof(session->client_public_key));
+  crypto_box_keypair(session->session_public_key, session->session_secret_key);
+}
+
 void hap_session_free(hap_session_t *session) {
   if (!session) {
     return;
@@ -114,6 +130,7 @@ void hap_session_free(hap_session_t *session) {
   sodium_memzero(session->session_secret_key,
                  sizeof(session->session_secret_key));
   sodium_memzero(session->shared_secret, sizeof(session->shared_secret));
+  sodium_memzero(session->ikm, sizeof(session->ikm));
   sodium_memzero(session->encrypt_key, sizeof(session->encrypt_key));
   sodium_memzero(session->decrypt_key, sizeof(session->decrypt_key));
   free(session);

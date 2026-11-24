@@ -21,7 +21,19 @@
 <option value='0'>Multi-room (v2)</option>
 <option value='1'>Legacy (v1)</option>
 </select></div>
-<p class='hint'>Some software only works with AirPlay v1. Apple devices still work in that mode, but without v2 features such as multi-speaker sync. The volume and track buttons on the speaker need v1. Takes effect after a restart.</p></div>
+<p class='hint'>Some software only works with AirPlay v1. Apple devices still work in that mode, but without v2 features such as multi-speaker sync. Takes effect after a restart.</p></div>
+<div class='form-group' id='airplay-model-box'><label for='airplay-model'>Appears to Apple devices as</label>
+<div class='row'><select id='airplay-model' onchange='saveAirplayModel()'>
+<option value='homepod'>HomePod mini</option>
+<option value='generic'>Generic AirPlay speaker</option>
+</select></div>
+<p class='hint'>HomePod mini is what this speaker has always claimed to be. Generic is the honest answer, and avoids iPhone features made for real HomePods; if your iPhone then asks for a PIN to connect, switch back. Takes effect after a restart.</p></div>
+<div class='form-group' id='airplay-deny-box'><label for='airplay-deny'>When another device plays</label>
+<div class='row'><select id='airplay-deny' onchange='saveAirplayDeny()'>
+<option value='0'>Take over (last one wins)</option>
+<option value='1'>Refuse while playing</option>
+</select></div>
+<p class='hint'>What happens when a second phone picks this speaker while another is playing. Applies at once.</p></div>
 <div id='sendspin-box' hidden>
 <div class='form-group'><label for='sendspin-enable'>Sendspin</label>
 <div class='row'><select id='sendspin-enable' onchange='saveSendspin()'>
@@ -304,6 +316,21 @@ async function saveAirplayMode(){
     airplayV1=v1;Shell.tick(sel,true);Shell.refresh();}
   catch(e){sel.value=airplayV1?'1':'0';Shell.tick(sel,false,e.message);}
 }
+var airplayModel='homepod',airplayDeny=false;
+async function saveAirplayModel(){
+  var sel=$('airplay-model'),m=sel.value;
+  try{var d=await Shell.post('/api/airplay/mode',{model:m});
+    if(!d.success)throw new Error(d.error);
+    airplayModel=m;Shell.tick(sel,true);Shell.refresh();}
+  catch(e){sel.value=airplayModel;Shell.tick(sel,false,e.message);}
+}
+async function saveAirplayDeny(){
+  var sel=$('airplay-deny'),deny=sel.value==='1';
+  try{var d=await Shell.post('/api/airplay/mode',{deny_interruptions:deny});
+    if(!d.success)throw new Error(d.error);
+    airplayDeny=deny;Shell.tick(sel,true);}
+  catch(e){sel.value=airplayDeny?'1':'0';Shell.tick(sel,false,e.message);}
+}
 async function saveSendspin(){
   var sel=$('sendspin-enable'),en=sel.value==='1';
   try{var d=await Shell.post('/api/sendspin/mode',{enabled:en});
@@ -343,7 +370,11 @@ async function resetIdentity(){
 Shell.info().then(async function(i){
   $('dev-name').placeholder=i.device_name||'';
   try{var d=await Shell.get('/api/airplay/mode');
-    airplayV1=!!d.v1;$('airplay-mode').value=d.v1?'1':'0';}
+    airplayV1=!!d.v1;$('airplay-mode').value=d.v1?'1':'0';
+    /* Older firmware has neither key. */
+    if(d.model){airplayModel=d.model;$('airplay-model').value=d.model;}
+    else $('airplay-model-box').hidden=$('airplay-deny-box').hidden=true;
+    airplayDeny=!!d.deny_interruptions;$('airplay-deny').value=airplayDeny?'1':'0';}
   catch(e){console.warn('Could not load the AirPlay mode',e);}
   /* Only a Sendspin build registers /api/sendspin/mode. */
   if(i.sendspin_supported){

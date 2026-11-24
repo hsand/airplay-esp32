@@ -4,8 +4,10 @@
 /**
  * DACP client — sends control commands to AirPlay source device.
  *
- * Works with both AirPlay 1 and AirPlay 2. The client's DACP service
- * is discovered via mDNS using the DACP-ID from the RTSP handshake.
+ * Used for AirPlay 1 and for AirPlay 2 senders older than 354.54.6 (newer
+ * ones get MediaRemote commands on the event channel instead and never send
+ * DACP headers).  The sender's DACP service is resolved by its exact mDNS
+ * instance name, iTunes_Ctrl_<DACP-ID>.
  * Commands are fire-and-forget HTTP GETs dispatched on a dedicated
  * worker task so callers (button task) never block on network I/O.
  *
@@ -25,135 +27,140 @@
 #include "freertos/semphr.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
 static const char *TAG = "dacp";
 
-#define DACP_ID_MAX         32
-#define ACTIVE_REMOTE_MAX   32
-#define MDNS_TIMEOUT_MS     1500
-#define MDNS_RETRY_COUNT    1
-#define MDNS_RETRY_DELAY_MS 500
-#define CMD_PATH_MAX        80
-#define CMD_QUEUE_LEN       4
-#define HTTP_TIMEOUT_MS     800
-#define WORKER_STACK        4096
+#define DACP_ID_MAX       32
+#define ACTIVE_REMOTE_MAX 32
+// Apple's receiver resolves the sender's DACP service, and connects to it,
+// with a 5 s timeout each.  A phone that has just woken its Wi-Fi can take
+// most of that to answer.
+#define RESOLVE_TIMEOUT_MS 5000
+#define PROBE_TIMEOUT_MS   2000
+#define CMD_PATH_MAX       80
+#define CMD_QUEUE_LEN      4
+#define HTTP_TIMEOUT_MS    5000
+#define WORKER_STACK       4096
 
 static SemaphoreHandle_t s_mutex;
 static bool s_initialized;
 static char s_dacp_id[DACP_ID_MAX];
 static char s_active_remote[ACTIVE_REMOTE_MAX];
 static uint32_t s_client_ip;
-static uint16_t s_dacp_port; // Discovered via mDNS
+// From the last successful resolve; 0 means resolve before the next command.
+// Never a "discovery failed" latch: every command that finds it 0 tries
+// again, and any HTTP or connect failure clears it.
+static uint16_t s_dacp_port;
 static bool s_session_valid;
-static bool
-    s_discovery_failed; // True if mDNS discovery failed for this session
 static QueueHandle_t s_cmd_queue;
 static TaskHandle_t s_worker_handle;
 
-// Special sentinel posted to the command queue to trigger mDNS discovery
-// on the worker task (avoids spawning a new task per session).
+// Special sentinel posted to the command queue to resolve ahead of the first
+// button press, on the worker task (no extra task per session).
 static const char CMD_DISCOVER[] = "\x01";
 
-// Discover the DACP port via mDNS. Called WITHOUT the mutex held since
-// mDNS queries can block for several seconds. Copies the DACP-ID under
-// the lock, performs discovery lock-free, then stores the result.
-static void discover_dacp_port(void) {
-  char dacp_id_local[DACP_ID_MAX];
-
-  xSemaphoreTake(s_mutex, portMAX_DELAY);
-  // Skip if port is already known or discovery already failed
-  if (s_dacp_port != 0 || s_discovery_failed) {
-    xSemaphoreGive(s_mutex);
-    return;
+// The service instance a sender advertises: "iTunes_Ctrl_" and the DACP-ID as
+// 16 upper-case hex digits, which is how Apple's receiver names it (the
+// header is parsed as a 64-bit hex number and printed with %016llX).
+static bool instance_name(const char *dacp_id, char *out, size_t size) {
+  char *end = NULL;
+  const unsigned long long id = strtoull(dacp_id, &end, 16);
+  if (!end || end == dacp_id || *end != '\0') {
+    return false;
   }
-  strlcpy(dacp_id_local, s_dacp_id, sizeof(dacp_id_local));
-  xSemaphoreGive(s_mutex);
+  snprintf(out, size, "iTunes_Ctrl_%016llX", id);
+  return true;
+}
 
-  if (dacp_id_local[0] == '\0') {
-    return;
+// Resolve the session's DACP service to a port: the exact instance by SRV
+// query, as Apple does, then a browse matched on the full instance name for a
+// responder that ignores direct queries.  Without the mutex: it blocks.
+static uint16_t resolve_port(const char *dacp_id, uint32_t timeout_ms) {
+  char instance[48];
+  if (!instance_name(dacp_id, instance, sizeof(instance))) {
+    ESP_LOGW(TAG, "DACP-ID '%s' is not a hex number", dacp_id);
+    return 0;
   }
-
-  uint16_t found_port = 0;
-
-  for (int attempt = 0; attempt < MDNS_RETRY_COUNT && found_port == 0;
-       attempt++) {
-    if (attempt > 0) {
-      vTaskDelay(pdMS_TO_TICKS(MDNS_RETRY_DELAY_MS));
-      ESP_LOGI(TAG, "DACP mDNS retry %d/%d", attempt + 1, MDNS_RETRY_COUNT);
-    }
-
-    // Query mDNS for _dacp._tcp services
-    mdns_result_t *results = NULL;
-    esp_err_t err =
-        mdns_query_ptr("_dacp", "_tcp", MDNS_TIMEOUT_MS, 8, &results);
-    if (err != ESP_OK || !results) {
-      ESP_LOGW(TAG, "mDNS DACP query failed or no results (err=%s)",
-               esp_err_to_name(err));
-      continue;
-    }
-
-    // Find the result matching our DACP-ID.
-    // iOS advertises as "iTunes_Ctrl_<DACPID>" or just "<DACPID>".
-    for (mdns_result_t *r = results; r; r = r->next) {
-      ESP_LOGI(TAG, "mDNS DACP service: instance='%s' port=%u",
-               r->instance_name ? r->instance_name : "(null)", r->port);
-      if (!r->instance_name || r->port == 0) {
-        continue;
-      }
-      // Match: exact, or instance contains the DACP-ID as a substring
-      if (strcasecmp(r->instance_name, dacp_id_local) == 0 ||
-          strcasestr(r->instance_name, dacp_id_local) != NULL) {
-        found_port = r->port;
-        ESP_LOGI(TAG, "Matched DACP service: '%s' port %u", r->instance_name,
-                 found_port);
-        break;
+  uint16_t port = 0;
+  mdns_result_t *results = NULL;
+  if (mdns_query_srv(instance, "_dacp", "_tcp", timeout_ms, &results) ==
+          ESP_OK &&
+      results) {
+    port = results->port;
+    mdns_query_results_free(results);
+    results = NULL;
+  }
+  if (port == 0 && mdns_query_ptr("_dacp", "_tcp", PROBE_TIMEOUT_MS, 8,
+                                  &results) == ESP_OK) {
+    for (mdns_result_t *r = results; r && port == 0; r = r->next) {
+      if (r->instance_name && r->port != 0 &&
+          strcasecmp(r->instance_name, instance) == 0) {
+        port = r->port;
       }
     }
-
+  }
+  if (results) {
     mdns_query_results_free(results);
   }
+  if (port != 0) {
+    ESP_LOGI(TAG, "Resolved %s._dacp._tcp: port %u", instance, port);
+  } else {
+    ESP_LOGW(TAG, "%s._dacp._tcp did not resolve", instance);
+  }
+  return port;
+}
 
-  // Store discovered port under the lock
+// Resolve if the port is not known.  Worker task only.
+static uint16_t ensure_port(void) {
+  char dacp_id_local[DACP_ID_MAX];
   xSemaphoreTake(s_mutex, portMAX_DELAY);
-  s_dacp_port = found_port;
-  if (found_port == 0) {
-    s_discovery_failed = true;
+  uint16_t port = s_dacp_port;
+  strlcpy(dacp_id_local, s_dacp_id, sizeof(dacp_id_local));
+  const bool valid = s_session_valid;
+  xSemaphoreGive(s_mutex);
+  if (port != 0 || !valid || dacp_id_local[0] == '\0') {
+    return port;
+  }
+
+  port = resolve_port(dacp_id_local, RESOLVE_TIMEOUT_MS);
+
+  xSemaphoreTake(s_mutex, portMAX_DELAY);
+  // Only if the session is still the one resolved for.
+  if (s_session_valid && strcmp(s_dacp_id, dacp_id_local) == 0) {
+    s_dacp_port = port;
+  } else {
+    port = 0;
   }
   xSemaphoreGive(s_mutex);
-
-  if (found_port == 0) {
-    ESP_LOGW(TAG, "DACP service not found for ID '%s' after %d attempts",
-             dacp_id_local, MDNS_RETRY_COUNT);
-  }
+  return port;
 }
 
 // Execute a DACP HTTP request synchronously. Only called from the worker task.
 static void execute_dacp_request(const char *path) {
+  // Waits for the resolve rather than dropping the command, as Apple's
+  // receiver does: the press that finds no port is the one that resolves.
+  const uint16_t port_copy = ensure_port();
+
   if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
     ESP_LOGW(TAG, "DACP mutex timeout for '%s'", path);
     return;
   }
-
   if (!s_session_valid || s_active_remote[0] == '\0') {
     xSemaphoreGive(s_mutex);
     ESP_LOGD(TAG, "DACP: no active session, skipping '%s'", path);
     return;
   }
-
   // Copy session state under the lock, then release before any I/O
   char active_remote_copy[ACTIVE_REMOTE_MAX];
   uint32_t client_ip_copy = s_client_ip;
-  uint16_t port_copy = s_dacp_port;
   strlcpy(active_remote_copy, s_active_remote, sizeof(active_remote_copy));
-
   xSemaphoreGive(s_mutex);
 
-  // If port not yet discovered, skip — the eager discovery task will
-  // populate it. Never block the worker on mDNS.
   if (port_copy == 0) {
-    ESP_LOGD(TAG, "DACP: port not ready, skipping '%s'", path);
+    ESP_LOGW(TAG, "DACP: sender's remote not found, '%s' not sent", path);
     return;
   }
 
@@ -163,7 +170,6 @@ static void execute_dacp_request(const char *path) {
   snprintf(url, sizeof(url), "http://%u.%u.%u.%u:%u/ctrl-int/1/%s", ip[0],
            ip[1], ip[2], ip[3], port_copy, path);
 
-  // Fire-and-forget HTTP GET
   esp_http_client_config_t config = {
       .url = url,
       .timeout_ms = HTTP_TIMEOUT_MS,
@@ -182,7 +188,7 @@ static void execute_dacp_request(const char *path) {
   esp_err_t err = esp_http_client_perform(client);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "DACP request failed: %s (%s)", path, esp_err_to_name(err));
-    // Connection failed — invalidate port so next command re-discovers
+    // The sender's remote moved or went away: resolve again next time.
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_dacp_port = 0;
     xSemaphoreGive(s_mutex);
@@ -198,15 +204,14 @@ static void execute_dacp_request(const char *path) {
 }
 
 // Worker task: drains the command queue and executes HTTP requests.
-// A sentinel command (CMD_DISCOVER) triggers mDNS discovery inline,
-// serialising discovery with HTTP commands and avoiding extra tasks.
+// A sentinel command (CMD_DISCOVER) resolves the port ahead of time.
 static void dacp_worker_task(void *pvParameters) {
   (void)pvParameters;
   char path[CMD_PATH_MAX];
   while (1) {
     if (xQueueReceive(s_cmd_queue, path, portMAX_DELAY) == pdTRUE) {
       if (path[0] == CMD_DISCOVER[0]) {
-        discover_dacp_port();
+        (void)ensure_port();
       } else {
         execute_dacp_request(path);
       }
@@ -223,7 +228,7 @@ static void send_dacp_request(const char *path) {
   strlcpy(buf, path, sizeof(buf));
   // Non-blocking: drop if queue is full (better than blocking caller)
   if (xQueueSend(s_cmd_queue, buf, 0) != pdTRUE) {
-    ESP_LOGD(TAG, "DACP queue full, dropping '%s'", path);
+    ESP_LOGW(TAG, "DACP queue full, dropping '%s'", path);
   }
 }
 
@@ -265,7 +270,6 @@ void dacp_set_session(const char *dacp_id, const char *active_remote,
   strlcpy(s_active_remote, remote, sizeof(s_active_remote));
   s_client_ip = client_ip;
   s_dacp_port = 0;
-  s_discovery_failed = false;
   s_session_valid = (s_dacp_id[0] != '\0' && s_active_remote[0] != '\0');
   bool valid = s_session_valid;
 
@@ -291,10 +295,15 @@ void dacp_clear_session(void) {
   s_active_remote[0] = '\0';
   s_dacp_port = 0;
   s_session_valid = false;
-  s_discovery_failed = false;
   xSemaphoreGive(s_mutex);
 
   ESP_LOGD(TAG, "DACP session cleared");
+}
+
+void dacp_send_command(const char *command) {
+  if (command && command[0]) {
+    send_dacp_request(command);
+  }
 }
 
 void dacp_send_playpause(void) {
@@ -358,22 +367,5 @@ bool dacp_probe_service(void) {
   strlcpy(dacp_id_copy, s_dacp_id, sizeof(dacp_id_copy));
   xSemaphoreGive(s_mutex);
 
-  mdns_result_t *results = NULL;
-  esp_err_t err = mdns_query_ptr("_dacp", "_tcp", 2000, 8, &results);
-  if (err != ESP_OK || !results) {
-    return false;
-  }
-
-  bool found = false;
-  for (mdns_result_t *r = results; r; r = r->next) {
-    if (r->instance_name &&
-        (strcasecmp(r->instance_name, dacp_id_copy) == 0 ||
-         strcasestr(r->instance_name, dacp_id_copy) != NULL)) {
-      found = true;
-      break;
-    }
-  }
-
-  mdns_query_results_free(results);
-  return found;
+  return resolve_port(dacp_id_copy, PROBE_TIMEOUT_MS) != 0;
 }

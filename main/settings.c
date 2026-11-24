@@ -39,6 +39,8 @@ static const char *TAG = "settings";
 #define NVS_KEY_AIRPLAY_V1     "ap_v1"
 #define NVS_KEY_CH_TRIM        "ch_trim"
 #define NVS_KEY_SENDSPIN       "ss_en"
+#define NVS_KEY_AIRPLAY_MODEL  "ap_model"
+#define NVS_KEY_AIRPLAY_DENY   "ap_deny_int"
 
 #define MAX_WIFI_SSID_LEN     32
 #define MAX_WIFI_PASSWORD_LEN 64
@@ -58,6 +60,9 @@ static bool g_bt_volume_loaded = false;
 
 static bool g_airplay_v1;
 static bool g_airplay_v1_configured;
+static int g_airplay_model;
+static int g_airplay_model_configured;
+static bool g_airplay_deny_interruptions;
 
 #ifdef CONFIG_SENDSPIN_ENABLE
 static bool g_sendspin_enabled;
@@ -84,6 +89,17 @@ esp_err_t settings_init(void) {
                g_airplay_v1 ? "v1 (classic RAOP)" : "v2");
     }
 
+    uint8_t model;
+    if (nvs_get_u8(nvs, NVS_KEY_AIRPLAY_MODEL, &model) == ESP_OK &&
+        model < SETTINGS_AIRPLAY_MODEL_COUNT) {
+      g_airplay_model = model;
+      ESP_LOGI(TAG, "Loaded AirPlay model: %d", g_airplay_model);
+    }
+    uint8_t deny;
+    if (nvs_get_u8(nvs, NVS_KEY_AIRPLAY_DENY, &deny) == ESP_OK) {
+      g_airplay_deny_interruptions = deny != 0;
+    }
+
 #ifdef CONFIG_SENDSPIN_ENABLE
     uint8_t sendspin;
     if (nvs_get_u8(nvs, NVS_KEY_SENDSPIN, &sendspin) == ESP_OK) {
@@ -97,6 +113,7 @@ esp_err_t settings_init(void) {
   }
 
   g_airplay_v1_configured = g_airplay_v1;
+  g_airplay_model_configured = g_airplay_model;
 #ifdef CONFIG_SENDSPIN_ENABLE
   g_sendspin_enabled_configured = g_sendspin_enabled;
 #endif
@@ -1078,6 +1095,62 @@ esp_err_t settings_set_airplay_v1(bool v1) {
     ESP_LOGI(TAG, "Saved AirPlay mode: %s", v1 ? "v1 (classic RAOP)" : "v2");
   } else {
     ESP_LOGE(TAG, "Failed to save AirPlay mode: %s", esp_err_to_name(err));
+  }
+  return err;
+}
+
+static esp_err_t save_u8(const char *key, uint8_t value) {
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to open NVS: %s", esp_err_to_name(err));
+    return err;
+  }
+  err = nvs_set_u8(nvs, key, value);
+  if (err == ESP_OK) {
+    err = nvs_commit(nvs);
+  }
+  nvs_close(nvs);
+  return err;
+}
+
+int settings_airplay_model(void) {
+  return g_airplay_model;
+}
+
+int settings_airplay_model_configured(void) {
+  return g_airplay_model_configured;
+}
+
+esp_err_t settings_set_airplay_model(int model) {
+  if (model < 0 || model >= SETTINGS_AIRPLAY_MODEL_COUNT) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  const esp_err_t err = save_u8(NVS_KEY_AIRPLAY_MODEL, (uint8_t)model);
+  if (err == ESP_OK) {
+    // Not applied to g_airplay_model: the TXT records are built at startup,
+    // and /info must keep agreeing with them until the restart.
+    g_airplay_model_configured = model;
+    ESP_LOGI(TAG, "Saved AirPlay model: %d", model);
+  } else {
+    ESP_LOGE(TAG, "Failed to save AirPlay model: %s", esp_err_to_name(err));
+  }
+  return err;
+}
+
+bool settings_airplay_deny_interruptions(void) {
+  return g_airplay_deny_interruptions;
+}
+
+esp_err_t settings_set_airplay_deny_interruptions(bool deny) {
+  const esp_err_t err = save_u8(NVS_KEY_AIRPLAY_DENY, deny ? 1 : 0);
+  if (err == ESP_OK) {
+    g_airplay_deny_interruptions = deny;
+    ESP_LOGI(TAG, "Saved AirPlay interruptions: %s",
+             deny ? "denied" : "allowed");
+  } else {
+    ESP_LOGE(TAG, "Failed to save AirPlay interruptions: %s",
+             esp_err_to_name(err));
   }
   return err;
 }

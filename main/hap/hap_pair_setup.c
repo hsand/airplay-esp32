@@ -40,6 +40,10 @@ esp_err_t hap_pair_setup_m1(hap_session_t *session, const uint8_t *input,
     return ESP_ERR_INVALID_ARG;
   }
 
+  // Every M1 starts clean: a retry after a failure must not inherit the
+  // previous attempt's SRP state or ephemeral key.
+  hap_session_reset_pairing(session);
+
   bool transient = false;
   if (flags && flags_len == 1) {
     transient = (flags[0] & 0x10) != 0;
@@ -114,6 +118,7 @@ esp_err_t hap_pair_setup_m3(hap_session_t *session, const uint8_t *input,
                                     client_proof, proof_len);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Client verification failed");
+    hap_session_reset_pairing(session);
     tlv8_encoder_t enc;
     tlv8_encoder_init(&enc, output, output_capacity);
     tlv8_encode_byte(&enc, TLV_TYPE_STATE, PAIR_SETUP_M4);
@@ -131,6 +136,11 @@ esp_err_t hap_pair_setup_m3(hap_session_t *session, const uint8_t *input,
     }
 
     memcpy(session->shared_secret, srp_key, 32);
+    // The whole of K, not the 32 bytes above: the Events and DataStream keys
+    // are derived from it exactly as the Control keys below are.
+    session->ikm_len =
+        srp_key_len < sizeof(session->ikm) ? srp_key_len : sizeof(session->ikm);
+    memcpy(session->ikm, srp_key, session->ikm_len);
     hap_hkdf_sha512((uint8_t *)"Control-Salt", 12, srp_key, srp_key_len,
                     (uint8_t *)"Control-Read-Encryption-Key", 27,
                     session->encrypt_key, 32);

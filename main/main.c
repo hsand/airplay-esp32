@@ -137,6 +137,10 @@ static void stop_airplay_services(void) {
 
   ESP_LOGI(TAG, "Stopping AirPlay services...");
 
+  // Another input is taking the output.  As Apple's receiver does on an
+  // audio interruption, tell an AirPlay 2 sender to pause, so the phone stops
+  // rather than playing on into a speaker that no longer listens.
+  airplay_remote_interrupted();
   rtsp_server_stop();
   audio_output_stop();
 

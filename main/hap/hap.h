@@ -20,6 +20,7 @@
 #define HAP_CHACHA20_KEY_SIZE       32
 #define HAP_CHACHA20_NONCE_SIZE     12
 #define HAP_POLY1305_TAG_SIZE       16
+#define HAP_IKM_MAX                 64
 
 // Forward declaration
 struct srp_session;
@@ -39,6 +40,13 @@ typedef struct {
 
   // Shared secret from X25519
   uint8_t shared_secret[HAP_X25519_KEY_SIZE];
+
+  // The input keying material every channel key is derived from (Control-,
+  // Events-, DataStream-Salt): the X25519 secret after pair-verify, the full
+  // 64-byte SRP session key K after transient pair-setup.  ikm_len is 0 until
+  // a pairing completes.
+  uint8_t ikm[HAP_IKM_MAX];
+  size_t ikm_len;
 
   // Derived session keys
   uint8_t encrypt_key[HAP_CHACHA20_KEY_SIZE];
@@ -78,6 +86,14 @@ hap_session_t *hap_session_create(void);
  * Free a HAP session
  */
 void hap_session_free(hap_session_t *session);
+
+/**
+ * Forget a pairing in progress, as Apple resets its pairing session after any
+ * error and before every new M1: no setup or verify state, no SRP session,
+ * and a fresh ephemeral X25519 key.  The keys of an established session are
+ * left alone, so an encrypted connection keeps working.
+ */
+void hap_session_reset_pairing(hap_session_t *session);
 
 /**
  * Handle pair-verify M1 message from client

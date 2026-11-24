@@ -1464,3 +1464,58 @@ bool bplist_collect_ipv4(const uint8_t *plist, size_t plist_len,
   *count = w.count;
   return true;
 }
+
+// The value reference for `key` in the dict at object `index`, using the
+// bounds-checked walk helpers above.
+static bool walk_dict_lookup(const ipv4_walk_t *w, uint64_t index,
+                             const char *key, uint64_t *value_index) {
+  uint64_t offset = 0;
+  if (!walk_object_offset(w, index, &offset) ||
+      (w->plist[offset] & 0xF0) != BPLIST_DICT) {
+    return false;
+  }
+  size_t n = 0;
+  size_t header = 0;
+  if (!bplist_parse_count(w->plist, w->len, offset, &n, &header) ||
+      n > w->num_objects ||
+      (size_t)offset + header + 2U * n * w->ref_size > w->len) {
+    return false;
+  }
+  const uint8_t *keys = w->plist + offset + header;
+  const uint8_t *values = keys + n * w->ref_size;
+  for (size_t i = 0; i < n; i++) {
+    uint64_t key_offset = 0;
+    char name[64];
+    if (walk_object_offset(w, read_be_int(keys + i * w->ref_size, w->ref_size),
+                           &key_offset) &&
+        bplist_read_string(w->plist, w->len, key_offset, name, sizeof(name)) &&
+        strcmp(name, key) == 0) {
+      *value_index = read_be_int(values + i * w->ref_size, w->ref_size);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool bplist_find_nested_int(const uint8_t *plist, size_t plist_len,
+                            const char *dict_key, const char *key,
+                            int64_t *out_value) {
+  if (!plist || !dict_key || !key || !out_value || plist_len < 40 ||
+      memcmp(plist, "bplist00", 8) != 0) {
+    return false;
+  }
+  ipv4_walk_t w = {.plist = plist, .len = plist_len};
+  uint64_t top_object = 0;
+  if (!bplist_parse_trailer(plist, plist_len, &w.offset_size, &w.ref_size,
+                            &w.num_objects, &top_object,
+                            &w.offset_table_offset)) {
+    return false;
+  }
+  uint64_t inner = 0;
+  uint64_t value = 0;
+  uint64_t offset = 0;
+  return walk_dict_lookup(&w, top_object, dict_key, &inner) &&
+         walk_dict_lookup(&w, inner, key, &value) &&
+         walk_object_offset(&w, value, &offset) &&
+         bplist_read_int(plist, plist_len, offset, out_value);
+}

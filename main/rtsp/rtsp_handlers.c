@@ -32,8 +32,12 @@
 #include "ptp_clock.h"
 #include "plist.h"
 #include "rtsp_anchor.h"
+#include "rtsp_events.h"
 #include "rtsp_fairplay.h"
+#include "rtsp_metadata.h"
+#include "rtsp_policy.h"
 #include "rtsp_rsa.h"
+#include "rtsp_server.h"
 #include "settings.h"
 #include "socket_utils.h"
 #include "tlv8.h"
@@ -43,8 +47,18 @@
 
 static const char *TAG = "rtsp_handlers";
 
+#ifdef CONFIG_ENABLE_AIRPLAY_ARTWORK
+#define AIRPLAY_ARTWORK true
+#else
+#define AIRPLAY_ARTWORK false
+#endif
+
 uint64_t airplay_features(void) {
-  return settings_airplay_v1() ? UINT64_C(0x5C4A00) : UINT64_C(0x1C340405C4A00);
+  return airplay_features_compute(settings_airplay_v1(), AIRPLAY_ARTWORK);
+}
+
+const char *airplay_model(void) {
+  return airplay_model_string((airplay_model_t)settings_airplay_model());
 }
 
 // ============================================================================
@@ -88,9 +102,6 @@ bool rtsp_codec_configure(int64_t type_id, audio_format_t *fmt,
   return false;
 }
 
-// Event port task state
-#define EVENT_STACK_SIZE 3072
-
 // Default playout latency for realtime (type 96) streams when SETUP does not
 // carry a usable latencyMin: 11025 samples = 250 ms at 44.1 kHz.  This is the
 // standard AirPlay realtime-stream minimum latency; senders transmit audio
@@ -112,16 +123,18 @@ bool rtsp_codec_configure(int64_t type_id, audio_format_t *fmt,
 
 // Timing peers taken from one SETUP or SETPEERS.
 #define AIRPLAY_MAX_TIMING_PEERS 16
-static int event_client_socket = -1;
-static int event_listen_socket = -1;
-static TaskHandle_t event_task_handle = NULL;
-static volatile bool event_task_should_stop = false;
 
 void rtsp_get_device_id(char *device_id, size_t len) {
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_WIFI_STA);
   snprintf(device_id, len, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1],
            mac[2], mac[3], mac[4], mac[5]);
+}
+
+void airplay_get_pairing_identity(char out[37]) {
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  airplay_pairing_identity(mac, out);
 }
 
 static int rtsp_create_udp_socket(uint16_t *port) {
@@ -284,150 +297,6 @@ static void log_timing_peers(const char *what, const uint32_t *peers,
   ESP_LOGI(TAG, "%s: %u timing peer(s) %s", what, (unsigned)count, list);
 }
 
-// Event port task - handles AirPlay 2 session persistence
-static void event_port_task(void *pvParameters) {
-  int listen_socket = (int)(intptr_t)pvParameters;
-  event_listen_socket = listen_socket;
-
-  while (!event_task_should_stop && listen_socket >= 0) {
-    fd_set read_fds;
-    FD_ZERO(&read_fds);
-    FD_SET(listen_socket, &read_fds);
-
-    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
-    int ret = select(listen_socket + 1, &read_fds, NULL, NULL, &tv);
-
-    if (event_task_should_stop) {
-      break;
-    }
-
-    if (ret < 0) {
-      if (errno != EINTR && !event_task_should_stop) {
-        ESP_LOGE(TAG, "Event port select error: %d", errno);
-      }
-      break;
-    }
-
-    if (ret == 0) {
-      continue;
-    }
-
-    // Check stop flag after select unblocks (shutdown() makes socket readable)
-    if (event_task_should_stop) {
-      break;
-    }
-
-    if (FD_ISSET(listen_socket, &read_fds)) {
-      struct sockaddr_in client_addr;
-      socklen_t addr_len = sizeof(client_addr);
-      int client =
-          accept(listen_socket, (struct sockaddr *)&client_addr, &addr_len);
-      if (client < 0) {
-        if (!event_task_should_stop) {
-          ESP_LOGE(TAG, "Event port accept error: %d", errno);
-        }
-        break; // Don't continue - socket is likely invalid
-      }
-
-      if (event_client_socket >= 0) {
-        close(event_client_socket);
-      }
-      event_client_socket = client;
-      ESP_LOGI(TAG, "Event client connected");
-      playback_events_emit(PLAYBACK_SOURCE_AIRPLAY, PLAYBACK_EVENT_CONNECTED,
-                           NULL);
-
-      // Monitor connection for disconnection
-      while (event_client_socket >= 0 && !event_task_should_stop) {
-        fd_set cfds;
-        FD_ZERO(&cfds);
-        FD_SET(event_client_socket, &cfds);
-        struct timeval ctv = {.tv_sec = 1, .tv_usec = 0};
-
-        ret = select(event_client_socket + 1, &cfds, NULL, NULL, &ctv);
-        if (ret < 0) {
-          break;
-        }
-        // Check stop flag after select unblocks
-        if (event_task_should_stop) {
-          break;
-        }
-        if (ret > 0 && FD_ISSET(event_client_socket, &cfds)) {
-          char buf[16];
-          ssize_t n = recv(event_client_socket, buf, sizeof(buf), MSG_PEEK);
-          if (n <= 0) {
-            close(event_client_socket);
-            event_client_socket = -1;
-            break;
-          }
-        }
-      }
-    }
-  }
-
-  if (event_client_socket >= 0) {
-    close(event_client_socket);
-    event_client_socket = -1;
-  }
-  event_listen_socket = -1;
-  event_task_handle = NULL;
-  vTaskDelete(NULL);
-}
-
-static bool event_port_wait_for_task_stopped(int timeout_ticks) {
-  while (event_task_handle != NULL && timeout_ticks-- > 0) {
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
-  return event_task_handle == NULL;
-}
-
-esp_err_t rtsp_start_event_port_task(int listen_socket) {
-  if (event_task_handle != NULL) {
-    rtsp_stop_event_port_task();
-    if (!event_port_wait_for_task_stopped(20)) {
-      ESP_LOGE(TAG, "Previous event port task did not stop");
-      return ESP_ERR_INVALID_STATE;
-    }
-  }
-  event_task_should_stop = false;
-  event_listen_socket = -1;
-  event_task_handle = NULL;
-  BaseType_t ret =
-      xTaskCreate(event_port_task, "event_port", EVENT_STACK_SIZE,
-                  (void *)(intptr_t)listen_socket, 5, &event_task_handle);
-  if (ret != pdPASS) {
-    event_task_handle = NULL;
-    ESP_LOGE(TAG, "Failed to create event port task");
-    return ESP_FAIL;
-  }
-  return ESP_OK;
-}
-
-int rtsp_event_port_listen_socket(void) {
-  return event_listen_socket;
-}
-
-void rtsp_stop_event_port_task(void) {
-  if (event_task_handle == NULL) {
-    return;
-  }
-
-  // Signal task to stop
-  event_task_should_stop = true;
-
-  // Shutdown sockets to unblock select()
-  if (event_client_socket >= 0) {
-    shutdown(event_client_socket, SHUT_RDWR);
-  }
-  if (event_listen_socket >= 0) {
-    shutdown(event_listen_socket, SHUT_RDWR);
-  }
-
-  if (!event_port_wait_for_task_stopped(20)) {
-    ESP_LOGW(TAG, "Event port task did not exit within timeout");
-  }
-}
-
 // Forward declarations of handlers
 static void handle_options(int socket, rtsp_conn_t *conn,
                            const rtsp_request_t *req, const uint8_t *raw,
@@ -545,6 +414,74 @@ static bool request_uses_rtsp(const rtsp_request_t *req) {
   return req && strncasecmp(req->protocol, "RTSP/", 5) == 0;
 }
 
+// Methods that act on the session: before this connection's SETUP (AirPlay 1:
+// ANNOUNCE) Apple answers them 455, and a connection that is not the one
+// playing must not pause, flush or re-anchor the one that is.
+static bool method_needs_session(const char *method) {
+  static const char *const methods[] = {
+      "RECORD",   "SET_PARAMETER",    "GET_PARAMETER", "PAUSE",
+      "FLUSH",    "FLUSHBUFFERED",    "SETPEERS",      "SETPEERSX",
+      "TEARDOWN", "SETRATEANCHORTIME"};
+  for (size_t i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
+    if (strcasecmp(method, methods[i]) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool conn_verified(const rtsp_conn_t *conn) {
+  return conn->hap_session && conn->hap_session->session_established;
+}
+
+// Apple's verified-pairing gate ("Unverified RTSP request denied"), applied
+// where it can matter here: an AirPlay 2 SETUP, RECORD or SET_PARAMETER from a
+// connection that has not completed pairing.  AirPlay 1 (RSA, or none) never
+// pairs and is not gated, and neither is a transient pairing, which is
+// verified at pair-setup M4.
+static bool refuse_unverified(const rtsp_conn_t *conn,
+                              const rtsp_request_t *req) {
+  const bool setup = strcasecmp(req->method, "SETUP") == 0;
+  const bool gated = setup || strcasecmp(req->method, "RECORD") == 0 ||
+                     strcasecmp(req->method, "SET_PARAMETER") == 0;
+  if (!gated || conn_verified(conn)) {
+    return false;
+  }
+  return conn->protocol_version == 2 ||
+         (setup && strstr(req->content_type,
+                          "application/x-apple-binary-plist") != NULL);
+}
+
+// DACP-ID / Active-Remote, as Apple takes them: only from the connection
+// holding the session, from every request (last writer wins).  An AirPlay 2
+// sender at srcvers 377.40.00 never sends them; AirPlay 1 senders do.
+static void capture_dacp(rtsp_conn_t *conn, const uint8_t *raw,
+                         size_t raw_len) {
+  // parse_raw_header uses a static buffer — copy before calling again.
+  const char *val = parse_raw_header(raw, raw_len, "DACP-ID:");
+  if (val && strcmp(val, conn->dacp_id) != 0) {
+    strlcpy(conn->dacp_id, val, sizeof(conn->dacp_id));
+    ESP_LOGI(TAG, "DACP-ID: %s", conn->dacp_id);
+  }
+  val = parse_raw_header(raw, raw_len, "Active-Remote:");
+  if (val && strcmp(val, conn->active_remote) != 0) {
+    strlcpy(conn->active_remote, val, sizeof(conn->active_remote));
+    ESP_LOGI(TAG, "Active-Remote: %s", conn->active_remote);
+  }
+  if (conn->dacp_id[0] != '\0' && conn->active_remote[0] != '\0') {
+    dacp_set_session(conn->dacp_id, conn->active_remote, conn->client_ip);
+  }
+}
+
+static void send_status(int socket, rtsp_conn_t *conn,
+                        const rtsp_request_t *req, int code, const char *text) {
+  if (request_uses_rtsp(req)) {
+    rtsp_send_response(socket, conn, code, text, req->cseq, NULL, NULL, 0);
+  } else {
+    rtsp_send_http_response(socket, conn, code, text, "text/plain", NULL, 0);
+  }
+}
+
 int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
                   size_t raw_len) {
   rtsp_request_t req;
@@ -555,33 +492,24 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
 
   ESP_LOGD(TAG, "<- %s %s", req.method, req.path);
 
-  // Extract DACP headers if present (AirPlay 1 only — modern iOS AirPlay 2
-  // does not send these; it uses MRP for remote control instead).
-  // parse_raw_header uses a static buffer — copy before calling again.
-  if (conn->dacp_id[0] == '\0') {
-    const char *val = parse_raw_header(raw_request, raw_len, "DACP-ID:");
-    if (val) {
-      strlcpy(conn->dacp_id, val, sizeof(conn->dacp_id));
-      ESP_LOGI(TAG, "DACP-ID: %s (from %s)", conn->dacp_id, req.method);
-    }
+  if (refuse_unverified(conn, &req)) {
+    ESP_LOGW(TAG, "%s from an unpaired connection: 403", req.method);
+    send_status(socket, conn, &req, 403, "Forbidden");
+    return 0;
   }
-  if (conn->active_remote[0] == '\0') {
-    const char *val = parse_raw_header(raw_request, raw_len, "Active-Remote:");
-    if (val) {
-      strlcpy(conn->active_remote, val, sizeof(conn->active_remote));
-      ESP_LOGI(TAG, "Active-Remote: %s (from %s)", conn->active_remote,
-               req.method);
-    }
-  }
-  // Update DACP client session when both identifiers are available
-  if (conn->dacp_id[0] != '\0' && conn->active_remote[0] != '\0') {
-    dacp_set_session(conn->dacp_id, conn->active_remote, conn->client_ip);
+  if (method_needs_session(req.method) && !conn->owns_session) {
+    ESP_LOGW(TAG, "%s without a session on this connection: 455", req.method);
+    send_status(socket, conn, &req, 455, "Method Not Valid in This State");
+    return 0;
   }
 
   // Find handler in dispatch table
   for (const rtsp_method_handler_t *h = method_handlers; h->method; h++) {
     if (strcasecmp(req.method, h->method) == 0) {
       h->handler(socket, conn, &req, raw_request, raw_len);
+      if (conn->owns_session) {
+        capture_dacp(conn, raw_request, raw_len);
+      }
       return 0;
     }
   }
@@ -661,22 +589,46 @@ static void handle_get(int socket, rtsp_conn_t *conn, const rtsp_request_t *req,
   (void)raw_len;
 
   if (strcmp(req->path, "/info") == 0) {
-    // Build info response
     char device_id[18];
     char device_name[65];
-
+    char pi[37];
+    char features_ex[24];
     rtsp_get_device_id(device_id, sizeof(device_id));
     settings_get_device_name(device_name, sizeof(device_name));
-    const uint8_t *pk = hap_get_public_key();
-    uint64_t features = airplay_features();
-
-    int64_t protocol_version = settings_airplay_v1() ? 1 : 2;
+    airplay_get_pairing_identity(pi);
+    const uint64_t features = airplay_features();
+    if (!airplay_features_ex(features, features_ex, sizeof(features_ex))) {
+      features_ex[0] = '\0';
+    }
+    // The current level, which a sender adopts as its starting volume
+    // rather than pushing its own.
+    float volume_db = -30.0f;
+    (void)settings_get_volume(&volume_db);
+    if (volume_db < -30.0f) {
+      volume_db = -30.0f;
+    } else if (volume_db > 0.0f) {
+      volume_db = 0.0f;
+    }
+    const airplay_info_t info = {
+        .device_id = device_id,
+        .device_name = device_name,
+        .model = airplay_model(),
+        .pi = pi,
+        .source_version = AIRPLAY_SOURCE_VERSION,
+        .features_ex = features_ex,
+        .pk = hap_get_public_key(),
+        .pk_len = 32,
+        .features = features,
+        // Apple's 26.x receivers report vv 1.
+        .vv = 1,
+        .status_flags = 4,
+        .has_initial_volume = !settings_airplay_v1(),
+        .initial_volume_db = volume_db,
+    };
 
     if (request_uses_rtsp(req)) {
       static uint8_t body[1024];
-      size_t body_len =
-          bplist_build_info_response(body, sizeof(body), device_id, device_name,
-                                     pk, 32, features, protocol_version);
+      size_t body_len = bplist_build_info(body, sizeof(body), &info);
       if (body_len == 0) {
         ESP_LOGE(TAG, "Failed to build binary /info response");
         rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
@@ -696,16 +648,26 @@ static void handle_get(int socket, rtsp_conn_t *conn, const rtsp_request_t *req,
     plist_begin(&p);
     plist_dict_begin(&p);
 
-    plist_dict_string(&p, "deviceid", device_id);
-    plist_dict_uint(&p, "features", features);
-    plist_dict_string(&p, "model", "AudioAccessory5,1");
+    plist_dict_string(&p, "deviceid", info.device_id);
+    plist_dict_uint(&p, "features", info.features);
+    plist_dict_string(&p, "model", info.model);
     plist_dict_string(&p, "protovers", "1.1");
-    plist_dict_string(&p, "srcvers", "377.40.00");
-    plist_dict_int(&p, "vv", protocol_version);
-    plist_dict_int(&p, "statusFlags", 4);
-    plist_dict_data(&p, "pk", pk, 32);
-    plist_dict_string(&p, "pi", "00000000-0000-0000-0000-000000000000");
-    plist_dict_string(&p, "name", device_name);
+    plist_dict_string(&p, "srcvers", info.source_version);
+    plist_dict_int(&p, "vv", info.vv);
+    plist_dict_int(&p, "statusFlags", info.status_flags);
+    plist_dict_data(&p, "pk", info.pk, info.pk_len);
+    plist_dict_string(&p, "pi", info.pi);
+    plist_dict_string(&p, "name", info.device_name);
+    // The names Apple's receiver uses, which Apple's sender reads.
+    plist_dict_string(&p, "deviceID", info.device_id);
+    plist_dict_string(&p, "protocolVersion", "1.1");
+    plist_dict_string(&p, "sourceVersion", info.source_version);
+    if (info.features_ex[0]) {
+      plist_dict_string(&p, "featuresEx", info.features_ex);
+    }
+    if (info.has_initial_volume) {
+      plist_dict_real(&p, "initialVolume", info.initial_volume_db);
+    }
 
     // Audio formats array
     plist_dict_array_begin(&p, "audioFormats");
@@ -755,18 +717,242 @@ static void handle_get(int socket, rtsp_conn_t *conn, const rtsp_request_t *req,
   }
 }
 
+// A pairing step failed: answer with the next state and an error, as HAP
+// does, and start the next attempt from scratch.  Apple resets its pairing
+// session on any error, so a retried M1 on the same connection works.
+static void send_pairing_error(int socket, rtsp_conn_t *conn,
+                               const rtsp_request_t *req, uint8_t request_state,
+                               uint8_t error) {
+  hap_session_reset_pairing(conn->hap_session);
+  const uint8_t reply_state =
+      (request_state >= 1 && request_state <= 5) ? request_state + 1 : 2;
+  const uint8_t tlv[] = {TLV_TYPE_STATE, 1, reply_state,
+                         TLV_TYPE_ERROR, 1, error};
+  rtsp_send_response(socket, conn, 200, "OK", req->cseq,
+                     "Content-Type: application/octet-stream\r\n",
+                     (const char *)tlv, sizeof(tlv));
+}
+
+static uint8_t tlv_state(const uint8_t *body, size_t body_len) {
+  size_t state_len = 0;
+  const uint8_t *state =
+      body ? tlv8_find(body, body_len, TLV_TYPE_STATE, &state_len) : NULL;
+  return (state && state_len == 1) ? state[0] : 0;
+}
+
+static void handle_pair_setup(int socket, rtsp_conn_t *conn,
+                              const rtsp_request_t *req) {
+  const uint8_t *body = req->body;
+  const size_t body_len = req->body_len;
+  const uint8_t state = tlv_state(body, body_len);
+
+  if (state == 1 && conn->hkp >= 0 && conn->hkp != 4) {
+    // A PIN, system or HomeKit pair-setup: M5/M6 would need a stored
+    // controller list this receiver does not keep.  Refuse at M1 rather than
+    // half-run it.  A transient request goes ahead whatever the header says.
+    size_t flags_len = 0;
+    const uint8_t *flags = tlv8_find(body, body_len, 0x13, &flags_len);
+    if (!(flags && flags_len == 1 && (flags[0] & 0x10))) {
+      ESP_LOGW(TAG, "Pair-setup type %d is not supported (transient only)",
+               conn->hkp);
+      send_pairing_error(socket, conn, req, state, TLV_ERROR_UNAVAILABLE);
+      return;
+    }
+  }
+
+  uint8_t *response = malloc(2048);
+  if (!response) {
+    rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
+                       NULL, 0);
+    return;
+  }
+  size_t response_len = 0;
+  esp_err_t err = ESP_FAIL;
+  switch (state) {
+  case 1:
+    err = hap_pair_setup_m1(conn->hap_session, body, body_len, response, 2048,
+                            &response_len);
+    break;
+  case 3:
+    err = hap_pair_setup_m3(conn->hap_session, body, body_len, response, 2048,
+                            &response_len);
+    break;
+  case 5:
+    err = hap_pair_setup_m5(conn->hap_session, body, body_len, response, 2048,
+                            &response_len);
+    break;
+  default:
+    break;
+  }
+
+  if (err == ESP_OK && response_len > 0) {
+    rtsp_send_response(socket, conn, 200, "OK", req->cseq,
+                       "Content-Type: application/octet-stream\r\n",
+                       (const char *)response, response_len);
+    if (conn->hap_session->pair_setup_state == 4 &&
+        conn->hap_session->session_established) {
+      conn->encrypted_mode = true;
+    }
+  } else {
+    ESP_LOGE(TAG, "Pair-setup M%u failed: err=%d", state, err);
+    send_pairing_error(socket, conn, req, state, TLV_ERROR_AUTHENTICATION);
+  }
+  free(response);
+}
+
+static void handle_pair_verify(int socket, rtsp_conn_t *conn,
+                               const rtsp_request_t *req) {
+  const uint8_t *body = req->body;
+  const size_t body_len = req->body_len;
+  hap_session_t *hap = conn->hap_session;
+
+  uint8_t *response = malloc(1024);
+  if (!response) {
+    rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
+                       NULL, 0);
+    return;
+  }
+  size_t response_len = 0;
+  esp_err_t err = ESP_FAIL;
+  uint8_t state = tlv_state(body, body_len);
+
+  if (state == 1) {
+    err =
+        hap_pair_verify_m1(hap, body, body_len, response, 1024, &response_len);
+  } else if (state == 3) {
+    err =
+        hap_pair_verify_m3(hap, body, body_len, response, 1024, &response_len);
+    // TLV8 pair-verify M3 establishes RTSP channel encryption
+    if (err == ESP_OK && hap->pair_verify_state == PAIR_VERIFY_STATE_M4) {
+      conn->encrypted_mode = true;
+      ESP_LOGI(TAG, "RTSP encryption enabled (TLV8 pair-verify)");
+    }
+  } else if (body && body_len > 0) {
+    // Raw (legacy) pair-verify, for the audio keys; RTSP stays unencrypted.
+    // Its 4-byte header says which message it is: 1 starts a new verify, 0 is
+    // the M3 of the one in progress.  Going by the header rather than our
+    // state lets a sender retry M1 after a failure.
+    bool is_m1 = hap->pair_verify_state != PAIR_VERIFY_STATE_M2;
+    if (body_len >= 68) {
+      is_m1 = body[0] == 1;
+    }
+    state = is_m1 ? 1 : 3;
+    if (is_m1) {
+      err = hap_pair_verify_m1_raw(hap, body, body_len, response, 1024,
+                                   &response_len);
+    } else if (hap->pair_verify_state == PAIR_VERIFY_STATE_M2) {
+      err = hap_pair_verify_m3_raw(hap, body, body_len, response, 1024,
+                                   &response_len);
+      if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Raw pair-verify complete (RTSP unencrypted)");
+      }
+    }
+  }
+
+  // A raw M3 succeeds with an empty reply.
+  if (err == ESP_OK && (response_len > 0 || state == 3)) {
+    rtsp_send_response(socket, conn, 200, "OK", req->cseq,
+                       "Content-Type: application/octet-stream\r\n",
+                       (const char *)response, response_len);
+  } else {
+    ESP_LOGE(TAG, "Pair-verify M%u failed, err=%d", state, err);
+    send_pairing_error(socket, conn, req, state, TLV_ERROR_AUTHENTICATION);
+  }
+  free(response);
+}
+
+// POST /command from the sender, as Apple's receiver takes it: a bplist
+// {type: <string>, params: <dict>}.
+static void handle_command(int socket, rtsp_conn_t *conn,
+                           const rtsp_request_t *req, const uint8_t *raw,
+                           size_t raw_len) {
+  const uint8_t *body = req->body;
+  const size_t body_len = req->body_len;
+  char type[48] = "";
+  const bool is_plist =
+      body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0;
+  if (!is_plist ||
+      !bplist_find_string(body, body_len, "type", type, sizeof(type))) {
+    if (is_plist && parse_raw_header(raw, raw_len, "X-Apple-StreamID:")) {
+      // Data for a stream; nothing here consumes it.
+      rtsp_send_ok(socket, conn, req->cseq);
+      return;
+    }
+    ESP_LOGW(TAG, "/command without a type: 400");
+    rtsp_send_response(socket, conn, 400, "Bad Request", req->cseq, NULL, NULL,
+                       0);
+    return;
+  }
+
+  if (strcmp(type, "mute") == 0 || strcmp(type, "unmute") == 0) {
+    // Senders use these from srcvers 370.35 on, instead of a volume of -144.
+    // Apple keeps mute apart from the level; so does this: the level goes
+    // to -144 dB (silence, through the same path as a SET_PARAMETER volume)
+    // and comes back on unmute.
+    const bool mute = type[0] == 'm';
+    ESP_LOGI(TAG, "/command %s", type);
+    if (conn->owns_session && mute != conn->sender_muted) {
+      if (mute) {
+        conn->sender_unmuted_db = conn->volume_db;
+        rtsp_conn_set_volume(conn, -144.0f);
+        conn->sender_muted = true;
+      } else {
+        conn->sender_muted = false;
+        rtsp_conn_set_volume(conn, conn->sender_unmuted_db);
+      }
+    }
+  } else if (strcmp(type, "setSenderDisplayLatencyMs") == 0) {
+    int64_t value = 0;
+    if (bplist_find_nested_int(body, body_len, "params", "value", &value) &&
+        value >= 0 && value <= UINT32_MAX) {
+      conn->has_sender_display_latency = true;
+      conn->sender_display_latency_ms = (uint32_t)value;
+      // Apple subtracts it from the platform latency only for a home-theater
+      // session; this receiver never is one, so nothing else changes.
+      ESP_LOGI(TAG, "/command setSenderDisplayLatencyMs %lld (stored)",
+               (long long)value);
+    } else {
+      rtsp_send_response(socket, conn, 400, "Bad Request", req->cseq, NULL,
+                         NULL, 0);
+      return;
+    }
+  } else if (strcmp(type, "updateMRNowPlayingInfo") == 0 ||
+             strcmp(type, "updateMRSupportedCommands") == 0 ||
+             strcmp(type, "updateMRPlaybackState") == 0 ||
+             strcmp(type, "updateMRNowPlayingClient") == 0 ||
+             strcmp(type, "setMRInfo") == 0 || strcmp(type, "duckAudio") == 0 ||
+             strcmp(type, "unduckAudio") == 0 ||
+             strcmp(type, "fadeAudio") == 0 ||
+             strcmp(type, "changeRelativeVolume") == 0) {
+    // Types Apple's receiver handles and this one accepts without acting on:
+    // bit 50 (MediaRemote now-playing) is not advertised, and the volume and
+    // fade ones are left to the sender's SET_PARAMETER volume.
+    ESP_LOGI(TAG, "/command %s (accepted, not used)", type);
+  } else {
+    ESP_LOGW(TAG, "/command %s not supported: 400", type);
+    rtsp_send_response(socket, conn, 400, "Bad Request", req->cseq, NULL, NULL,
+                       0);
+    return;
+  }
+  rtsp_send_ok(socket, conn, req->cseq);
+}
+
 static void handle_post(int socket, rtsp_conn_t *conn,
                         const rtsp_request_t *req, const uint8_t *raw,
                         size_t raw_len) {
-  (void)raw;
-  (void)raw_len;
-
   const uint8_t *body = req->body;
   size_t body_len = req->body_len;
 
-  if (strstr(req->path, "/pair-setup")) {
+  if (strstr(req->path, "/pair-setup") || strstr(req->path, "/pair-verify")) {
     conn->protocol_version = 2;
-    // Create session if needed
+    // The pairing type the sender asks for.  Absent means legacy pairing.
+    const char *hkp = parse_raw_header(raw, raw_len, "X-Apple-HKP:");
+    // NOLINTNEXTLINE(bugprone-unchecked-string-to-number-conversion)
+    const int hkp_value = hkp ? atoi(hkp) : -1;
+    if (hkp_value != conn->hkp) {
+      ESP_LOGI(TAG, "%s: X-Apple-HKP %s", req->path, hkp ? hkp : "absent");
+    }
+    conn->hkp = hkp_value;
     if (!conn->hap_session) {
       conn->hap_session = hap_session_create();
       if (!conn->hap_session) {
@@ -776,130 +962,11 @@ static void handle_post(int socket, rtsp_conn_t *conn,
         return;
       }
     }
-
-    uint8_t *response = malloc(2048);
-    if (!response) {
-      rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
-                         NULL, 0);
-      return;
-    }
-
-    size_t response_len = 0;
-    esp_err_t err = ESP_FAIL;
-
-    if (body && body_len > 0) {
-      size_t state_len;
-      const uint8_t *state =
-          tlv8_find(body, body_len, TLV_TYPE_STATE, &state_len);
-
-      if (state && state_len == 1) {
-        switch (state[0]) {
-        default:
-          break;
-        case 1:
-          err = hap_pair_setup_m1(conn->hap_session, body, body_len, response,
-                                  2048, &response_len);
-          break;
-        case 3:
-          err = hap_pair_setup_m3(conn->hap_session, body, body_len, response,
-                                  2048, &response_len);
-          break;
-        case 5:
-          err = hap_pair_setup_m5(conn->hap_session, body, body_len, response,
-                                  2048, &response_len);
-          break;
-        }
-      }
-    }
-
-    if (err == ESP_OK && response_len > 0) {
-      rtsp_send_response(socket, conn, 200, "OK", req->cseq,
-                         "Content-Type: application/octet-stream\r\n",
-                         (const char *)response, response_len);
-
-      if (conn->hap_session && conn->hap_session->pair_setup_state == 4 &&
-          conn->hap_session->session_established) {
-        conn->encrypted_mode = true;
-      }
+    if (strstr(req->path, "/pair-setup")) {
+      handle_pair_setup(socket, conn, req);
     } else {
-      ESP_LOGE(TAG, "Pair-setup failed: err=%d", err);
-      static const uint8_t error_response[] = {0x06, 0x01, 0x02,
-                                               0x07, 0x01, 0x02};
-      rtsp_send_response(socket, conn, 200, "OK", req->cseq,
-                         "Content-Type: application/octet-stream\r\n",
-                         (const char *)error_response, sizeof(error_response));
+      handle_pair_verify(socket, conn, req);
     }
-
-    free(response);
-
-  } else if (strstr(req->path, "/pair-verify")) {
-    conn->protocol_version = 2;
-    if (!conn->hap_session) {
-      conn->hap_session = hap_session_create();
-      if (!conn->hap_session) {
-        rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
-                           NULL, 0);
-        return;
-      }
-    }
-
-    uint8_t *response = malloc(1024);
-    if (!response) {
-      rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
-                         NULL, 0);
-      return;
-    }
-
-    size_t response_len = 0;
-    esp_err_t err = ESP_FAIL;
-
-    if (body && body_len > 0) {
-      size_t state_len;
-      const uint8_t *state =
-          tlv8_find(body, body_len, TLV_TYPE_STATE, &state_len);
-
-      if (state && state_len == 1) {
-        if (state[0] == 0x01) {
-          err = hap_pair_verify_m1(conn->hap_session, body, body_len, response,
-                                   1024, &response_len);
-        } else if (state[0] == 0x03) {
-          err = hap_pair_verify_m3(conn->hap_session, body, body_len, response,
-                                   1024, &response_len);
-          // TLV8 pair-verify M3 establishes RTSP channel encryption
-          if (err == ESP_OK &&
-              conn->hap_session->pair_verify_state == PAIR_VERIFY_STATE_M4) {
-            conn->encrypted_mode = true;
-            ESP_LOGI(TAG, "RTSP encryption enabled (TLV8 pair-verify)");
-          }
-        }
-      } else {
-        // Raw format - used for audio encryption keys, not RTSP encryption
-        if (conn->hap_session->pair_verify_state == 0) {
-          err = hap_pair_verify_m1_raw(conn->hap_session, body, body_len,
-                                       response, 1024, &response_len);
-        } else if (conn->hap_session->pair_verify_state ==
-                   PAIR_VERIFY_STATE_M2) {
-          err = hap_pair_verify_m3_raw(conn->hap_session, body, body_len,
-                                       response, 1024, &response_len);
-          if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Raw pair-verify complete (RTSP unencrypted)");
-          }
-        }
-      }
-    }
-
-    if (err == ESP_OK && response_len > 0) {
-      rtsp_send_response(socket, conn, 200, "OK", req->cseq,
-                         "Content-Type: application/octet-stream\r\n",
-                         (const char *)response, response_len);
-    } else {
-      ESP_LOGE(TAG, "Pair-verify failed, err=%d", err);
-      rtsp_send_response(socket, conn, 200, "OK", req->cseq,
-                         "Content-Type: application/octet-stream\r\n",
-                         "\x06\x01\x04\x07\x01\x02", 6);
-    }
-
-    free(response);
 
   } else if (strstr(req->path, "/fp-setup")) {
     uint8_t *fp_response = NULL;
@@ -920,13 +987,7 @@ static void handle_post(int socket, rtsp_conn_t *conn,
                        "Content-Type: application/octet-stream\r\n", "\x00", 1);
 
   } else if (strstr(req->path, "/command")) {
-    if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0) {
-      int64_t cmd_type = 0;
-      if (bplist_find_int(body, body_len, "type", &cmd_type)) {
-        ESP_LOGI(TAG, "/command type=%lld", (long long)cmd_type);
-      }
-    }
-    rtsp_send_ok(socket, conn, req->cseq);
+    handle_command(socket, conn, req, raw, raw_len);
 
   } else if (strstr(req->path, "/feedback")) {
     if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0) {
@@ -1125,11 +1186,30 @@ static void parse_sdp(rtsp_conn_t *conn, const char *sdp, size_t len) {
   }
 }
 
+// Take the session for this connection, or answer 453 as Apple does when the
+// active one may not be interrupted.  False when the request was answered.
+static bool claim_session_or_refuse(int socket, rtsp_conn_t *conn,
+                                    const rtsp_request_t *req) {
+  const int status = rtsp_server_claim_session(conn);
+  if (status == 0) {
+    return true;
+  }
+  rtsp_send_response(socket, conn, status, "Not Enough Bandwidth", req->cseq,
+                     NULL, NULL, 0);
+  return false;
+}
+
 static void handle_announce(int socket, rtsp_conn_t *conn,
                             const rtsp_request_t *req, const uint8_t *raw,
                             size_t raw_len) {
   (void)raw;
   (void)raw_len;
+
+  // AirPlay 1's session starts here: a second sender's ANNOUNCE is what takes
+  // the speaker over, as an AirPlay 2 session SETUP does.
+  if (!claim_session_or_refuse(socket, conn, req)) {
+    return;
+  }
 
   if (req->body && req->body_len > 0) {
     parse_sdp(conn, (const char *)req->body, req->body_len);
@@ -1263,6 +1343,12 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   const uint8_t *body = req->body;
   size_t body_len = req->body_len;
 
+  // Preemption happens here and nowhere else: another connection's /info,
+  // OPTIONS or pairing never touches a playing session (rtsp_server.c).
+  if (!claim_session_or_refuse(socket, conn, req)) {
+    return;
+  }
+
   bool is_bplist =
       strstr(req->content_type, "application/x-apple-binary-plist") != NULL;
 
@@ -1284,6 +1370,9 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       !request_has_streams &&
       parse_raw_header(raw, raw_len, "Transport:") != NULL;
 
+  // The first stream's codec and rate, for its audioBufferSize.
+  int64_t stream_codec = -1;
+  int64_t stream_rate = 44100;
   if (body && body_len > 0 && is_bplist && request_has_streams) {
     conn->protocol_version = 2;
     for (size_t i = 0; i < stream_count; i++) {
@@ -1324,6 +1413,8 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
           audio_receiver_set_format(&format);
           if (i == 0) {
             conn->sample_rate = format.sample_rate;
+            stream_codec = codec_type;
+            stream_rate = sample_rate;
           }
         }
       }
@@ -1416,6 +1507,15 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     conn->event_socket = rtsp_create_event_socket(&conn->event_port);
     if (conn->event_socket >= 0) {
       if (rtsp_start_event_port_task(conn->event_socket) == ESP_OK) {
+        // The event channel is encrypted when this connection is: keys from
+        // the same pairing secret, Events-Salt.  A legacy (raw) pair-verify
+        // leaves RTSP in plaintext, and the event channel with it.
+        const hap_session_t *hap = conn->hap_session;
+        if (conn->encrypted_mode && hap && hap->ikm_len > 0) {
+          rtsp_events_set_keys(hap->ikm, hap->ikm_len);
+        } else {
+          rtsp_events_set_keys(NULL, 0);
+        }
         ESP_LOGI(TAG, "SETUP: Created event port %u", conn->event_port);
       } else {
         close(conn->event_socket);
@@ -1475,6 +1575,18 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     }
 
     ESP_LOGI(TAG, "SETUP: Initial connection setup (no streams)");
+
+    if (is_bplist && body) {
+      // Which remote-control path this sender listens on: Apple's receiver
+      // uses DACP only below 354.54.6, MediaRemote commands above.
+      char source_version[24] = "";
+      if (bplist_find_string(body, body_len, "sourceVersion", source_version,
+                             sizeof(source_version))) {
+        conn->sender_srcvers = airplay_source_version_parse(source_version);
+      }
+      ESP_LOGI(TAG, "SETUP: sender sourceVersion %s",
+               source_version[0] ? source_version : "(none)");
+    }
 
     uint32_t self_ip = 0;
     const bool have_self = rtsp_local_ipv4(socket, &self_ip);
@@ -1609,16 +1721,18 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     size_t plist_len = bplist_build_stream_setup(
         plist_body, sizeof(plist_body), stream_type, response_data_port,
         conn->control_port,
-        stream_type == 103 ? AP2_AUDIO_BUFFER_SIZE
-                           : AP2_REALTIME_AUDIO_BUFFER_SIZE);
+        airplay_audio_buffer_size(stream_type, stream_codec, stream_rate));
     if (plist_len == 0) {
       audio_receiver_stop();
       rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
                          NULL, 0);
       return;
     }
-    ESP_LOGI(TAG, "SETUP response: type=%lld dataPort=%u controlPort=%u",
-             (long long)stream_type, response_data_port, conn->control_port);
+    ESP_LOGI(TAG,
+             "SETUP response: type=%lld dataPort=%u controlPort=%u "
+             "audioBufferSize=%" PRIu32,
+             (long long)stream_type, response_data_port, conn->control_port,
+             airplay_audio_buffer_size(stream_type, stream_codec, stream_rate));
     rtsp_send_response(socket, conn, 200, "OK", req->cseq,
                        "Content-Type: application/x-apple-binary-plist\r\n",
                        (const char *)plist_body, plist_len);
@@ -1722,125 +1836,46 @@ static void handle_record(int socket, rtsp_conn_t *conn,
 }
 
 // ============================================================================
-// Metadata and Progress Logging Helpers
+// SET_PARAMETER: volume and now-playing
 // ============================================================================
 
-/**
- * Format time in seconds as mm:ss string
- * @param seconds Time in seconds
- * @param out Output buffer (at least 8 bytes for "999:59\0")
- * @param out_size Size of output buffer
- */
-static void format_time_mmss(uint32_t seconds, char *out, size_t out_size) {
-  uint32_t mins = seconds / 60;
-  uint32_t secs = seconds % 60;
-  snprintf(out, out_size, "%" PRIu32 ":%02" PRIu32, mins, secs);
+// The value of a "key: value" line, copied out.  Looks only between text and
+// end; the key is matched case-insensitively at the start of a line.
+static bool find_line_value(const char *text, size_t len, const char *key,
+                            char *out, size_t out_size) {
+  const size_t key_len = strlen(key);
+  size_t i = 0;
+  while (i < len) {
+    const size_t line = i;
+    while (i < len && text[i] != '\r' && text[i] != '\n') {
+      i++;
+    }
+    if (i - line > key_len && strncasecmp(text + line, key, key_len) == 0 &&
+        text[line + key_len] == ':') {
+      size_t v = line + key_len + 1;
+      while (v < i && text[v] == ' ') {
+        v++;
+      }
+      const size_t n = i - v < out_size - 1 ? i - v : out_size - 1;
+      memcpy(out, text + v, n);
+      out[n] = '\0';
+      return true;
+    }
+    while (i < len && (text[i] == '\r' || text[i] == '\n')) {
+      i++;
+    }
+  }
+  return false;
 }
 
-/**
- * Parse DMAP-tagged data and extract metadata into struct
- * DMAP format: 4-byte tag, 4-byte BE length, data
- * Common tags:
- *   minm = item name (track title)
- *   asar = artist
- *   asal = album
- *   asgn = genre
- *   asai = album id (64-bit)
- */
-#define DMAP_MAX_NESTING 8
-
-static void parse_dmap_metadata(const uint8_t *data, size_t len,
-                                playback_metadata_t *meta, int depth) {
-  size_t pos = 0;
-
-  if (depth > DMAP_MAX_NESTING) {
+// SET_PARAMETER volume, or the stash a sender mute holds it in.
+static void apply_sender_volume(rtsp_conn_t *conn, float volume_db) {
+  if (conn->sender_muted && volume_db > -144.0f) {
+    // Muted by /command mute: the level is what unmute restores.
+    conn->sender_unmuted_db = volume_db;
     return;
   }
-
-  while (pos + 8 <= len) {
-    // Read 4-byte tag
-    char tag[5] = {0};
-    memcpy(tag, data + pos, 4);
-    pos += 4;
-
-    // Read 4-byte big-endian length
-    uint32_t item_len = ((uint32_t)data[pos] << 24) |
-                        ((uint32_t)data[pos + 1] << 16) |
-                        ((uint32_t)data[pos + 2] << 8) | data[pos + 3];
-    pos += 4;
-
-    // Subtraction, not pos + item_len: that addition wraps on 32-bit size_t
-    // for a hostile length and would let a malformed frame read out of bounds.
-    if (item_len > len - pos) {
-      break; // Malformed
-    }
-
-    // Extract known metadata tags
-    if (strcmp(tag, "minm") == 0 && item_len > 0) {
-      size_t copy_len = item_len < METADATA_STRING_MAX - 1
-                            ? item_len
-                            : METADATA_STRING_MAX - 1;
-      memcpy(meta->title, data + pos, copy_len);
-      meta->title[copy_len] = '\0';
-      ESP_LOGI(TAG, "  Title  = %s", meta->title);
-    } else if (strcmp(tag, "asar") == 0 && item_len > 0) {
-      size_t copy_len = item_len < METADATA_STRING_MAX - 1
-                            ? item_len
-                            : METADATA_STRING_MAX - 1;
-      memcpy(meta->artist, data + pos, copy_len);
-      meta->artist[copy_len] = '\0';
-      ESP_LOGI(TAG, "  Artist = %s", meta->artist);
-    } else if (strcmp(tag, "asal") == 0 && item_len > 0) {
-      size_t copy_len = item_len < METADATA_STRING_MAX - 1
-                            ? item_len
-                            : METADATA_STRING_MAX - 1;
-      memcpy(meta->album, data + pos, copy_len);
-      meta->album[copy_len] = '\0';
-      ESP_LOGI(TAG, "  Album  = %s", meta->album);
-    } else if (strcmp(tag, "asgn") == 0 && item_len > 0) {
-      size_t copy_len = item_len < METADATA_STRING_MAX - 1
-                            ? item_len
-                            : METADATA_STRING_MAX - 1;
-      memcpy(meta->genre, data + pos, copy_len);
-      meta->genre[copy_len] = '\0';
-      ESP_LOGI(TAG, "  Genre  = %s", meta->genre);
-    } else if (strcmp(tag, "mlit") == 0 || strcmp(tag, "cmst") == 0 ||
-               strcmp(tag, "mdst") == 0) {
-      // Container tags - recurse into them
-      parse_dmap_metadata(data + pos, item_len, meta, depth + 1);
-    }
-
-    pos += item_len;
-  }
-}
-
-/**
- * Parse progress string and populate metadata fields
- * Progress format: "start/current/end" in RTP timestamp units
- * Sample rate is typically 44100
- */
-static void parse_progress(const char *progress_str, uint32_t sample_rate,
-                           playback_metadata_t *meta) {
-  uint64_t start = 0, current = 0, end = 0;
-
-  // NOLINTNEXTLINE(bugprone-unchecked-string-to-number-conversion)
-  if (sscanf(progress_str, "%" PRIu64 "/%" PRIu64 "/%" PRIu64, &start, &current,
-             &end) == 3) {
-    if (sample_rate == 0) {
-      sample_rate = 44100; // Default sample rate
-    }
-
-    meta->position_secs = (uint32_t)((current - start) / sample_rate);
-    meta->duration_secs = (uint32_t)((end - start) / sample_rate);
-
-    char pos_str[16], dur_str[16];
-    format_time_mmss(meta->position_secs, pos_str, sizeof(pos_str));
-    format_time_mmss(meta->duration_secs, dur_str, sizeof(dur_str));
-
-    ESP_LOGI(TAG,
-             "Progress: %s / %s (raw: %" PRIu64 "/%" PRIu64 "/%" PRIu64 ")",
-             pos_str, dur_str, start, current, end);
-  }
+  rtsp_conn_set_volume(conn, volume_db);
 }
 
 static void handle_set_parameter(int socket, rtsp_conn_t *conn,
@@ -1848,129 +1883,78 @@ static void handle_set_parameter(int socket, rtsp_conn_t *conn,
                                  size_t raw_len) {
   const uint8_t *body = req->body;
   size_t body_len = req->body_len;
-  playback_event_data_t event_data;
-  memset(&event_data, 0, sizeof(event_data));
-  bool has_metadata = false;
+  const uint32_t sample_rate =
+      conn->sample_rate > 0 ? (uint32_t)conn->sample_rate : 44100U;
+  char value[64];
 
-  // Check for progress header in raw request
-  const char *progress_hdr = strstr((const char *)raw, "progress:");
-  if (!progress_hdr) {
-    progress_hdr = strstr((const char *)raw, "Progress:");
-  }
-  if (progress_hdr) {
-    // Find end of header line
-    const char *line_end = strstr(progress_hdr, "\r\n");
-    if (line_end) {
-      size_t val_start = 9; // Length of "progress:"
-      while (progress_hdr[val_start] == ' ') {
-        val_start++;
-      }
-      char progress_val[64];
-      size_t val_len = line_end - (progress_hdr + val_start);
-      if (val_len < sizeof(progress_val)) {
-        memcpy(progress_val, progress_hdr + val_start, val_len);
-        progress_val[val_len] = '\0';
-        parse_progress(progress_val, 44100, &event_data.metadata);
-        has_metadata = true;
-      }
-    }
+  // Some senders put progress in a header rather than the body.
+  const uint8_t *header_end = rtsp_find_header_end(raw, raw_len);
+  const size_t header_len = header_end ? (size_t)(header_end - raw) : 0;
+  if (header_len > 0 && find_line_value((const char *)raw, header_len,
+                                        "progress", value, sizeof(value))) {
+    rtsp_metadata_progress(value, sample_rate);
   }
 
   if (strstr(req->content_type, "text/parameters")) {
-    if (body) {
-      if (strstr((const char *)body, "volume:")) {
-        const char *vol = strstr((const char *)body, "volume:");
-        if (vol) {
-          float volume = strtof(vol + 7, NULL);
-          ESP_LOGI(TAG, "SET_PARAMETER: volume=%.2f dB", volume);
-          rtsp_conn_set_volume(conn, volume);
-        }
+    if (body && body_len > 0) {
+      if (find_line_value((const char *)body, body_len, "volume", value,
+                          sizeof(value))) {
+        const float volume = strtof(value, NULL);
+        ESP_LOGI(TAG, "SET_PARAMETER: volume=%.2f dB", volume);
+        apply_sender_volume(conn, volume);
       }
-      // Check for progress in body (AirPlay 1 style)
-      const char *prog = strstr((const char *)body, "progress:");
-      if (prog) {
-        prog += 9;
-        while (*prog == ' ') {
-          prog++;
-        }
-        parse_progress(prog, 44100, &event_data.metadata);
-        has_metadata = true;
+      if (find_line_value((const char *)body, body_len, "progress", value,
+                          sizeof(value))) {
+        rtsp_metadata_progress(value, sample_rate);
       }
     }
   } else if (strstr(req->content_type, "application/x-dmap-tagged")) {
-    // DMAP-tagged metadata (AirPlay 1)
     if (body && body_len > 0) {
-      ESP_LOGI(TAG, "Received DMAP metadata (%zu bytes)", body_len);
-      parse_dmap_metadata(body, body_len, &event_data.metadata, 0);
-      has_metadata = true;
+      rtsp_metadata_dmap(body, body_len);
     }
-  } else if (strstr(req->content_type, "image/jpeg") ||
-             strstr(req->content_type, "image/png")) {
+  } else if (strstr(req->content_type, "image/")) {
 #ifdef CONFIG_ENABLE_AIRPLAY_ARTWORK
-    // Artwork - log and flag in metadata
+    // Only flagged: the image itself is not kept.
     ESP_LOGI(TAG, "Received artwork: %s (%zu bytes)", req->content_type,
              body_len);
-    event_data.metadata.has_artwork = true;
-    has_metadata = true;
+    if (body_len > 0) {
+      rtsp_metadata_artwork();
+    }
 #else
-    // Artwork reception disabled — ignore it.  The md txt record already asks
-    // senders not to transmit cover art, but some send it regardless.
+    // Artwork reception disabled.  Neither md nor feature bit 15 offers it,
+    // but some senders send it regardless.
     ESP_LOGD(TAG, "Ignoring artwork (%s, %zu bytes): disabled in config",
              req->content_type, body_len);
 #endif
   } else if (strstr(req->content_type, "application/x-apple-binary-plist")) {
+    // Not something Apple's receiver accepts; kept for third-party senders
+    // that send now-playing this way.
     if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0) {
-      int64_t value;
-      if (bplist_find_int(body, body_len, "networkTimeSecs", &value)) {
-        ESP_LOGI(TAG, "SET_PARAMETER: networkTimeSecs=%lld", (long long)value);
+      playback_metadata_t partial;
+      memset(&partial, 0, sizeof(partial));
+      bool any = false;
+      any |= bplist_find_string(body, body_len, "itemName", partial.title,
+                                sizeof(partial.title));
+      any |= bplist_find_string(body, body_len, "artistName", partial.artist,
+                                sizeof(partial.artist));
+      any |= bplist_find_string(body, body_len, "albumName", partial.album,
+                                sizeof(partial.album));
+      double elapsed = 0;
+      double duration = 0;
+      const bool has_position =
+          bplist_find_real(body, body_len, "elapsed", &elapsed) && elapsed >= 0;
+      if (bplist_find_real(body, body_len, "duration", &duration) &&
+          duration > 0) {
+        partial.duration_secs = (uint32_t)duration;
+        any = true;
       }
-      double rate;
-      if (bplist_find_real(body, body_len, "rate", &rate)) {
-        ESP_LOGI(TAG, "SET_PARAMETER: rate=%.2f", rate);
+      if (has_position) {
+        partial.position_secs = (uint32_t)elapsed;
       }
-      // Try to extract metadata from bplist (AirPlay 2)
-      char str_val[METADATA_STRING_MAX];
-      if (bplist_find_string(body, body_len, "itemName", str_val,
-                             sizeof(str_val))) {
-        ESP_LOGI(TAG, "Metadata: Title = %s", str_val);
-        strlcpy(event_data.metadata.title, str_val, METADATA_STRING_MAX);
-        has_metadata = true;
-      }
-      if (bplist_find_string(body, body_len, "artistName", str_val,
-                             sizeof(str_val))) {
-        ESP_LOGI(TAG, "Metadata: Artist = %s", str_val);
-        strlcpy(event_data.metadata.artist, str_val, METADATA_STRING_MAX);
-        has_metadata = true;
-      }
-      if (bplist_find_string(body, body_len, "albumName", str_val,
-                             sizeof(str_val))) {
-        ESP_LOGI(TAG, "Metadata: Album = %s", str_val);
-        strlcpy(event_data.metadata.album, str_val, METADATA_STRING_MAX);
-        has_metadata = true;
-      }
-      // Progress info from bplist
-      double elapsed = 0, duration = 0;
-      if (bplist_find_real(body, body_len, "elapsed", &elapsed)) {
-        event_data.metadata.position_secs = (uint32_t)elapsed;
-        has_metadata = true;
-        char elapsed_str[16];
-        format_time_mmss((uint32_t)elapsed, elapsed_str, sizeof(elapsed_str));
-        if (bplist_find_real(body, body_len, "duration", &duration)) {
-          event_data.metadata.duration_secs = (uint32_t)duration;
-          char duration_str[16];
-          format_time_mmss((uint32_t)duration, duration_str,
-                           sizeof(duration_str));
-          ESP_LOGI(TAG, "Progress: %s / %s", elapsed_str, duration_str);
-        } else {
-          ESP_LOGI(TAG, "Progress: %s", elapsed_str);
-        }
+      if (any || has_position) {
+        rtsp_metadata_update(&partial, has_position);
       }
     }
-  }
-
-  if (has_metadata) {
-    playback_events_emit(PLAYBACK_SOURCE_AIRPLAY, PLAYBACK_EVENT_METADATA,
-                         &event_data);
   }
 
   rtsp_send_ok(socket, conn, req->cseq);
@@ -2155,6 +2139,7 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
     // the session is over, so anything else waiting for the speaker can have
     // it. A stream-level teardown is a pause and deliberately keeps the claim.
     audio_receiver_end_session();
+    conn->session_ended = true;
     // For v1 sessions, keep the DACP session alive across teardown so the
     // grace period can probe mDNS to differentiate pause from real
     // disconnect. v2 sessions clear immediately.

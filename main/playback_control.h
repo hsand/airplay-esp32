@@ -13,8 +13,10 @@
  * Routes hardware button actions to the correct backend (AirPlay or
  * Bluetooth) and notifies the remote client of changes.
  *
- * For AirPlay: applies volume/pause locally, then sends DACP commands
- * to the iOS/macOS client so its UI stays in sync.
+ * For AirPlay: transport commands go to the sender, as Apple's receiver sends
+ * them (a MediaRemote command on the AirPlay 2 event channel, DACP for
+ * AirPlay 1 and old senders); volume is applied locally and mirrored to the
+ * sender's slider.
  *
  * For Bluetooth: sends AVRCP passthrough commands to the source device,
  * which controls playback and sends volume back via absolute volume.
@@ -73,8 +75,8 @@ void playback_control_set_muted(bool muted);
 
 /**
  * Set the volume in AirPlay dB (-30..0) from this device, as the buttons do:
- * the DAC and the AirPlay session both follow, and the sender is told over
- * DACP when it listens. Not persisted.
+ * the DAC and the AirPlay session both follow, and the sender's slider is
+ * told (dvlc on the event channel, or DACP). Not persisted.
  *
  * Muted stays muted; the level is what unmuting restores.
  */

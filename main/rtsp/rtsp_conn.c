@@ -39,6 +39,7 @@ rtsp_conn_t *rtsp_conn_create(void) {
   conn->data_socket = -1;
   conn->control_socket = -1;
   conn->event_socket = -1;
+  conn->hkp = -1;
 
   return conn;
 }
