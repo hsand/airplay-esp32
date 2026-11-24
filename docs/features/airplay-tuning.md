@@ -117,6 +117,13 @@ a speaker grouped with HomePods plays at their level for the same slider positio
 under 0.3 dB, 1 % of the slider, are ignored, as Apple ignores them. The stored level is
 kept within −30…0 dB, so a muted session does not start the next one silent.
 
+!!! note "Changed after v0.3.0"
+    Apple's curve is now the default on every board, and the bottom of the slider gets
+    louder. The lowest step of an iPhone's volume buttons (−28 dB from the sender) used to
+    play at about −48 dB in software and about −83 dB on a DAC with its own volume control;
+    it now plays at −28 dB, and anything at or below −30 dB is silent. To keep the old
+    behaviour, build with `CONFIG_DAC_VOLUME_LAW_LEGACY=y`, as below.
+
 The curves of earlier firmware are still available as
 **DAC Configuration → Volume curve → Earlier firmware's** in `menuconfig`
 (`CONFIG_DAC_VOLUME_LAW_LEGACY`): the square of the slider position in software, and 2 dB
