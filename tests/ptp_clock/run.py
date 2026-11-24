@@ -33,6 +33,8 @@ with tempfile.TemporaryDirectory(prefix="ptp-clock-tests-") as temporary:
     command = shlex.split(os.environ.get("CC", "cc")) + [
         "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-g", "-O1", "-pthread",
         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+        # Undefined behaviour (an overflow, say) fails the run.
+        "-fno-sanitize-recover=undefined",
         # The FreeRTOS task entry point never reads its parameter.
         "-Wno-unused-parameter",
         "-I", str(build), "-I", str(HERE),

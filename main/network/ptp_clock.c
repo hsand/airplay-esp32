@@ -2036,7 +2036,8 @@ static void log_status(void) {
   // RTT = 2 x the rate-corrected one-way delay
   const long rtt_min = n ? (long)scratch[0] * 2 / 1000 : -1;
   const long rtt_med = n ? (long)scratch[n / 2] * 2 / 1000 : -1;
-  const long ppb = (long)((dev_q * 1000000000LL) >> PTP_RATE_FRAC);
+  // dev_q is bounded by the 10000 ppm gate, so this fits in 32 bits.
+  const long ppb = (long)mul_q40(1000000000LL, dev_q);
   const long ppb_abs = ppb < 0 ? -ppb : ppb;
   // Two lines: one long line is cut off by the log buffer.
   ESP_LOGI(TAG,
@@ -2510,8 +2511,7 @@ void ptp_clock_get_stats(ptp_stats_t *stats) {
   stats->delay_resp_received = ptp.dresp_received;
   const ptp_servo_t *s = output_servo();
   stats->two_way = s == &ptp.tw;
-  stats->rate_ppb =
-      s ? (int32_t)((s->dev_q * 1000000000LL) >> PTP_RATE_FRAC) : 0;
+  stats->rate_ppb = s ? (int32_t)mul_q40(1000000000LL, s->dev_q) : 0;
   stats->grandmaster_id = ptp.gm_id;
   if (check_locked() && ptp.lock_start_ms > 0) {
     stats->lock_time_ms = now_ms() - ptp.lock_start_ms;

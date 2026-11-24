@@ -367,6 +367,25 @@ static void test_mul_q40(void) {
   }
 }
 
+/* The reported rate stays exact across the whole range the ppm gate admits
+ * (+-10000 ppm); a plain dev_q * 1e9 overflowed above ~8389 ppm. */
+static void test_rate_ppb_range(void) {
+  printf("rate in ppb up to the gate\n");
+  reset();
+  master_t a = master_a();
+  settle(&a, 24);
+  static const int32_t ppbs[] = {9000000, -9000000, 9999999, -9999999, 1234};
+  for (size_t i = 0; i < sizeof(ppbs) / sizeof(ppbs[0]); i++) {
+    ptp.tw.dev_q = (int64_t)llround((double)ppbs[i] * 1e-9 *
+                                    (double)(1LL << PTP_RATE_FRAC));
+    ptp_stats_t st;
+    ptp_clock_get_stats(&st);
+    CHECK(st.two_way && llabs((long long)st.rate_ppb - ppbs[i]) <= 1,
+          "rate %ld ppb reported as %ld", (long)ppbs[i], (long)st.rate_ppb);
+  }
+  log_status(); /* the same conversion, on the status line */
+}
+
 /* ---------- two-way basics ---------- */
 
 static void test_delay_req_format(void) {
@@ -1260,6 +1279,7 @@ static void test_rx_hook(void) {
 
 int main(void) {
   test_mul_q40();
+  test_rate_ppb_range();
   test_delay_req_format();
   test_two_way_accuracy();
   test_drift_ramp();
