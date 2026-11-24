@@ -53,6 +53,7 @@ static int failures;
 int64_t mock_now_us = 1000000;
 static _Thread_local unsigned critical_depth;
 static void (*log_hook)(void);
+static char last_log[160];
 
 void mock_enter_critical(portMUX_TYPE *mux) {
   if (pthread_mutex_lock(mux) != 0) {
@@ -78,10 +79,13 @@ void mock_log(const char *tag, const char *format, ...) {
     log_hook = NULL;
     hook();
   }
+  va_list args;
+  va_start(args, format);
+  vsnprintf(last_log, sizeof(last_log), format, args);
+  va_end(args);
   if (getenv("PTP_TEST_VERBOSE") == NULL) {
     return;
   }
-  va_list args;
   va_start(args, format);
   printf("    [%s] ", tag);
   vprintf(format, args);
@@ -1420,6 +1424,26 @@ static void test_session_handover(void) {
   CHECK(ptp_clock_is_locked(), "other master between sessions: lock dropped");
 }
 
+/* The lock is reported once when it is taken and once when it is lost. */
+static void test_lock_lines(void) {
+  printf("LOCKED / UNLOCKED lines\n");
+  reset();
+  lock_logged = false;
+  master_t a = master_a();
+  settle(&a, 16);
+  CHECK(lock_logged, "no LOCKED line");
+  last_log[0] = 0;
+  log_lock_lost();
+  CHECK(last_log[0] == 0, "logged while still locked: %s", last_log);
+  mock_now_us += (LOCK_TIMEOUT_MS + 1000) * 1000LL;
+  log_lock_lost();
+  CHECK(strncmp(last_log, "UNLOCKED", 8) == 0, "no UNLOCKED line (%s)",
+        last_log);
+  last_log[0] = 0;
+  log_lock_lost();
+  CHECK(last_log[0] == 0, "UNLOCKED logged twice");
+}
+
 /* ---------- lwIP input hook ---------- */
 
 static size_t ip_packet(uint8_t *out, uint32_t src, uint16_t dport,
@@ -1515,6 +1539,7 @@ int main(void) {
   test_concurrent_packets_and_sessions();
   test_session_handover();
   test_rx_hook();
+  test_lock_lines();
   if (failures) {
     printf("%d check(s) failed\n", failures);
     return 1;

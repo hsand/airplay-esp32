@@ -17,8 +17,9 @@
  *    cancel the symmetric part of the path delay.
  *  - A lag-compensated two-stage IIR per timeline gives offset *and* rate,
  *    so local <-> network conversions are anchor + rate, not offset only.
- *  - Masters that never answer Delay_Req are followed passively, from the
- *    least delayed one-way samples, with a retry of two-way every 10 s.
+ *  - Masters that never answer Delay_Req, or stop answering for 10 s, are
+ *    followed passively, from the least delayed one-way samples, with a
+ *    retry of two-way every 10 s.
  *  - The grandmaster is tracked from Announce and the Follow_Up TLVs; every
  *    network time carries the GM it is on, and a GM change resets the clock.
  *

@@ -12,10 +12,12 @@
 //
 // Each estimator ("servo") filters the remote and the local timeline with a
 // lag-compensated two-stage IIR and publishes an anchor + rate.  The clock
-// uses the two-way servo whenever the master answers, the passive one
-// otherwise.  All timestamps are int64 ns; filter state is kept relative to
-// the last input so no product ever needs more than 64 bits, and the only
-// floating point runs once per SYNC.
+// uses the two-way servo while the master answers Delay_Req.  It follows the
+// passive one when a master never answers (16 Delay_Reqs in a row) or stops
+// answering (80 SYNCs, 10 s, without a single Delay_Resp), and tries two-way
+// again every 10 s.  All timestamps are int64 ns; filter state is kept
+// relative to the last input so no product ever needs more than 64 bits,
+// and the only floating point runs once per SYNC.
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -201,8 +203,8 @@ static const char *TAG = "ptp_clock";
 // delay floor) is learnt, and removed again after a fallback.  It is kept
 // until reboot: the path is mostly the board's own Wi-Fi hop, so the floor
 // learnt from one master is the best guess for the next.  Before anything
-// is learnt, a typical floor is assumed [inferred: an AP relays the frame,
-// two short hops of airtime plus queueing].
+// is learnt, a typical floor is assumed: an AP relays the frame, so two
+// short hops of airtime plus queueing.
 #define PTP_PASSIVE_BIAS_MIN_SAMPLES 8
 #define PTP_PASSIVE_BIAS_SHIFT       4
 #define PTP_PASSIVE_DELAY_PRIOR_NS   500000LL
@@ -232,6 +234,7 @@ static const char *TAG = "ptp_clock";
 // session can carry on with the lock rather than spend ~0.5 s re-acquiring it.
 #define SESSION_KEEP_MS 2000
 
+// Debug status lines while a master sends.
 #define PTP_STATUS_INTERVAL_MS 10000
 #define PTP_TASK_PRIORITY      7 // above the decoder (6), below playback (9)
 #define PTP_TASK_STACK         4608
@@ -449,7 +452,6 @@ static struct {
   // Statistics
   uint32_t sync_count;
   uint32_t followup_count;
-  uint32_t announce_count;
   uint32_t rejected_master_count; // SYNC from a port not on the chosen GM
   uint32_t dreq_sent;
   uint32_t dresp_received;
@@ -1917,7 +1919,6 @@ static void handle_delay_resp(const uint8_t *data, size_t len,
 
 static void handle_announce(const uint8_t *data, size_t len, const ptp_hdr_t *h,
                             uint32_t src_ip) {
-  ptp.announce_count++;
   if (len < PTP_ANNOUNCE_LEN) {
     return;
   }
@@ -1935,6 +1936,9 @@ static void handle_announce(const uint8_t *data, size_t len, const ptp_hdr_t *h,
   p->has_announce = true;
   p->last_announce_ms = now_ms();
 }
+
+// A LOCKED line was printed and no UNLOCKED line since.  PTP task only.
+static bool lock_logged;
 
 static void log_actions(const ptp_actions_t *act) {
   const uint32_t ev = act->events;
@@ -1986,10 +1990,28 @@ static void log_actions(const ptp_actions_t *act) {
     ESP_LOGD(TAG, "Apple Follow_Up TLV names another GM than Announce");
   }
   if (ev & EV_LOCKED) {
+    lock_logged = true;
     ESP_LOGI(TAG, "LOCKED: gm=%016llx mode=%s after %lu SYNCs",
              (unsigned long long)act->lock_gm,
              act->lock_two_way ? "two-way" : "passive",
              (unsigned long)act->lock_syncs);
+  }
+}
+
+// The lock is dropped wherever it is read (check_locked()), under the mux;
+// the PTP task notices within a second and says so once.
+static void log_lock_lost(void) {
+  if (!lock_logged) {
+    return;
+  }
+  portENTER_CRITICAL(&ptp_state_mux);
+  const bool locked = check_locked();
+  const bool silent = now_ms() - ptp.last_sync_rx_ms > LOCK_TIMEOUT_MS;
+  portEXIT_CRITICAL(&ptp_state_mux);
+  if (!locked) {
+    lock_logged = false;
+    ESP_LOGI(TAG, "UNLOCKED: %s",
+             silent ? "no SYNC from the master for 10 s" : "clock reset");
   }
 }
 
@@ -2137,6 +2159,7 @@ static void log_status(void) {
   const uint32_t r_gap = ptp.resets_gap, r_gm = ptp.gm_changes;
   const uint32_t hook = ptp.rx_hook_stamps, task = ptp.rx_task_stamps;
   const uint32_t rejected = ptp.rejected_master_count;
+  const uint32_t tx_err = ptp.dreq_tx_errors;
   const uint32_t tx_slow = ptp.tx_slow, tx_done = ptp.tx_done_used;
   const uint32_t tx_lost = ptp.tx_done_lost;
   const int64_t bias = ptp.passive_bias_n ? ptp.passive_bias_ns : 0;
@@ -2152,7 +2175,7 @@ static void log_status(void) {
   const long ppb = (long)mul_q40(1000000000LL, dev_q);
   const long ppb_abs = ppb < 0 ? -ppb : ppb;
   // Two lines: one long line is cut off by the log buffer.
-  ESP_LOGI(TAG,
+  ESP_LOGD(TAG,
            "status: %s %s gm=%016llx via " PTP_IP_FMT
            " dreq=%lu resp=%lu rtt_us min=%ld med=%ld resid_rms_us=%lu "
            "rate=%c%ld.%03ldppm",
@@ -2161,17 +2184,18 @@ static void log_status(void) {
            (unsigned long)recv, rtt_min, rtt_med,
            (unsigned long)(isqrt64((uint64_t)resid_ms) / 1000),
            ppb < 0 ? '-' : '+', ppb_abs / 1000, ppb_abs % 1000);
-  ESP_LOGI(
-      TAG,
-      "status: drops gate=%lu delay=%lu passive=%lu lucky=%lu "
-      "t3 txdone=%lu lost=%lu slow=%lu resets drop=%lu oob=%lu gap=%lu gm=%lu "
-      "bias_us=%ld "
-      "rx hook=%lu task=%lu rejected=%lu",
-      (unsigned long)ppm, (unsigned long)dly, (unsigned long)pas,
-      (unsigned long)lucky, (unsigned long)tx_done, (unsigned long)tx_lost,
-      (unsigned long)tx_slow, (unsigned long)r_drop, (unsigned long)r_oob,
-      (unsigned long)r_gap, (unsigned long)r_gm, (long)(bias / 1000),
-      (unsigned long)hook, (unsigned long)task, (unsigned long)rejected);
+  ESP_LOGD(TAG,
+           "status: drops gate=%lu delay=%lu passive=%lu lucky=%lu "
+           "t3 txdone=%lu lost=%lu slow=%lu tx_err=%lu resets drop=%lu oob=%lu "
+           "gap=%lu gm=%lu "
+           "bias_us=%ld "
+           "rx hook=%lu task=%lu rejected=%lu",
+           (unsigned long)ppm, (unsigned long)dly, (unsigned long)pas,
+           (unsigned long)lucky, (unsigned long)tx_done, (unsigned long)tx_lost,
+           (unsigned long)tx_slow, (unsigned long)tx_err, (unsigned long)r_drop,
+           (unsigned long)r_oob, (unsigned long)r_gap, (unsigned long)r_gm,
+           (long)(bias / 1000), (unsigned long)hook, (unsigned long)task,
+           (unsigned long)rejected);
 }
 
 // ---- Sockets and task
@@ -2299,6 +2323,7 @@ static void ptp_task(void *pvParameters) {
       }
     }
 
+    log_lock_lost();
     const uint32_t now = now_ms();
     if (now - ptp.last_status_ms >= PTP_STATUS_INTERVAL_MS) {
       ptp.last_status_ms = now;
