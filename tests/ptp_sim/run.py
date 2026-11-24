@@ -40,6 +40,7 @@ SCENARIOS = [
     ("relay", "direct port lost at 200 s, relay"),
     ("multi", "plus a better-priority other GM"),
     ("storm", "25 s storm: 20-60 ms delays, Delay_Resps lost/late"),
+    ("answers-stop", "answers stop at 200 s, GM steps +50 ms at 300 s"),
 ]
 
 KEYS = ["mean_us", "p95_us", "p2p_us", "peak_us", "unlocked_pct", "lock_s",
@@ -142,7 +143,8 @@ def main():
                 agg(rows, "unlocked_pct"),
                 agg(rows, "lock_s"), agg(rows, "settle_s"),
                 agg(rows, "recovery_s") if name in
-                ("sleep", "sleep-passive", "gm-change", "relay") else "-"))
+                ("sleep", "sleep-passive", "gm-change", "relay",
+                         "answers-stop") else "-"))
     print()
     for name, desc in scen:
         print("  %-20s %s" % (name, desc))

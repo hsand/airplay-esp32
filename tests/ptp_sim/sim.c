@@ -11,7 +11,8 @@
  * masters that answer Delay_Req or not.  Scripted events: a phone that
  * sleeps (its clock stops, so it steps back), a grandmaster change to an
  * unrelated timeline, a direct port that disappears behind a boundary relay,
- * and an unrelated better-priority master on the network.
+ * an unrelated better-priority master on the network, and a master that
+ * stops answering Delay_Req for good and then steps its clock.
  *
  * Every 20 ms it reads the clock at "now" and compares it with the true
  * network time of the grandmaster the anchor names; it prints one line of
@@ -83,6 +84,9 @@ typedef struct {
   bool hook;
   bool tlv8021as;
   double storm_at, storm_len; /* congestion storm: late/lost Delay_Resps */
+  double answers_stop_at;     /* the master stops answering for good */
+  double step_at;             /* GM A's clock steps by step_ms */
+  double step_ms;
 } scenario_t;
 
 static scenario_t sc;
@@ -423,7 +427,9 @@ ssize_t sim_sendto(int fd, const void *buf, size_t len, int flags,
 
 static void dreq_at_master(const event_t *e) {
   master_t *x = &ms[e->m];
-  if (!x->answers || master_asleep(e->m, now_T)) {
+  if (!x->answers || master_asleep(e->m, now_T) ||
+      (sc.answers_stop_at > 0 &&
+       now_T >= (int64_t)(sc.answers_stop_at * SEC))) {
     return;
   }
   int64_t late = 300 * US; /* a little processing */
@@ -555,6 +561,9 @@ static bool in_event_window(int64_t t) {
       s < sc.relay_drop_at + recover) {
     return true;
   }
+  if (sc.step_at > 0 && s >= sc.step_at && s < sc.step_at + recover) {
+    return true;
+  }
   return false;
 }
 
@@ -628,6 +637,8 @@ static void report(void) {
     rec = settle(sc.gm_change_at, mean, MS);
   } else if (sc.relay_drop_at > 0) {
     rec = settle(sc.relay_drop_at, mean, MS);
+  } else if (sc.step_at > 0) {
+    rec = settle(sc.step_at, mean, MS);
   }
   printf("mean_us=%.1f p95_us=%.1f p2p_us=%.1f peak_us=%.1f unlocked_pct=%.2f "
          "lock_s=%.2f settle_s=%.2f recovery_s=%.2f\n",
@@ -718,6 +729,11 @@ static bool setup(const char *name) {
     wifi();
     sc.storm_at = 400;
     sc.storm_len = 25;
+  } else if (!strcmp(name, "answers-stop")) {
+    wifi();
+    sc.answers_stop_at = 200;
+    sc.step_at = 300;
+    sc.step_ms = 50;
   } else if (!strcmp(name, "multi")) {
     wifi();
     sc.multi = true;
@@ -834,7 +850,7 @@ int main(int argc, char **argv) {
   const int64_t end = (int64_t)(sc.duration * SEC);
   uint64_t truth_gm = 0;
   int truth_m = M_A;
-  bool slept = false;
+  bool slept = false, stepped = false;
   samples = malloc(sizeof(*samples) * (size_t)(sc.duration * 50 + 10));
   nsamples = 0;
 
@@ -849,6 +865,10 @@ int main(int argc, char **argv) {
         now_T >= (int64_t)((sc.sleep_at + sc.sleep_len) * SEC)) {
       slept = true;
       ms[M_A].step -= (int64_t)(sc.sleep_len * SEC);
+    }
+    if (!stepped && sc.step_at > 0 && now_T >= (int64_t)(sc.step_at * SEC)) {
+      stepped = true;
+      ms[M_A].step += (int64_t)(sc.step_ms * MS);
     }
     switch (ev.type) {
     case EV_SYNC_TX:

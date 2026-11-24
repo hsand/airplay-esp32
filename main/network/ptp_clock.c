@@ -81,9 +81,12 @@ static const char *TAG = "ptp_clock";
 #define PTP_DELAY_REQ_FLAGS        0x0408
 #define PTP_DELAY_REQ_LOG_INTERVAL (-3)
 #define PTP_LOCAL_PORT_NUMBER      1
-// Delay_Reqs in a row without a Delay_Resp before the clock follows the
-// master passively, and how often it then tries two-way again.
+// Delay_Reqs in a row without any Delay_Resp before the clock follows the
+// master passively: 16 for a master that has never answered on this port,
+// Apple's 80-SYNC gap (10 s) for one that has; and how often it then tries
+// two-way again.
 #define PTP_DREQ_UNANSWERED_LIMIT 16
+#define PTP_DREQ_LOST_LIMIT       PTP_GAP_RESET_SYNCS
 #define PTP_TWO_WAY_RETRY_MS      10000
 // t3, as Apple takes it: when the driver reports the Delay_Req transmitted
 // (esp_wifi_set_tx_done_cb(), the Wi-Fi driver's TX-done callback).  Where
@@ -337,6 +340,7 @@ enum {
   EV_TIME_BASE = 1 << 8,
   EV_PORT_CHANGE = 1 << 9,
   EV_APPLE_GM_MISMATCH = 1 << 10,
+  EV_ANSWERS_STOPPED = 1 << 11,
 };
 
 typedef struct {
@@ -1611,15 +1615,32 @@ static void handle_sync(const uint8_t *data, size_t len, const ptp_hdr_t *h,
   ptp.x_t3_pre = 0;
   ptp.x_have_t4 = false;
 
-  // Apple's stack has no passive mode: a missing Delay_Resp is just a
-  // missing sample.  The passive fallback exists only for masters that have
-  // never answered on this port; once one has, lost or late answers (Wi-Fi
-  // congestion) only cost samples, exactly as on Apple's receiver.
-  if (ptp.mode != PTP_MODE_PASSIVE && ptp.last_dresp_ms == 0 &&
-      ptp.unanswered >= PTP_DREQ_UNANSWERED_LIMIT) {
+  // Apple's stack has no passive mode: a missing Delay_Resp is a missing
+  // sample, and the next sample after a gap of 80 SYNCs resets its filter.
+  // Here a master that has never answered on this port is followed
+  // passively after 16 unanswered Delay_Reqs.  Once one has answered, lost
+  // or late answers (Wi-Fi congestion) only cost samples, as on Apple's
+  // receiver, and the two-way line extrapolates on its rate meanwhile; any
+  // answer, even one too late to use, shows the master is still there.
+  // After 80 SYNCs without a single answer the two-way line is stale, as a
+  // gap that long is to Apple.  Apple would extrapolate on it until the
+  // next sample, blind to the master's clock moving; the passive estimator
+  // can see that, so the clock drops the stale line and follows passively,
+  // and reports itself unlocked if it has no passive line either.
+  const bool answered = ptp.last_dresp_ms != 0;
+  if (ptp.mode != PTP_MODE_PASSIVE &&
+      ptp.unanswered >=
+          (answered ? PTP_DREQ_LOST_LIMIT : PTP_DREQ_UNANSWERED_LIMIT)) {
     ptp.mode = PTP_MODE_PASSIVE;
     ptp.last_probe_ms = now;
-    act->events |= EV_PASSIVE;
+    if (answered) {
+      // Same timeline: the rate is kept for when answers come back.
+      servo_unseed(&ptp.tw, true);
+      ptp.tw.locked = false;
+      act->events |= EV_ANSWERS_STOPPED;
+    } else {
+      act->events |= EV_PASSIVE;
+    }
     publish_model(NULL);
   }
   bool send = ptp.mode != PTP_MODE_PASSIVE;
@@ -1839,6 +1860,11 @@ static void log_actions(const ptp_actions_t *act) {
              "master does not answer Delay_Req (%d in a row): passive mode, "
              "retrying every %d s",
              PTP_DREQ_UNANSWERED_LIMIT, PTP_TWO_WAY_RETRY_MS / 1000);
+  }
+  if (ev & EV_ANSWERS_STOPPED) {
+    ESP_LOGW(TAG,
+             "no Delay_Resp for %d SYNCs: passive mode, retrying every %d s",
+             PTP_DREQ_LOST_LIMIT, PTP_TWO_WAY_RETRY_MS / 1000);
   }
   if (ev & EV_TWO_WAY) {
     ESP_LOGI(TAG, "master answers Delay_Req again: two-way mode");

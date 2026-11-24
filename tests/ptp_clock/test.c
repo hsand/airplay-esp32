@@ -791,8 +791,8 @@ static void test_bmca_and_gm_change(void) {
 
 /* A master that has answered is not declared silent by a burst of lost
  * Delay_Resps (Wi-Fi congestion): Apple has no passive mode, a missing
- * answer is just a missing sample.  Only 30 s without any answer makes it
- * silent again. */
+ * answer is just a missing sample.  Only 80 SYNCs (10 s) without any answer
+ * make it silent again. */
 static void test_answer_burst_stays_two_way(void) {
   printf("lost answers keep two-way\n");
   reset();
@@ -813,6 +813,59 @@ static void test_answer_burst_stays_two_way(void) {
   settle(&a, 16);
   CHECK(two_way() && ptp.mode == PTP_MODE_TWO_WAY && ptp_clock_is_locked(),
         "not two-way once answers resumed");
+}
+
+/* Answers stop for good after the clock locked two-way, then the master's
+ * clock steps.  The two-way line must not stay "locked" on stale data: after
+ * 80 SYNCs without an answer the clock follows passively, so it sees both a
+ * forward and a backward step, and two-way comes back with the answers. */
+static void test_answers_stop(void) {
+  printf("answers stop for good\n");
+  reset();
+  master_t a = master_a();
+  ptp_clock_set_master_clock_id(MASTER_A);
+  settle(&a, 48);
+  CHECK(two_way(), "not two-way to begin with");
+  a.answers = false;
+  for (int i = 0; i < PTP_DREQ_LOST_LIMIT - 4; i++) {
+    exchange(&a, 1 + jitter_ms(i) / 4, 1);
+  }
+  CHECK(ptp.mode == PTP_MODE_TWO_WAY, "gave up on two-way before 80 SYNCs");
+  for (int i = 0; i < 8; i++) {
+    exchange(&a, 1 + jitter_ms(i) / 4, 1);
+  }
+  CHECK(ptp.mode == PTP_MODE_PASSIVE && !two_way(),
+        "still on two-way after 80 SYNCs without an answer");
+  CHECK(ptp_clock_is_locked() && llabs(error_ns(&a)) < MS,
+        "lost the clock falling back (%lld us)",
+        (long long)(error_ns(&a) / US));
+  /* +50 ms, then -50 ms: within 1 ms of the master, or unlocked, from 5 s
+   * after a forward step (a passive fall is followed after 160 SYNCs). */
+  static const int64_t steps[] = {50 * MS, -50 * MS};
+  static const int settle_syncs[] = {40, 180};
+  for (int k = 0; k < 2; k++) {
+    a.offset += steps[k];
+    for (int i = 0; i < 240; i++) {
+      exchange(&a, 1 + jitter_ms(i) / 4, 1);
+      if (i >= settle_syncs[k] && ptp_clock_is_locked() &&
+          llabs(error_ns(&a)) > MS) {
+        CHECK(false, "locked %lld us off, %d SYNCs after a %+lld ms step",
+              (long long)(error_ns(&a) / US), i, (long long)(steps[k] / MS));
+        break;
+      }
+    }
+    CHECK(ptp_clock_is_locked(), "unlocked after the %+lld ms step",
+          (long long)(steps[k] / MS));
+  }
+  /* The master answers again: the next retry brings two-way back. */
+  a.answers = true;
+  for (int i = 0; i < 160; i++) {
+    exchange(&a, 1 + jitter_ms(i) / 4, 1 + jitter_ms(i + 3) / 4);
+  }
+  CHECK(ptp.mode == PTP_MODE_TWO_WAY && two_way() && ptp_clock_is_locked(),
+        "two-way not restored");
+  CHECK(llabs(error_ns(&a)) < MS, "error %lld us back on two-way",
+        (long long)(error_ns(&a) / US));
 }
 
 /* t3 from the Wi-Fi driver's TX-done report: our Delay_Req is found by
@@ -1333,6 +1386,7 @@ int main(void) {
   test_passive_step();
   test_bmca_and_gm_change();
   test_answer_burst_stays_two_way();
+  test_answers_stop();
   test_tx_done_scan();
   test_anchor_gm_handover();
   test_anchor_gm_silence();
