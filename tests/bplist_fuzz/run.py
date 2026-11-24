@@ -51,7 +51,9 @@ def as_int64(v):
 
 
 def int_of(v):
-    """What an integer lookup reads."""
+    """What an integer lookup reads: an integer, or a boolean as 0 or 1."""
+    if isinstance(v, bool):
+        return int(v)
     return as_int64(v) if is_int(v) else None
 
 
@@ -294,7 +296,12 @@ def handpicked():
         yield {"int": v, "real": v}
     for v in (0.0, -0.0, 1.5, -2.25, 1e300, 5e-324, float("inf")):
         yield {"real": v, "int": v}
+    # Booleans read as integers, as CFDictionaryGetInt64 reads them (SETUP's
+    # isRemoteControlOnly arrives as one).
     yield {"real": True, "int": False}
+    yield {"int": True, "isRemoteControlOnly": True}
+    yield {"params": {"value": False}}
+    yield {"streams": [{"type": True, "shk": bytes(32)}]}
     for n in (0, 1, 15, 16, 31, 32):
         yield {"str": "s" * n}
     yield {"str": "Café"}
@@ -607,6 +614,11 @@ def main():
                           f"  (parser, model): {diff}")
         if failures:
             raise SystemExit(f"FAIL: {failures} of {len(valid)} valid plists")
+        # bplist_find_int() reads true and false as 1 and 0.
+        for flag in (False, True):
+            data = plistlib.dumps({"int": flag}, fmt=plistlib.FMT_BINARY)
+            line = run(binary, [data], timeout=10)[0]
+            assert parse_line(line)["int"] == str(int(flag)), line
 
         hostile = hostile_corpus()
         run(binary, hostile, timeout=120)

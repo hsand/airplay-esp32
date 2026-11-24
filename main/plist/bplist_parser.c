@@ -214,11 +214,17 @@ static bool bp_read_data(const bplist_t *bp, size_t offset, uint8_t *out,
   return true;
 }
 
+// An integer, or a boolean as 0 or 1, as CFDictionaryGetInt64 reads one:
+// Apple sends some flags (SETUP's isRemoteControlOnly) as booleans.
 static bool bp_read_int(const bplist_t *bp, size_t offset, int64_t *out) {
   if (offset >= bp->objects_end) {
     return false;
   }
   const uint8_t marker = bp->data[offset];
+  if (marker == 0x08 || marker == 0x09) {
+    *out = marker == 0x09;
+    return true;
+  }
   // 1 to 8 bytes, or 16 for an unsigned value above INT64_MAX (whose low 8
   // bytes are returned).
   if ((marker & 0xF0) != BPLIST_INT || (marker & 0x0F) > 4) {
