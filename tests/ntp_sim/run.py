@@ -3,7 +3,9 @@
 
 Both builds run the real ntp_clock.c task loop against the same seeded
 simulated sender, Wi-Fi link and drifting crystal (see sim.c), and the table
-compares their error in network time "now" against the truth.
+compares their error in network time "now" against the truth.  The current
+code must then stay within LIMITS and no worse than v0.3.0, or the run exits
+non-zero.
 
 Requires Python 3 and a C compiler; no ESP-IDF installation or hardware needed.
 Run from any directory with: python3 tests/ntp_sim/run.py
@@ -36,6 +38,22 @@ COLUMNS = (
     ("startup", "<60s p95 us", 1),
     ("recovery", "recover s", 1),
 )
+
+
+# Upper bounds for the current code, about 1.25x (means) to 1.5x (worst seed)
+# what it measures today, so only a regression trips them: mean p95|e| us,
+# worst-seed p95|e| us, mean <60s p95 us, mean recover s.  The simulation is
+# seeded and deterministic; the margin absorbs libm and compiler differences.
+LIMITS = {
+    "lan": (350, 450, 600, None),
+    "wifi": (1300, 2000, 1600, None),
+    "wifi_bad": (3700, 5500, 5500, None),
+    "step_30ms": (2400, 5000, 1600, 260),
+    "step_400ms": (1800, 6500, 1600, 150),
+}
+# Every seed has to lock, and within this.
+LOCK_LIMIT_S = 2.0
+SEEDS = 8
 
 
 def build(build_dir, name, source, include, defines):
@@ -99,6 +117,40 @@ def table(builds):
           "(NTP_FREQ_ACQUIRE=0), i.e. Apple's clock discipline alone.")
 
 
+def check(new, old):
+    """Returns the failures of the current code against LIMITS and v0.3.0."""
+    failures = []
+
+    def mean(rows, key):
+        return statistics.fmean(r[key] for r in rows)
+
+    for name, (p95, worst, startup, recovery) in LIMITS.items():
+        rows = new.get(name, [])
+        if len(rows) != SEEDS:
+            failures.append(f"{name}: {len(rows)} of {SEEDS} seeds ran")
+            continue
+        limits = [("mean p95|e| us", mean(rows, "p95"), p95),
+                  ("worst p95|e| us", max(r["p95"] for r in rows), worst),
+                  ("mean <60s p95 us", mean(rows, "startup"), startup),
+                  ("worst lock s", max(r["lock"] for r in rows),
+                   LOCK_LIMIT_S)]
+        if recovery is not None:
+            limits.append(("mean recover s", mean(rows, "recovery"),
+                           recovery))
+        for label, value, limit in limits:
+            if value > limit:
+                failures.append(f"{name}: {label} {value:.1f} > {limit}")
+        if min(r["lock"] for r in rows) < 0:
+            failures.append(f"{name}: a seed never locked")
+        # Without a sender step the frequency acquisition has to pay its way.
+        if recovery is None and name in old:
+            baseline = mean(old[name], "p95")
+            if mean(rows, "p95") > baseline:
+                failures.append(f"{name}: mean p95|e| {mean(rows, 'p95'):.1f}"
+                                f" us is worse than v0.3.0's {baseline:.1f}")
+    return failures
+
+
 with tempfile.TemporaryDirectory(prefix="ntp-sim-") as temporary:
     build_dir = Path(temporary)
     for name in SHIMS:
@@ -114,6 +166,13 @@ with tempfile.TemporaryDirectory(prefix="ntp-sim-") as temporary:
     old = build(build_dir, "sim_old", HERE / "baseline/ntp_clock.c",
                 HERE / "baseline", [])
     subprocess.run([str(new), "--units"], check=True)
-    table([("v0.3.0", collect(old)), ("apple", collect(apple)),
-           ("new", collect(new))])
+    old_rows, new_rows = collect(old), collect(new)
+    table([("v0.3.0", old_rows), ("apple", collect(apple)),
+           ("new", new_rows)])
+    failures = check(new_rows, old_rows)
+    for failure in failures:
+        print(f"FAIL {failure}")
     sys.stdout.flush()
+    if failures:
+        sys.exit(f"{len(failures)} limit(s) exceeded")
+    print("\nThe current code is within every limit.")
