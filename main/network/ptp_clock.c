@@ -1776,8 +1776,14 @@ static void handle_delay_resp(const uint8_t *data, size_t len,
     ptp.superseded++;
     return;
   }
+  // The Delay_Resp's correctionField is the Delay_Req's residence time in
+  // transparent clocks on the way (the master copies it over), so it is
+  // subtracted: t4 is when the Delay_Req would have arrived without them
+  // (IEEE 1588-2019 11.3.2).  Apple's kernel adds it instead; AirPlay paths
+  // have no transparent clocks and the field is 0, so this only matters on
+  // a network that does have one, where adding would double the error.
   ptp.x_t4 =
-      parse_ptp_timestamp_ns(data + PTP_TIMESTAMP_OFFSET) + h->correction_ns;
+      parse_ptp_timestamp_ns(data + PTP_TIMESTAMP_OFFSET) - h->correction_ns;
   ptp.x_have_t4 = true;
   // t3 from the driver's TX-done report when there is one for this
   // Delay_Req, after it was handed to the stack and not in the future.

@@ -234,18 +234,27 @@ static void send_announce(const master_t *m, uint64_t gm, uint8_t p1,
   handle_packet(p, sizeof(p), false, m->ip, 0);
 }
 
-/* Answer the Delay_Req the clock just sent, if it was for this master. */
-static void answer(const master_t *m, int64_t rev_us) {
+/* Answer the Delay_Req the clock just sent, if it was for this master.  A
+ * transparent clock on the way back holds the Delay_Req for residence_us
+ * and says so in the correctionField (2^-16 ns), which the master copies
+ * into its Delay_Resp. */
+static void answer_tc(const master_t *m, int64_t rev_us, int64_t residence_us) {
   if (!m->answers || dreq_ip != m->ip || dreq_count == 0) {
     return;
   }
-  const int64_t t4 = master_time(m, dreq_local_ns + rev_us * US);
+  const int64_t t4 =
+      master_time(m, dreq_local_ns + (rev_us + residence_us) * US);
   uint8_t p[54];
   header(p, sizeof(p), PTP_MSG_DELAY_RESP, m->clock, m->port,
          (uint16_t)((dreq[30] << 8) | dreq[31]), m->log_interval);
+  put_be(p + 8, (uint64_t)(residence_us * US * 65536), 8);
   put_ts(p + 34, t4);
   memcpy(p + 44, dreq + 20, 10);
   handle_packet(p, sizeof(p), false, m->ip, 0);
+}
+
+static void answer(const master_t *m, int64_t rev_us) {
+  answer_tc(m, rev_us, 0);
 }
 
 /* One SYNC interval: SYNC whose trip took fwd_ms, FOLLOW_UP, and the answer
@@ -519,6 +528,32 @@ static void test_delay_resp_matching(void) {
   handle_packet(p, sizeof(p), false, a.ip, 0);
   CHECK(ptp.superseded == sup + 1, "stale Delay_Resp not superseded");
   CHECK(ptp.x_active && !ptp.x_have_t4, "stale Delay_Resp completed the pair");
+}
+
+/* A transparent clock's residence time in the Delay_Resp correctionField is
+ * taken off t4, as IEEE 1588 says: the clock lands on the master's time, not
+ * half the residence time beside it. */
+static void test_delay_resp_correction(void) {
+  printf("Delay_Resp correctionField\n");
+  reset();
+  master_t a = master_a();
+  for (int i = 0; i < 200; i++) {
+    mock_now_us += SYNC_INTERVAL * 1000;
+    const int64_t t1 = master_time(&a, now_ns());
+    const uint16_t seq = a.seq++;
+    mock_now_us += 800;
+    const int before = dreq_count;
+    send_sync(&a, seq);
+    send_followup(&a, seq, t1);
+    mock_now_us += 2000 + 800;
+    if (dreq_count != before) {
+      answer_tc(&a, 800, 2000);
+    }
+  }
+  CHECK(ptp_clock_is_locked() && two_way(), "not locked two-way");
+  CHECK(llabs(error_ns(&a)) < 20 * US,
+        "error %lld us with a 2 ms residence time corrected for",
+        (long long)(error_ns(&a) / US));
 }
 
 /* ---------- gates and steps ---------- */
@@ -1285,6 +1320,7 @@ int main(void) {
   test_drift_ramp();
   test_long_run_precision();
   test_delay_resp_matching();
+  test_delay_resp_correction();
   test_delayed_first_sample();
   test_delay_burst_ignored();
   test_backward_step_followed();
