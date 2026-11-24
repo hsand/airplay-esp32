@@ -130,6 +130,7 @@ nav:
       - HybridFlow DSP (TAS57xx): features/hybridflow.md
       - TAS58xx DAC: features/tas58xx.md
       - Software EQ: features/software-eq.md
+      - Output latency: features/output-latency.md
       - AirPlay tuning: features/airplay-tuning.md
   - Reference:
       - Build environments: reference/build-environments.md
