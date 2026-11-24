@@ -253,6 +253,10 @@ esp_err_t iot_board_deinit(void) {
 
   dac_enable_speaker(false);
   dac_set_power_mode(DAC_POWER_OFF);
+  /* An OFF that follows ON is deferred by DAC_QUIET_DELAY_MS.  dac_deinit()
+   * applies it now and releases the amplifiers, so nothing writes to the bus
+   * after it is deleted below. */
+  dac_deinit();
 
   // Tear down I2C bus (after DAC is deinitialized)
   if (s_i2c_bus_handle != NULL) {

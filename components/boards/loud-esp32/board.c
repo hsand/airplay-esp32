@@ -151,6 +151,8 @@ esp_err_t iot_board_deinit(void) {
 
   playback_events_unregister(on_playback_event);
   dac_set_power_mode(DAC_POWER_OFF);
+  // Applies an OFF still deferred by DAC_QUIET_DELAY_MS before returning.
+  dac_deinit();
 
 #ifdef CONFIG_ETH_W5500_ENABLED
   if (s_spi_bus_initialized) {
