@@ -38,9 +38,15 @@
 
 #ifdef ESP_PLATFORM
 #include "lwip/pbuf.h"
-#if defined(CONFIG_ESP_WIFI_ENABLED) && CONFIG_ESP_WIFI_ENABLED
-// esp_wifi_set_tx_done_cb(): the Wi-Fi driver's TX-done callback, used for
-// t3 as Apple's stack uses its driver's transmit completion.
+#include "sdkconfig.h"
+// esp_wifi_set_tx_done_cb(): the in-chip Wi-Fi driver's TX-done callback,
+// used for t3 as Apple's stack uses its driver's transmit completion.  It
+// is declared in ESP-IDF's private Wi-Fi header, not a public API, so it
+// may change between IDF releases.  Chips without in-chip Wi-Fi (the
+// ESP32-P4) do not have it.  The host tests define PTP_HAVE_TX_DONE
+// themselves, with a mock driver.
+#if defined(CONFIG_SOC_WIFI_SUPPORTED) && CONFIG_SOC_WIFI_SUPPORTED && \
+    defined(CONFIG_ESP_WIFI_ENABLED) && CONFIG_ESP_WIFI_ENABLED
 #include "esp_private/wifi.h"
 #define PTP_HAVE_TX_DONE 1
 #endif
@@ -90,13 +96,27 @@ static const char *TAG = "ptp_clock";
 #define PTP_TWO_WAY_RETRY_MS      10000
 // t3, as Apple takes it: when the driver reports the Delay_Req transmitted
 // (esp_wifi_set_tx_done_cb(), the Wi-Fi driver's TX-done callback).  Where
-// that is unavailable (Ethernet, or a driver that never reports our frame)
-// t3 falls back to a local read right after sendto(), bracketed by one
-// before it; a bracket wider than this means the task was preempted around
-// the send, and the exchange is dropped rather than biased by half the
-// preemption -- the software analogue of Apple rejecting implausible TX
-// timestamps.
+// that is unavailable (Ethernet, a chip without in-chip Wi-Fi, or a driver
+// that does not report our frame) t3 is a local read right after sendto(),
+// bracketed by one before it; a bracket wider than this means the task was
+// preempted around the send, and the exchange is dropped rather than biased
+// by half the preemption -- the software analogue of Apple rejecting
+// implausible TX timestamps.
 #define PTP_TX_STAMP_MAX_NS 500000LL
+// The two sources differ: the TX-done stamp comes after the driver's queue
+// and the air time (retries included), the software one before them, so
+// their t3s for the same frame differ by a variable few hundred us, which
+// moves a midpoint by half that.  The two-way filter therefore takes t3 from
+// one source only.  Once TX-done stamps arrive it uses them alone, and an
+// exchange whose stamp is missing is dropped; after this many in a row the
+// driver is taken to have stopped reporting (Wi-Fi was re-initialised, or
+// the traffic moved to Ethernet) and the filter goes back to software t3.
+// Each change of source re-seeds the filter.  The same run of misses, on
+// either source, has the callback registered again.
+#define PTP_TX_DONE_MISS_LIMIT 16
+// Registration is retried at most this often while it fails (Wi-Fi not
+// initialised), or after the driver stopped reporting.
+#define PTP_TX_DONE_RETRY_MS 10000
 // A TX-done callback frame longer than this cannot be a Delay_Req (44 bytes
 // of PTP in UDP/IPv4 under an 802.11 or Ethernet header); not scanned.
 #define PTP_TX_DONE_MAX_FRAME 200
@@ -433,10 +453,14 @@ static struct {
   uint32_t rejected_master_count; // SYNC from a port not on the chosen GM
   uint32_t dreq_sent;
   uint32_t dresp_received;
-  uint32_t last_dresp_ms; // last answer on the selected port (0 = none)
-  uint32_t tx_slow;       // exchanges dropped for a wide t3 bracket
-  uint32_t tx_done_used;  // exchanges whose t3 came from the TX-done callback
-  int64_t x_t3_pre;       // local time just before sendto() of x_dreq_seq
+  uint32_t last_dresp_ms;  // last answer on the selected port (0 = none)
+  uint32_t tx_slow;        // exchanges dropped for a wide t3 bracket
+  uint32_t tx_done_used;   // exchanges whose t3 came from the TX-done callback
+  uint32_t tx_done_lost;   // exchanges dropped for a missing TX-done stamp
+  uint32_t tx_done_misses; // completed exchanges in a row without one
+  bool t3_tx_done;         // the two-way filter is on TX-done t3
+  bool tx_done_retry;      // the driver stopped reporting: register again
+  int64_t x_t3_pre;        // local time just before sendto() of x_dreq_seq
   uint32_t dreq_tx_errors;
   uint32_t superseded;
   uint32_t out_of_order;
@@ -685,16 +709,49 @@ static void ptp_wifi_tx_done(uint8_t ifidx, uint8_t *data, uint16_t *data_len,
     tx_done_scan(data, *data_len, esp_timer_get_time());
   }
 }
+
+// Only the PTP task registers, and ptp_clock_stop() unregisters once that
+// task has exited.
+static bool tx_done_registered;
+static uint32_t tx_done_attempt_ms;
+static bool tx_done_attempted;
 #endif
 
-// Register the TX-done callback once Wi-Fi is up (it refuses before
-// esp_wifi_start()); retried on each Delay_Req until it takes.
-static void ensure_tx_done_cb(void) {
+// Register the TX-done callback, before a Delay_Req is sent.  It fails until
+// esp_wifi_init() has run and is then retried every 10 s, as it is when the
+// driver stopped reporting our frames: esp_wifi_deinit() may have dropped
+// the registration.  The driver has a single slot; nothing else in this
+// firmware uses it.
+static void ensure_tx_done_cb(uint32_t now) {
 #ifdef PTP_HAVE_TX_DONE
-  static bool registered;
-  if (!registered && esp_wifi_set_tx_done_cb(ptp_wifi_tx_done) == ESP_OK) {
-    registered = true;
+  portENTER_CRITICAL(&ptp_state_mux);
+  const bool retry = ptp.tx_done_retry;
+  ptp.tx_done_retry = false;
+  portEXIT_CRITICAL(&ptp_state_mux);
+  if (retry) {
+    tx_done_registered = false;
   }
+  if (tx_done_registered ||
+      (tx_done_attempted && now - tx_done_attempt_ms < PTP_TX_DONE_RETRY_MS)) {
+    return;
+  }
+  tx_done_attempted = true;
+  tx_done_attempt_ms = now;
+  tx_done_registered = esp_wifi_set_tx_done_cb(ptp_wifi_tx_done) == ESP_OK;
+#else
+  (void)now;
+#endif
+}
+
+// Empty the driver's slot.  It checks the slot for NULL before calling it
+// (ESP-IDF 5.5's Wi-Fi library), so NULL unregisters.
+static void tx_done_unregister(void) {
+#ifdef PTP_HAVE_TX_DONE
+  if (tx_done_registered) {
+    (void)esp_wifi_set_tx_done_cb(NULL);
+    tx_done_registered = false;
+  }
+  tx_done_attempted = false;
 #endif
 }
 
@@ -1766,6 +1823,51 @@ static void handle_followup(const uint8_t *data, size_t len, const ptp_hdr_t *h,
   publish_model(act);
 }
 
+// Caller holds ptp_state_mux.  The two-way filter has a new t3 source: the
+// midpoints move by half the difference, and the delays it gates on change,
+// so it starts over on this timeline (lock and rate kept).
+static void t3_source_changed(bool tx_done) {
+  ptp.t3_tx_done = tx_done;
+  ptp.tx_done_misses = 0;
+  servo_unseed(&ptp.tw, true);
+  reset_delay_stats();
+  ptp.delay_total = 0;
+  ptp.lucky_limit_ns = INT64_MAX;
+}
+
+// Caller holds ptp_state_mux.  t3 for the exchange whose Delay_Resp just
+// arrived, from one source as described at PTP_TX_DONE_MISS_LIMIT: the
+// driver's TX-done stamp when it reported this Delay_Req, after it was
+// handed to the stack and not in the future; else the software stamp taken
+// at sendto(), unless the filter is on TX-done stamps.
+static void select_t3(void) {
+  int64_t tx_ns;
+  if (tx_done_stamp_ns(ptp.x_dreq_seq, &tx_ns) && ptp.x_t3_pre != 0 &&
+      tx_ns >= ptp.x_t3_pre && tx_ns <= get_local_time_ns()) {
+    if (!ptp.t3_tx_done) {
+      t3_source_changed(true);
+    }
+    ptp.tx_done_misses = 0;
+    ptp.x_t3 = tx_ns;
+    ptp.x_have_t3 = true;
+    ptp.tx_done_used++;
+    return;
+  }
+  const bool stopped = ++ptp.tx_done_misses >= PTP_TX_DONE_MISS_LIMIT;
+  if (stopped) {
+    ptp.tx_done_misses = 0;
+    ptp.tx_done_retry = true; // register again (at most every 10 s)
+  }
+  if (!ptp.t3_tx_done) {
+    return; // software t3, if its bracket was tight
+  }
+  ptp.x_have_t3 = false;
+  ptp.tx_done_lost++;
+  if (stopped) {
+    t3_source_changed(false);
+  }
+}
+
 static void handle_delay_resp(const uint8_t *data, size_t len,
                               const ptp_hdr_t *h, uint32_t src_ip,
                               ptp_actions_t *act) {
@@ -1806,15 +1908,7 @@ static void handle_delay_resp(const uint8_t *data, size_t len,
   ptp.x_t4 =
       parse_ptp_timestamp_ns(data + PTP_TIMESTAMP_OFFSET) - h->correction_ns;
   ptp.x_have_t4 = true;
-  // t3 from the driver's TX-done report when there is one for this
-  // Delay_Req, after it was handed to the stack and not in the future.
-  int64_t tx_ns;
-  if (tx_done_stamp_ns(ptp.x_dreq_seq, &tx_ns) && ptp.x_t3_pre != 0 &&
-      tx_ns >= ptp.x_t3_pre && tx_ns <= get_local_time_ns()) {
-    ptp.x_t3 = tx_ns;
-    ptp.x_have_t3 = true;
-    ptp.tx_done_used++;
-  }
+  select_t3();
   if (ptp.x_have_t1 && ptp.x_have_t3) {
     two_way_sample(p, act);
     publish_model(act);
@@ -1982,7 +2076,7 @@ static void handle_packet(const uint8_t *data, size_t len, bool is_event_port,
     dst.sin_family = AF_INET;
     dst.sin_port = htons(PTP_EVENT_PORT);
     dst.sin_addr.s_addr = act.dreq_ip;
-    ensure_tx_done_cb();
+    ensure_tx_done_cb(now_ms());
     const int64_t t3_pre = get_local_time_ns();
     const ssize_t sent = sendto(ptp.event_socket, act.dreq, PTP_DELAY_REQ_LEN,
                                 0, (struct sockaddr *)&dst, sizeof(dst));
@@ -2044,6 +2138,7 @@ static void log_status(void) {
   const uint32_t hook = ptp.rx_hook_stamps, task = ptp.rx_task_stamps;
   const uint32_t rejected = ptp.rejected_master_count;
   const uint32_t tx_slow = ptp.tx_slow, tx_done = ptp.tx_done_used;
+  const uint32_t tx_lost = ptp.tx_done_lost;
   const int64_t bias = ptp.passive_bias_n ? ptp.passive_bias_ns : 0;
   portEXIT_CRITICAL(&ptp_state_mux);
   if (syncs == 0) {
@@ -2066,16 +2161,17 @@ static void log_status(void) {
            (unsigned long)recv, rtt_min, rtt_med,
            (unsigned long)(isqrt64((uint64_t)resid_ms) / 1000),
            ppb < 0 ? '-' : '+', ppb_abs / 1000, ppb_abs % 1000);
-  ESP_LOGI(TAG,
-           "status: drops gate=%lu delay=%lu passive=%lu lucky=%lu "
-           "t3 txdone=%lu slow=%lu resets drop=%lu oob=%lu gap=%lu gm=%lu "
-           "bias_us=%ld "
-           "rx hook=%lu task=%lu rejected=%lu",
-           (unsigned long)ppm, (unsigned long)dly, (unsigned long)pas,
-           (unsigned long)lucky, (unsigned long)tx_done, (unsigned long)tx_slow,
-           (unsigned long)r_drop, (unsigned long)r_oob, (unsigned long)r_gap,
-           (unsigned long)r_gm, (long)(bias / 1000), (unsigned long)hook,
-           (unsigned long)task, (unsigned long)rejected);
+  ESP_LOGI(
+      TAG,
+      "status: drops gate=%lu delay=%lu passive=%lu lucky=%lu "
+      "t3 txdone=%lu lost=%lu slow=%lu resets drop=%lu oob=%lu gap=%lu gm=%lu "
+      "bias_us=%ld "
+      "rx hook=%lu task=%lu rejected=%lu",
+      (unsigned long)ppm, (unsigned long)dly, (unsigned long)pas,
+      (unsigned long)lucky, (unsigned long)tx_done, (unsigned long)tx_lost,
+      (unsigned long)tx_slow, (unsigned long)r_drop, (unsigned long)r_oob,
+      (unsigned long)r_gap, (unsigned long)r_gm, (long)(bias / 1000),
+      (unsigned long)hook, (unsigned long)task, (unsigned long)rejected);
 }
 
 // ---- Sockets and task
@@ -2342,6 +2438,7 @@ void ptp_clock_stop(void) {
     ESP_LOGW(TAG, "PTP task did not exit in time");
   }
   task_free_spiram(&ptp.task_mem);
+  tx_done_unregister();
 }
 
 void ptp_clock_clear(void) {

@@ -61,3 +61,11 @@ esp_err_t esp_read_mac(uint8_t *mac, int type);
 ssize_t mock_sendto(int fd, const void *buf, size_t len, int flags,
                     const struct sockaddr *dst, socklen_t dst_len);
 #define sendto mock_sendto
+
+// The Wi-Fi driver's TX-done callback (esp_private/wifi.h), when the test
+// defines PTP_HAVE_TX_DONE.
+#ifdef PTP_HAVE_TX_DONE
+typedef void (*wifi_tx_done_cb_t)(uint8_t ifidx, uint8_t *data,
+                                  uint16_t *data_len, bool txStatus);
+esp_err_t esp_wifi_set_tx_done_cb(wifi_tx_done_cb_t cb);
+#endif

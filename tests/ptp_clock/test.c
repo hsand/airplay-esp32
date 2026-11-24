@@ -16,6 +16,9 @@
  *  - samples come from one chosen port, so "mixed masters" no longer
  *    exists; ports and GMs are tested instead. */
 
+/* The TX-done path is built as on a chip with in-chip Wi-Fi, against the
+ * mock driver below. */
+#define PTP_HAVE_TX_DONE 1
 #include "ptp_clock.c"
 
 #include <math.h>
@@ -128,6 +131,21 @@ ssize_t mock_sendto(int fd, const void *buf, size_t len, int flags,
   dreq_port = ntohs(in->sin_port);
   dreq_local_ns = (int64_t)mock_now_us * 1000;
   return (ssize_t)len;
+}
+
+/* The Wi-Fi driver's single TX-done slot.  Registration fails while
+ * wifi_set_result says so (Wi-Fi not initialised). */
+static wifi_tx_done_cb_t wifi_cb;
+static esp_err_t wifi_set_result = ESP_OK;
+static int wifi_set_calls;
+
+esp_err_t esp_wifi_set_tx_done_cb(wifi_tx_done_cb_t cb) {
+  wifi_set_calls++;
+  if (wifi_set_result != ESP_OK) {
+    return wifi_set_result;
+  }
+  wifi_cb = cb;
+  return ESP_OK;
 }
 
 /* ---------- a scripted master ---------- */
@@ -868,6 +886,102 @@ static void test_answers_stop(void) {
         (long long)(error_ns(&a) / US));
 }
 
+/* One SYNC interval over a symmetric path of path_us each way, where the
+ * Delay_Req leaves tx_us after sendto() (the driver's queue and the air
+ * time) and, when `report`, the driver says so through its TX-done slot. */
+static void exchange_tx(master_t *m, int64_t path_us, int64_t tx_us,
+                        bool report) {
+  mock_now_us += SYNC_INTERVAL * 1000;
+  const int64_t t1 = master_time(m, now_ns());
+  const uint16_t seq = m->seq++;
+  mock_now_us += path_us;
+  const int before = dreq_count;
+  send_sync(m, seq);
+  mock_now_us += tx_us;
+  if (dreq_count != before && report && wifi_cb != NULL) {
+    /* behind 24 bytes of 802.11 header, 8 of LLC, 20 of IPv4, 8 of UDP */
+    uint8_t frame[60 + PTP_DELAY_REQ_LEN] = {0};
+    memcpy(frame + 60, dreq, PTP_DELAY_REQ_LEN);
+    uint16_t len = sizeof(frame);
+    wifi_cb(0, frame, &len, true);
+  }
+  mock_now_us += 100;
+  send_followup(m, seq, t1);
+  mock_now_us += 2 * path_us;
+  if (dreq_count != before) {
+    answer(m, path_us + tx_us);
+  }
+}
+
+/* t3 from the TX-done report, end to end: registration once Wi-Fi is up
+ * (retried every 10 s), the switch from software t3 to the driver's stamps,
+ * exchanges whose stamp is missing dropped rather than mixed in, the return
+ * to software t3 and a new registration when the driver stops reporting
+ * (Wi-Fi re-initialised), and unregistering. */
+static void test_tx_done_t3(void) {
+  printf("TX-done t3 exchanges\n");
+  tx_done_unregister();
+  wifi_cb = NULL;
+  wifi_set_calls = 0;
+  wifi_set_result = 0x3001; /* ESP_ERR_WIFI_NOT_INIT */
+  reset();
+  master_t a = master_a();
+  /* Software t3 is 600 us early: the midpoint sits 300 us late. */
+  for (int i = 0; i < 400; i++) {
+    exchange_tx(&a, 800, 600, true);
+  }
+  CHECK(wifi_cb == NULL && !ptp.t3_tx_done, "registered while Wi-Fi was off");
+  CHECK(wifi_set_calls >= 5 && wifi_set_calls <= 6,
+        "%d registration attempts in 50 s", wifi_set_calls);
+  CHECK(ptp_clock_is_locked() && llabs(error_ns(&a) - 300 * US) < 50 * US,
+        "software t3: error %lld us, want +300",
+        (long long)(error_ns(&a) / US));
+  /* Wi-Fi comes up: the next attempt takes, and the filter moves to the
+   * driver's stamps, which are when the frame left. */
+  wifi_set_result = ESP_OK;
+  for (int i = 0; i < 400; i++) {
+    exchange_tx(&a, 800, 600, true);
+    CHECK(ptp_clock_is_locked(), "unlocked by the change of t3 source");
+  }
+  CHECK(wifi_cb != NULL && ptp.t3_tx_done, "not on TX-done t3");
+  CHECK(llabs(error_ns(&a)) < 50 * US, "TX-done t3: error %lld us",
+        (long long)(error_ns(&a) / US));
+  /* A few exchanges without a stamp are dropped, not fed on software t3. */
+  const uint16_t fed = ptp.tw.last_seq;
+  const uint32_t lost = ptp.tx_done_lost;
+  for (int i = 0; i < 8; i++) {
+    exchange_tx(&a, 800, 600, false);
+  }
+  CHECK(ptp.tw.last_seq == fed && ptp.tx_done_lost == lost + 8,
+        "an exchange without a stamp reached the filter");
+  CHECK(ptp.t3_tx_done, "left TX-done t3 after 8 misses");
+  for (int i = 0; i < 40; i++) {
+    exchange_tx(&a, 800, 600, true);
+  }
+  /* Wi-Fi re-initialised: the driver's slot is empty, so the stamps stop.
+   * After 16 misses the filter is back on software t3 and the callback is
+   * registered again; the stamps return and so does TX-done t3. */
+  wifi_cb = NULL;
+  const int calls = wifi_set_calls;
+  for (int i = 0; i < PTP_TX_DONE_MISS_LIMIT; i++) {
+    exchange_tx(&a, 800, 600, true);
+  }
+  CHECK(!ptp.t3_tx_done, "still on TX-done t3 after the driver stopped");
+  exchange_tx(&a, 800, 600, true);
+  CHECK(wifi_set_calls == calls + 1 && wifi_cb != NULL,
+        "callback not registered again");
+  for (int i = 0; i < 200; i++) {
+    exchange_tx(&a, 800, 600, true);
+    CHECK(ptp_clock_is_locked(), "unlocked by the change of t3 source");
+  }
+  CHECK(ptp.t3_tx_done && llabs(error_ns(&a)) < 50 * US,
+        "TX-done t3 not resumed (error %lld us)",
+        (long long)(error_ns(&a) / US));
+  /* ptp_clock_stop() empties the slot. */
+  tx_done_unregister();
+  CHECK(wifi_cb == NULL, "callback still registered after stop");
+}
+
 /* t3 from the Wi-Fi driver's TX-done report: our Delay_Req is found by
  * content in whatever framing the driver hands back; anything else is
  * ignored. */
@@ -1388,6 +1502,7 @@ int main(void) {
   test_answer_burst_stays_two_way();
   test_answers_stop();
   test_tx_done_scan();
+  test_tx_done_t3();
   test_anchor_gm_handover();
   test_anchor_gm_silence();
   test_relayed_port();
