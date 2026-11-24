@@ -166,7 +166,10 @@ size_t airplay_txt_raop(const airplay_txt_input_t *in, airplay_txt_item_t *out,
                         size_t max) {
   size_t n = 0;
   n = put_txt(out, max, n, "am", in->model);
-  n = put_txt(out, max, n, "cn", "0,1,2,3"); // PCM, ALAC, AAC, AAC-ELD
+  // PCM, ALAC, AAC.  Not AAC-ELD (3): esp_audio_codec decodes only AAC-LC
+  // and HE-AAC, and fed ELD it fails and then faults (measured in QEMU), so a
+  // sender that chose it would get silence and a crash.
+  n = put_txt(out, max, n, "cn", "0,1,2");
   n = put_txt(out, max, n, "da", "true");
   // et=1 (RSA) and ek=1 keep RAOP-only senders (TuneBlade, AirMusic...)
   // working; Apple's own record has et=0,3,5.

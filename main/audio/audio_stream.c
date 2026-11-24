@@ -54,6 +54,25 @@ static bool apply_aac_transient_mute(audio_receiver_state_t *state, bool wanted,
   return true;
 }
 
+// Where a decoded packet's PCM belongs on the RTP timeline.  An AAC
+// decoder's output for packet k is the overlap-add that completes the frame
+// *before* it (the MDCT's one-frame delay; esp_aac_dec adds nothing beyond
+// that, measured in QEMU against ffmpeg).  Apple's receiver therefore plays
+// AAC one packet earlier than its RTP timestamp: it subtracts the decoder's
+// delay, one packet x framesPerPacket, from the playout offset
+// (APReceiverAudioSessionRealTimeUpdateLatency's plc_delay_samples, from the
+// converter's kAudioConverterPrimeInfo; the buffered path's CoreMedia renderer
+// is time-aligned the same way).  Stamping it with its own timestamp put
+// every AAC stream one frame (23.2 ms at 44.1 kHz) late against Apple
+// speakers.  ALAC has no such delay.
+static uint32_t decoded_pcm_rtp(const audio_receiver_state_t *state,
+                                uint32_t rtp, size_t decoded_samples) {
+  if (audio_decoder_is_aac(state->decoder)) {
+    return rtp - (uint32_t)decoded_samples;
+  }
+  return rtp;
+}
+
 bool audio_stream_accept_timestamp(audio_receiver_state_t *state,
                                    uint32_t timestamp) {
   if (!state) {
@@ -192,8 +211,9 @@ bool audio_stream_process_accepted_frame(audio_receiver_state_t *state,
   }
 
   state->stats.packets_decoded++;
-  return audio_stream_push_timeline_pcm(state, timestamp, decode_buffer,
-                                        (size_t)decoded_samples, channels);
+  return audio_stream_push_timeline_pcm(
+      state, decoded_pcm_rtp(state, timestamp, (size_t)decoded_samples),
+      decode_buffer, (size_t)decoded_samples, channels);
 }
 
 bool audio_stream_process_frame(audio_receiver_state_t *state,
@@ -313,7 +333,9 @@ bool audio_stream_decode_encoded_packet(audio_receiver_state_t *state,
 
   for (;;) {
     const audio_engine_push_result_t pushed = audio_engine_v2_push_pcm_seq_wait(
-        &state->engine_v2, packet->epoch, packet->rtp_timestamp, packet->seq,
+        &state->engine_v2, packet->epoch,
+        decoded_pcm_rtp(state, packet->rtp_timestamp, (size_t)decoded_samples),
+        packet->seq,
         flush_generation, decode_buffer, (size_t)decoded_samples,
         (uint8_t)channels, AUDIO_DECODE_PUSH_TIMEOUT_MS);
     if (pushed == AUDIO_ENGINE_PUSH_OK) {
