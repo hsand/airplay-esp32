@@ -94,6 +94,9 @@ jobs:
       - name: Simulate the AirPlay 1 NTP clock against v0.3.0
         run: python3 tests/ntp_sim/run.py
 
+      - name: Simulate the PTP clock on a Wi-Fi network against v0.3.0
+        run: python3 tests/ptp_sim/run.py
+
       - name: Test AirPlay device names in binary plists
         run: python3 tests/bplist/run.py
 
@@ -105,6 +108,12 @@ jobs:
 
       - name: Test FLUSHBUFFERED ranges, anchor validation and timing peers
         run: python3 tests/airplay_control/run.py
+
+      - name: Test feature bits, preemption, remote commands and now playing
+        run: python3 tests/airplay_remote/run.py
+
+      - name: Test the output cursor against a model of the I2S TX queue
+        run: python3 tests/i2s_cursor/run.py
 
       - name: Simulate the buffered playout chain, v0.3.0 against this tree
         run: python3 tests/playout_sim/run.py
