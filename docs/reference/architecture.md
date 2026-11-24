@@ -153,23 +153,56 @@ main/
 ├── main.c                      # Entry point — NVS, WiFi, AirPlay services
 ├── settings.c                  # NVS persistence
 ├── audio/
-│   ├── audio_receiver.c        # RTSP session manager
+│   ├── audio_receiver.c        # RTSP session manager — buffered or realtime stream
+│   ├── audio_stream.c          # Base stream abstraction
 │   ├── audio_stream_buffered.c # AirPlay 2 AAC, deep jitter buffer
 │   ├── audio_stream_realtime.c # AirPlay 1 ALAC, low-latency UDP
+│   ├── rtp_resend.c            # Realtime retransmit requests (RTT-timed, Apple-style)
+│   ├── rtp_sync.c              # Realtime sync packets → one smoothed anchor per segment
 │   ├── audio_decoder.c         # ALAC and AAC decoders
-│   ├── audio_buffer.c          # Frame buffering
-│   ├── audio_timing.c          # PTP-based early/late frame handling
+│   ├── audio_decode_worker.c   # Decoder task fed from the receive path
+│   ├── audio_flush_queue.c     # FLUSHBUFFERED records, keyed on 24-bit sequence numbers
+│   ├── audio_buffer.c          # Decoder scratch space
+│   ├── audio_timeline.c        # RTP-addressed PCM store — holds the decoded audio
+│   ├── audio_plc.c             # Packet-loss concealment: fills holes with a faded repeat
+│   ├── audio_engine_v2.c       # Owns the epoch, timeline, clock map and scheduler
+│   ├── audio_scheduler.c       # Anchor/preroll/play/pause state machine + drift servo
+│   ├── audio_clock_map.c       # Sender time ↔ RTP (PTP for AirPlay 2, NTP for AirPlay 1)
+│   ├── audio_playout_clock.c   # Local → sender time per render: rate, anchor, freewheel
+│   ├── audio_epoch.c           # Generation counter that invalidates stale work
+│   ├── audio_timing.c          # Clock plumbing shared by the streams
+│   ├── audio_latency.c         # Output latency: DMA depth + FIFO + resampler + DAC + trim
+│   ├── audio_volume.c          # AirPlay dB → gain (Apple's law by default)
 │   ├── audio_resample.c        # 44.1 → 48 kHz conversion
-│   ├── audio_output*.c         # I2S, S/PDIF and USB backends
+│   ├── audio_output*.c         # I2S, S/PDIF and USB backends, weak defaults
+│   ├── audio_delay.c           # Per-output delay for multi-way speakers
 │   ├── audio_eq.c              # Software EQ for DACs without a DSP
+│   ├── eq_ab.c                 # Software/DSP EQ A/B switch on a TAS58xx
+│   ├── usb_audio_sink.c        # USB speaker: the host plays into the I2S DAC
+│   ├── audio_crypto.c          # AirPlay audio decryption
 │   └── a2dp_sink.c             # Bluetooth A2DP sink
-├── rtsp/                       # RTSP server, handlers, crypto, FairPlay,
-│                               # event channel, now-playing, advertisement policy
-├── hap/                        # HomeKit pairing — SRP, Ed25519
+├── rtsp/
+│   ├── rtsp_server.c           # Connections; one holds the session
+│   ├── rtsp_conn.c             # Connection management
+│   ├── rtsp_message.c          # Request parsing and response building
+│   ├── rtsp_handlers.c         # Method handlers (OPTIONS, SETUP, PLAY, …)
+│   ├── rtsp_anchor.c           # SETRATEANCHORTIME / FLUSHBUFFERED request validation
+│   ├── rtsp_events.c           # Event channel: commands back to the sender
+│   ├── rtsp_metadata.c         # DMAP, progress and artwork as one now-playing state
+│   ├── rtsp_policy.c           # Platform-free rules: features, TXT, pi, preemption
+│   ├── rtsp_crypto.c           # RTSP-level encryption
+│   ├── rtsp_fairplay.c         # FairPlay
+│   └── rtsp_rsa.c              # RSA (AirPlay 1)
+├── hap/                        # HomeKit pairing — SRP, Ed25519, TLV8
 ├── plist/                      # Apple property list parsing
 ├── network/                    # WiFi, Ethernet, mDNS, PTP, NTP, web server, OTA
+├── sendspin/                   # Sendspin player role (experimental)
+├── usb/                        # TinyUSB composite device (UAC + HID controls)
 ├── dacp_client.c               # DACP remote commands (AirPlay 1, old senders)
 ├── playback_control.c          # Unified playback abstraction
+├── playback_events.c           # Per-source playback state, fanned out
+├── bt_coex.c                   # Frees Bluetooth's DRAM when AirPlay takes over
+├── led.c                       # Status LED
 └── buttons.c                   # Debounced button input
 
 components/
