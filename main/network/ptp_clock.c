@@ -366,13 +366,13 @@ static struct {
   uint64_t gm_id; // timeline of the model (0 = none)
   bool model_valid;
 
-  uint64_t expected_clock_id; // GM named by the anchor (0 = BMCA)
+  uint64_t expected_clock_id;   // GM named by the anchor (0 = BMCA)
   uint32_t expected_gm_seen_ms; // last time a live port carried it
   // The anchor's GM was left for BMCA (handover or silence); stays set until
   // the next anchor names a GM, so the pin does not re-assert and flap.
   bool expected_released;
-  ptp_servo_t tw;             // two-way estimator
-  ptp_servo_t ow;             // passive (one-way) estimator
+  ptp_servo_t tw; // two-way estimator
+  ptp_servo_t ow; // passive (one-way) estimator
 
   // Passive front end
   int64_t win_best_r, win_best_l, win_best_res;
@@ -629,8 +629,8 @@ static ptp_tx_stamp_t tx_slot;
 // framing), so the message is found by content -- our sourcePortIdentity
 // at offset 20 of a version-2 Delay_Req -- rather than by header offsets.
 static void tx_done_scan(const uint8_t *data, size_t len, int64_t now_us) {
-  if (data == NULL || len < PTP_DELAY_REQ_LEN ||
-      len > PTP_TX_DONE_MAX_FRAME || !ptp.have_identity) {
+  if (data == NULL || len < PTP_DELAY_REQ_LEN || len > PTP_TX_DONE_MAX_FRAME ||
+      !ptp.have_identity) {
     return;
   }
   for (size_t i = 20; i + 10 + (PTP_DELAY_REQ_LEN - 30) <= len; i++) {
@@ -1208,8 +1208,8 @@ static void select_port(ptp_actions_t *act) {
         abdicated = true;
       }
     }
-    if (!carried && (abdicated ||
-               now - ptp.expected_gm_seen_ms >= PTP_ANNOUNCE_TIMEOUT_MS)) {
+    if (!carried && (abdicated || now - ptp.expected_gm_seen_ms >=
+                                      PTP_ANNOUNCE_TIMEOUT_MS)) {
       gm = 0;
       ptp.expected_released = true;
     }
@@ -1970,8 +1970,7 @@ static void handle_packet(const uint8_t *data, size_t len, bool is_event_port,
     portENTER_CRITICAL(&ptp_state_mux);
     if (sent == PTP_DELAY_REQ_LEN) {
       ptp.dreq_sent++;
-      if (ptp.x_active && ptp.x_dreq_sent &&
-          ptp.x_dreq_seq == act.dreq_seq) {
+      if (ptp.x_active && ptp.x_dreq_sent && ptp.x_dreq_seq == act.dreq_seq) {
         ptp.x_t3_pre = t3_pre;
       }
       if (!t3_ok) {
@@ -2055,11 +2054,10 @@ static void log_status(void) {
            "bias_us=%ld "
            "rx hook=%lu task=%lu rejected=%lu",
            (unsigned long)ppm, (unsigned long)dly, (unsigned long)pas,
-           (unsigned long)lucky, (unsigned long)tx_done,
-           (unsigned long)tx_slow, (unsigned long)r_drop,
-           (unsigned long)r_oob, (unsigned long)r_gap, (unsigned long)r_gm,
-           (long)(bias / 1000), (unsigned long)hook, (unsigned long)task,
-           (unsigned long)rejected);
+           (unsigned long)lucky, (unsigned long)tx_done, (unsigned long)tx_slow,
+           (unsigned long)r_drop, (unsigned long)r_oob, (unsigned long)r_gap,
+           (unsigned long)r_gm, (long)(bias / 1000), (unsigned long)hook,
+           (unsigned long)task, (unsigned long)rejected);
 }
 
 // ---- Sockets and task

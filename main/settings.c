@@ -1160,7 +1160,6 @@ static esp_err_t save_u8(const char *key, uint8_t value) {
   return err;
 }
 
-
 bool settings_airplay_deny_interruptions(void) {
   return g_airplay_deny_interruptions;
 }
