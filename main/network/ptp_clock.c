@@ -38,6 +38,12 @@
 
 #ifdef ESP_PLATFORM
 #include "lwip/pbuf.h"
+#if defined(CONFIG_ESP_WIFI_ENABLED) && CONFIG_ESP_WIFI_ENABLED
+// esp_wifi_set_tx_done_cb(): the Wi-Fi driver's TX-done callback, used for
+// t3 as Apple's stack uses its driver's transmit completion.
+#include "esp_private/wifi.h"
+#define PTP_HAVE_TX_DONE 1
+#endif
 #endif
 
 static const char *TAG = "ptp_clock";
@@ -79,6 +85,18 @@ static const char *TAG = "ptp_clock";
 // master passively, and how often it then tries two-way again.
 #define PTP_DREQ_UNANSWERED_LIMIT 16
 #define PTP_TWO_WAY_RETRY_MS      10000
+// t3, as Apple takes it: when the driver reports the Delay_Req transmitted
+// (esp_wifi_set_tx_done_cb(), the Wi-Fi driver's TX-done callback).  Where
+// that is unavailable (Ethernet, or a driver that never reports our frame)
+// t3 falls back to a local read right after sendto(), bracketed by one
+// before it; a bracket wider than this means the task was preempted around
+// the send, and the exchange is dropped rather than biased by half the
+// preemption -- the software analogue of Apple rejecting implausible TX
+// timestamps.
+#define PTP_TX_STAMP_MAX_NS 500000LL
+// A TX-done callback frame longer than this cannot be a Delay_Req (44 bytes
+// of PTP in UDP/IPv4 under an 802.11 or Ethernet header); not scanned.
+#define PTP_TX_DONE_MAX_FRAME 200
 
 // ---- Sync filter (Apple's kernel EtE filter) -------------------------------
 // Gain 2^-shift per stage.  Shift and ppm bound add up per link end: Wi-Fi
@@ -411,6 +429,10 @@ static struct {
   uint32_t rejected_master_count; // SYNC from a port not on the chosen GM
   uint32_t dreq_sent;
   uint32_t dresp_received;
+  uint32_t last_dresp_ms; // last answer on the selected port (0 = none)
+  uint32_t tx_slow;       // exchanges dropped for a wide t3 bracket
+  uint32_t tx_done_used;  // exchanges whose t3 came from the TX-done callback
+  int64_t x_t3_pre;       // local time just before sendto() of x_dreq_seq
   uint32_t dreq_tx_errors;
   uint32_t superseded;
   uint32_t out_of_order;
@@ -587,6 +609,89 @@ static void rx_stamp_ip4(const uint8_t *ip, size_t len, int64_t now_us) {
   __atomic_store_n(&e->us_hi, (uint32_t)((uint64_t)now_us >> 32),
                    __ATOMIC_RELAXED);
   __atomic_store_n(&e->ver, v + 2, __ATOMIC_RELEASE);
+}
+
+// ---- TX-done timestamps -----------------------------------------------------
+
+// The last Delay_Req the driver reported transmitted.  Single writer (the
+// Wi-Fi driver's task), read without blocking it through a sequence lock.
+typedef struct {
+  uint32_t ver; // odd while being written
+  uint16_t seq;
+  uint32_t us_lo;
+  uint32_t us_hi;
+} ptp_tx_stamp_t;
+
+static ptp_tx_stamp_t tx_slot;
+
+// Find our own Delay_Req in a transmitted frame and record when it left.
+// The callback's buffer layout is not documented (802.11 or Ethernet
+// framing), so the message is found by content -- our sourcePortIdentity
+// at offset 20 of a version-2 Delay_Req -- rather than by header offsets.
+static void tx_done_scan(const uint8_t *data, size_t len, int64_t now_us) {
+  if (data == NULL || len < PTP_DELAY_REQ_LEN ||
+      len > PTP_TX_DONE_MAX_FRAME || !ptp.have_identity) {
+    return;
+  }
+  for (size_t i = 20; i + 10 + (PTP_DELAY_REQ_LEN - 30) <= len; i++) {
+    if (data[i] != ptp.local_identity[0] ||
+        memcmp(data + i, ptp.local_identity, 8) != 0 ||
+        read_be(data + i + 8, 2) != PTP_LOCAL_PORT_NUMBER) {
+      continue;
+    }
+    const uint8_t *msg = data + i - 20;
+    if ((msg[0] & 0x0F) != PTP_MSG_DELAY_REQ || (msg[1] & 0x0F) != 2) {
+      continue;
+    }
+    const uint32_t v = __atomic_load_n(&tx_slot.ver, __ATOMIC_RELAXED);
+    __atomic_store_n(&tx_slot.ver, v + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&tx_slot.seq, (uint16_t)read_be(msg + 30, 2),
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&tx_slot.us_lo, (uint32_t)now_us, __ATOMIC_RELAXED);
+    __atomic_store_n(&tx_slot.us_hi, (uint32_t)((uint64_t)now_us >> 32),
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&tx_slot.ver, v + 2, __ATOMIC_RELEASE);
+    return;
+  }
+}
+
+// The TX-done time of Delay_Req `seq`, if the driver reported it.
+static bool tx_done_stamp_ns(uint16_t seq, int64_t *ns) {
+  const uint32_t v1 = __atomic_load_n(&tx_slot.ver, __ATOMIC_ACQUIRE);
+  if (v1 == 0 || (v1 & 1)) {
+    return false;
+  }
+  const uint16_t s = __atomic_load_n(&tx_slot.seq, __ATOMIC_RELAXED);
+  const uint32_t lo = __atomic_load_n(&tx_slot.us_lo, __ATOMIC_RELAXED);
+  const uint32_t hi = __atomic_load_n(&tx_slot.us_hi, __ATOMIC_RELAXED);
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+  if (__atomic_load_n(&tx_slot.ver, __ATOMIC_RELAXED) != v1 || s != seq) {
+    return false;
+  }
+  *ns = (int64_t)(((uint64_t)hi << 32) | lo) * 1000LL;
+  return true;
+}
+
+#ifdef PTP_HAVE_TX_DONE
+static void ptp_wifi_tx_done(uint8_t ifidx, uint8_t *data, uint16_t *data_len,
+                             bool tx_ok) {
+  (void)ifidx;
+  if (tx_ok && data_len != NULL) {
+    tx_done_scan(data, *data_len, esp_timer_get_time());
+  }
+}
+#endif
+
+// Register the TX-done callback once Wi-Fi is up (it refuses before
+// esp_wifi_start()); retried on each Delay_Req until it takes.
+static void ensure_tx_done_cb(void) {
+#ifdef PTP_HAVE_TX_DONE
+  static bool registered;
+  if (!registered && esp_wifi_set_tx_done_cb(ptp_wifi_tx_done) == ESP_OK) {
+    registered = true;
+  }
+#endif
 }
 
 #ifdef ESP_PLATFORM
@@ -1171,6 +1276,7 @@ static void select_port(ptp_actions_t *act) {
     ptp.x_active = false;
     ptp.mode = PTP_MODE_PROBING;
     ptp.unanswered = 0;
+    ptp.last_dresp_ms = 0;
     ptp.last_probe_ms = 0;
     ptp.delay_total = 0;
     ptp.lucky_limit_ns = INT64_MAX;
@@ -1502,9 +1608,14 @@ static void handle_sync(const uint8_t *data, size_t len, const ptp_hdr_t *h,
   ptp.x_have_t1 = false;
   ptp.x_dreq_sent = false;
   ptp.x_have_t3 = false;
+  ptp.x_t3_pre = 0;
   ptp.x_have_t4 = false;
 
-  if (ptp.mode != PTP_MODE_PASSIVE &&
+  // Apple's stack has no passive mode: a missing Delay_Resp is just a
+  // missing sample.  The passive fallback exists only for masters that have
+  // never answered on this port; once one has, lost or late answers (Wi-Fi
+  // congestion) only cost samples, exactly as on Apple's receiver.
+  if (ptp.mode != PTP_MODE_PASSIVE && ptp.last_dresp_ms == 0 &&
       ptp.unanswered >= PTP_DREQ_UNANSWERED_LIMIT) {
     ptp.mode = PTP_MODE_PASSIVE;
     ptp.last_probe_ms = now;
@@ -1653,6 +1764,7 @@ static void handle_delay_resp(const uint8_t *data, size_t len,
   // responses past the next SYNC is no reason to go passive.
   ptp.dresp_received++;
   ptp.unanswered = 0;
+  ptp.last_dresp_ms = now_ms();
   if (ptp.mode != PTP_MODE_TWO_WAY) {
     if (ptp.mode == PTP_MODE_PASSIVE) {
       act->events |= EV_TWO_WAY;
@@ -1667,6 +1779,15 @@ static void handle_delay_resp(const uint8_t *data, size_t len,
   ptp.x_t4 =
       parse_ptp_timestamp_ns(data + PTP_TIMESTAMP_OFFSET) + h->correction_ns;
   ptp.x_have_t4 = true;
+  // t3 from the driver's TX-done report when there is one for this
+  // Delay_Req, after it was handed to the stack and not in the future.
+  int64_t tx_ns;
+  if (tx_done_stamp_ns(ptp.x_dreq_seq, &tx_ns) && ptp.x_t3_pre != 0 &&
+      tx_ns >= ptp.x_t3_pre && tx_ns <= get_local_time_ns()) {
+    ptp.x_t3 = tx_ns;
+    ptp.x_have_t3 = true;
+    ptp.tx_done_used++;
+  }
   if (ptp.x_have_t1 && ptp.x_have_t3) {
     two_way_sample(p, act);
     publish_model(act);
@@ -1833,11 +1954,15 @@ static void handle_packet(const uint8_t *data, size_t len, bool is_event_port,
     dst.sin_family = AF_INET;
     dst.sin_port = htons(PTP_EVENT_PORT);
     dst.sin_addr.s_addr = act.dreq_ip;
+    ensure_tx_done_cb();
+    const int64_t t3_pre = get_local_time_ns();
     const ssize_t sent = sendto(ptp.event_socket, act.dreq, PTP_DELAY_REQ_LEN,
                                 0, (struct sockaddr *)&dst, sizeof(dst));
     // t3: right after the packet has been handed to the stack, the closest
-    // software point to its departure.
+    // software point to its departure -- unless the task was preempted
+    // around the send, which the bracket shows.
     const int64_t t3 = get_local_time_ns();
+    const bool t3_ok = t3 - t3_pre <= PTP_TX_STAMP_MAX_NS;
     ptp_actions_t act2;
     act2.events = 0;
     act2.need_median = false;
@@ -1845,7 +1970,15 @@ static void handle_packet(const uint8_t *data, size_t len, bool is_event_port,
     portENTER_CRITICAL(&ptp_state_mux);
     if (sent == PTP_DELAY_REQ_LEN) {
       ptp.dreq_sent++;
-      if (ptp.x_active && ptp.x_dreq_sent && ptp.x_dreq_seq == act.dreq_seq) {
+      if (ptp.x_active && ptp.x_dreq_sent &&
+          ptp.x_dreq_seq == act.dreq_seq) {
+        ptp.x_t3_pre = t3_pre;
+      }
+      if (!t3_ok) {
+        ptp.tx_slow++;
+      }
+      if (t3_ok && ptp.x_active && ptp.x_dreq_sent &&
+          ptp.x_dreq_seq == act.dreq_seq) {
         ptp.x_t3 = t3;
         ptp.x_have_t3 = true;
         if (ptp.x_have_t1 && ptp.x_have_t4 && ptp.selected >= 0) {
@@ -1894,6 +2027,7 @@ static void log_status(void) {
   const uint32_t r_gap = ptp.resets_gap, r_gm = ptp.gm_changes;
   const uint32_t hook = ptp.rx_hook_stamps, task = ptp.rx_task_stamps;
   const uint32_t rejected = ptp.rejected_master_count;
+  const uint32_t tx_slow = ptp.tx_slow, tx_done = ptp.tx_done_used;
   const int64_t bias = ptp.passive_bias_n ? ptp.passive_bias_ns : 0;
   portEXIT_CRITICAL(&ptp_state_mux);
   if (syncs == 0) {
@@ -1905,21 +2039,27 @@ static void log_status(void) {
   const long rtt_med = n ? (long)scratch[n / 2] * 2 / 1000 : -1;
   const long ppb = (long)((dev_q * 1000000000LL) >> PTP_RATE_FRAC);
   const long ppb_abs = ppb < 0 ? -ppb : ppb;
+  // Two lines: one long line is cut off by the log buffer.
   ESP_LOGI(TAG,
            "status: %s %s gm=%016llx via " PTP_IP_FMT
            " dreq=%lu resp=%lu rtt_us min=%ld med=%ld resid_rms_us=%lu "
-           "rate=%c%ld.%03ldppm drops gate=%lu delay=%lu passive=%lu lucky=%lu "
-           "resets drop=%lu oob=%lu gap=%lu gm=%lu bias_us=%ld rx hook=%lu "
-           "task=%lu rejected=%lu",
+           "rate=%c%ld.%03ldppm",
            locked ? "locked" : "unlocked", two_way ? "two-way" : "passive",
            (unsigned long long)gm, PTP_IP_ARGS(ip), (unsigned long)sent,
            (unsigned long)recv, rtt_min, rtt_med,
            (unsigned long)(isqrt64((uint64_t)resid_ms) / 1000),
-           ppb < 0 ? '-' : '+', ppb_abs / 1000, ppb_abs % 1000,
+           ppb < 0 ? '-' : '+', ppb_abs / 1000, ppb_abs % 1000);
+  ESP_LOGI(TAG,
+           "status: drops gate=%lu delay=%lu passive=%lu lucky=%lu "
+           "t3 txdone=%lu slow=%lu resets drop=%lu oob=%lu gap=%lu gm=%lu "
+           "bias_us=%ld "
+           "rx hook=%lu task=%lu rejected=%lu",
            (unsigned long)ppm, (unsigned long)dly, (unsigned long)pas,
-           (unsigned long)lucky, (unsigned long)r_drop, (unsigned long)r_oob,
-           (unsigned long)r_gap, (unsigned long)r_gm, (long)(bias / 1000),
-           (unsigned long)hook, (unsigned long)task, (unsigned long)rejected);
+           (unsigned long)lucky, (unsigned long)tx_done,
+           (unsigned long)tx_slow, (unsigned long)r_drop,
+           (unsigned long)r_oob, (unsigned long)r_gap, (unsigned long)r_gm,
+           (long)(bias / 1000), (unsigned long)hook, (unsigned long)task,
+           (unsigned long)rejected);
 }
 
 // ---- Sockets and task

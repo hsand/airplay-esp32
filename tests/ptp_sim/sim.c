@@ -82,6 +82,7 @@ typedef struct {
   bool multi;                 /* unrelated better-priority master C */
   bool hook;
   bool tlv8021as;
+  double storm_at, storm_len; /* congestion storm: late/lost Delay_Resps */
 } scenario_t;
 
 static scenario_t sc;
@@ -170,8 +171,18 @@ static double congestion_us(int64_t t) {
   return 0;
 }
 
+static bool in_storm(int64_t t) {
+  const double s = (double)t / SEC;
+  return sc.storm_len > 0 && s >= sc.storm_at && s < sc.storm_at + sc.storm_len;
+}
+
 static int64_t path_delay(int dir, int r) {
   double d = sc.base_us[dir] + exprand_s(r, sc.exp_us[dir]);
+  if (in_storm(now_T)) {
+    /* What a real burst looked like: retransmit round trips of ~40 ms, so
+     * every packet waits 20-60 ms, differently each way. */
+    d += 20000 + urand_s(r) * 40000;
+  }
   if (urand_s(r) < sc.spike_p) {
     d += 5000 + urand_s(r) * 35000;
   }
@@ -415,13 +426,24 @@ static void dreq_at_master(const event_t *e) {
   if (!x->answers || master_asleep(e->m, now_T)) {
     return;
   }
+  int64_t late = 300 * US; /* a little processing */
+  if (in_storm(now_T)) {
+    /* Most answers lost, the rest held up past the next SYNCs. */
+    /* ...and for 4 s in the middle, every answer: what drove the board's
+     * unanswered count to 16 on hardware. */
+    const double into = (double)now_T / SEC - sc.storm_at;
+    if (urand_s(R_REV) < 0.6 || (into >= 10 && into < 14)) {
+      return;
+    }
+    late += (int64_t)(urand_s(R_REV) * 1500) * MS;
+  }
   const int64_t t4 = master_time(e->m, now_T);
   uint8_t r[54];
   header(r, e->m, PTP_MSG_DELAY_RESP, 54,
          (uint16_t)((e->buf[30] << 8) | e->buf[31]), 3);
   put_ts(r + 34, t4);
   memcpy(r + 44, e->buf + 20, 10);
-  send_to_board(e->m, 1, r, sizeof(r), 300 * US); /* a little processing */
+  send_to_board(e->m, 1, r, sizeof(r), late);
 }
 
 /* ---------- board side ---------- */
@@ -594,6 +616,7 @@ static void report(void) {
   }
   qsort(errs, n, sizeof(*errs), cmp_i64);
   const double p95 = n ? (double)errs[(size_t)(0.95 * (double)(n - 1))] : -1;
+  const double peak = n ? (double)errs[n - 1] : -1;
   const double mean = n ? sum / (double)n : 0;
   /* Settled: within 500 us of where the clock sits in steady state (its
    * bias is the mean column).  Recovered: back within 1 ms of it. */
@@ -606,9 +629,9 @@ static void report(void) {
   } else if (sc.relay_drop_at > 0) {
     rec = settle(sc.relay_drop_at, mean, MS);
   }
-  printf("mean_us=%.1f p95_us=%.1f p2p_us=%.1f unlocked_pct=%.2f "
+  printf("mean_us=%.1f p95_us=%.1f p2p_us=%.1f peak_us=%.1f unlocked_pct=%.2f "
          "lock_s=%.2f settle_s=%.2f recovery_s=%.2f\n",
-         mean / 1e3, p95 / 1e3, n ? (double)(hi - lo) / 1e3 : -1,
+         mean / 1e3, p95 / 1e3, n ? (double)(hi - lo) / 1e3 : -1, peak / 1e3,
          steady ? 100.0 * (double)unlocked / (double)steady : 0, first_lock,
          settled, rec);
   free(errs);
@@ -691,6 +714,10 @@ static bool setup(const char *name) {
   } else if (!strcmp(name, "relay")) {
     wifi();
     sc.relay_drop_at = 200;
+  } else if (!strcmp(name, "storm")) {
+    wifi();
+    sc.storm_at = 400;
+    sc.storm_len = 25;
   } else if (!strcmp(name, "multi")) {
     wifi();
     sc.multi = true;

@@ -735,6 +735,69 @@ static void test_bmca_and_gm_change(void) {
   CHECK(ptp.rejected_master_count > 0, "B's SYNCs not counted as rejected");
 }
 
+/* A master that has answered is not declared silent by a burst of lost
+ * Delay_Resps (Wi-Fi congestion): Apple has no passive mode, a missing
+ * answer is just a missing sample.  Only 30 s without any answer makes it
+ * silent again. */
+static void test_answer_burst_stays_two_way(void) {
+  printf("lost answers keep two-way\n");
+  reset();
+  master_t a = master_a();
+  ptp_clock_set_master_clock_id(MASTER_A);
+  settle(&a, 48);
+  CHECK(two_way(), "not two-way to begin with");
+  a.answers = false;
+  for (int i = 0; i < 40; i++) { /* 5 s of lost answers */
+    exchange(&a, 1, 1);
+  }
+  CHECK(two_way() && ptp.mode == PTP_MODE_TWO_WAY,
+        "went passive on a 5 s burst of lost Delay_Resps");
+  CHECK(ptp_clock_is_locked() && llabs(error_ms(&a)) <= 1,
+        "lost the clock during the burst (%lld ms)", (long long)error_ms(&a));
+  /* Answers resume: the next ones are samples again, no mode change. */
+  a.answers = true;
+  settle(&a, 16);
+  CHECK(two_way() && ptp.mode == PTP_MODE_TWO_WAY && ptp_clock_is_locked(),
+        "not two-way once answers resumed");
+}
+
+/* t3 from the Wi-Fi driver's TX-done report: our Delay_Req is found by
+ * content in whatever framing the driver hands back; anything else is
+ * ignored. */
+static void test_tx_done_scan(void) {
+  printf("TX-done t3\n");
+  reset();
+  uint8_t frame[PTP_TX_DONE_MAX_FRAME];
+  uint8_t dreq[PTP_DELAY_REQ_LEN];
+  build_delay_req(dreq, 0, 0, 0x1234);
+  int64_t ns = 0;
+  /* Behind a 24-byte 802.11 header + 8 LLC + 20 IPv4 + 8 UDP. */
+  memset(frame, 0xAB, sizeof(frame));
+  memcpy(frame + 60, dreq, sizeof(dreq));
+  tx_done_scan(frame, 60 + sizeof(dreq), 123456);
+  CHECK(tx_done_stamp_ns(0x1234, &ns) && ns == 123456000LL,
+        "Delay_Req behind 802.11 framing not found");
+  CHECK(!tx_done_stamp_ns(0x1235, &ns), "stamp matched another sequence");
+  /* Behind Ethernet framing. */
+  memcpy(frame + 42, dreq, sizeof(dreq));
+  tx_done_scan(frame, 42 + sizeof(dreq), 777);
+  CHECK(tx_done_stamp_ns(0x1234, &ns) && ns == 777000LL,
+        "Delay_Req behind Ethernet framing not found");
+  /* Someone else's Delay_Req, and an oversized frame, leave it alone. */
+  uint8_t other[PTP_DELAY_REQ_LEN];
+  memcpy(other, dreq, sizeof(other));
+  other[21] ^= 0xFF;
+  other[31] = 0x99;
+  memcpy(frame + 60, other, sizeof(other));
+  tx_done_scan(frame, 60 + sizeof(other), 999);
+  uint8_t big[PTP_TX_DONE_MAX_FRAME + 64];
+  memset(big, 0, sizeof(big));
+  build_delay_req(big + 100, 0, 0, 0x4321);
+  tx_done_scan(big, sizeof(big), 555);
+  CHECK(tx_done_stamp_ns(0x1234, &ns) && ns == 777000LL,
+        "a foreign or oversized frame replaced the stamp");
+}
+
 /* The anchor names A, then A hands GM over to B mid-session: A keeps sending
  * SYNCs, now as a boundary clock, but its Announce names B.  The clock must
  * follow at once (as Apple's kernel does through BMCA) and report the new
@@ -1213,6 +1276,8 @@ int main(void) {
   test_passive_fallback();
   test_passive_step();
   test_bmca_and_gm_change();
+  test_answer_burst_stays_two_way();
+  test_tx_done_scan();
   test_anchor_gm_handover();
   test_anchor_gm_silence();
   test_relayed_port();

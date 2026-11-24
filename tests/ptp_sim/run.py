@@ -39,9 +39,10 @@ SCENARIOS = [
     ("gm-change", "anchor moves to new GM at 300 s"),
     ("relay", "direct port lost at 200 s, relay"),
     ("multi", "plus a better-priority other GM"),
+    ("storm", "25 s storm: 20-60 ms delays, Delay_Resps lost/late"),
 ]
 
-KEYS = ["mean_us", "p95_us", "p2p_us", "unlocked_pct", "lock_s",
+KEYS = ["mean_us", "p95_us", "p2p_us", "peak_us", "unlocked_pct", "lock_s",
         "settle_s", "recovery_s"]
 
 
@@ -78,7 +79,7 @@ def agg(rows, key):
         if any(v < 0 for v in vals):
             return "never" if all(v < 0 for v in vals) else "%.1f*" % max(vals)
         return "%.1f" % max(vals)
-    if key in ("p2p_us", "p95_us"):
+    if key in ("p2p_us", "p95_us", "peak_us"):
         return "%.0f" % max(vals)
     if key == "unlocked_pct":
         return "%.1f" % max(vals)
@@ -125,18 +126,20 @@ def main():
     print("lock = first locked on the anchor's GM; settle = within 500 us of "
           "the steady mean for 5 s; recovery = from the event's end to "
           "within 1 ms of it for 5 s (worst seed, * = some seed never).")
-    hdr = ("%-20s %-4s %8s %8s %8s %7s %6s %8s %8s" %
-           ("scenario", "impl", "mean_us", "p95_us", "p2p_us", "unlck%",
+    hdr = ("%-20s %-4s %8s %8s %8s %8s %7s %6s %8s %8s" %
+           ("scenario", "impl", "mean_us", "p95_us", "p2p_us", "peak_us",
+            "unlck%",
             "lock_s", "settl_s", "recov_s"))
     print(hdr)
     print("-" * len(hdr))
     for name, desc in scen:
         for impl in ("old", "new", "apple"):
             rows = results[(name, impl)]
-            print("%-20s %-4s %8s %8s %8s %7s %6s %8s %8s" % (
+            print("%-20s %-4s %8s %8s %8s %8s %7s %6s %8s %8s" % (
                 name if impl == "old" else "", impl,
                 agg(rows, "mean_us"), agg(rows, "p95_us"),
-                agg(rows, "p2p_us"), agg(rows, "unlocked_pct"),
+                agg(rows, "p2p_us"), agg(rows, "peak_us"),
+                agg(rows, "unlocked_pct"),
                 agg(rows, "lock_s"), agg(rows, "settle_s"),
                 agg(rows, "recovery_s") if name in
                 ("sleep", "sleep-passive", "gm-change", "relay") else "-"))
