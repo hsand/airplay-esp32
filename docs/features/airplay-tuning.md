@@ -57,9 +57,10 @@ over, at which point the first one is disconnected. This is what Apple's receive
 last device to press play wins.
 
 To keep the current listener in charge instead, open the web interface and pick
-**Configuration → When another device plays → Refuse while playing**. A second device is
-then turned away (RTSP status 453, which iOS shows as the speaker being in use) until the
-first one stops. It applies at once. A phone that lost its Wi-Fi and comes back is still
+**Configuration → When another device plays → Refuse while another is connected**. A second
+device is then turned away (RTSP status 453, which iOS shows as the speaker being in use)
+for as long as the first one holds the speaker, playing or paused, as on Apple's receivers.
+It applies at once. A phone that lost its Wi-Fi and comes back is still
 let in, since it is taking back its own session.
 
 ## Device model

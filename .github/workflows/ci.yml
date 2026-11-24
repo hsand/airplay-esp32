@@ -127,6 +127,9 @@ jobs:
       - name: Test the stream SETUP reply against plistlib
         run: python3 tests/bplist_setup/run.py
 
+      - name: Fuzz the binary plist parser under ASan/UBSan
+        run: python3 tests/bplist_fuzz/run.py
+
       - name: Test how far a TAS58xx filter chain lifts full scale
         run: python3 tests/tas58xx_peak/run.py
 

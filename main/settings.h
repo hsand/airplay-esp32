@@ -153,8 +153,9 @@ bool settings_airplay_v1_configured(void);
 esp_err_t settings_set_airplay_v1(bool v1);
 
 /**
- * Whether a second sender's session SETUP is refused (RTSP 453) while one is
- * playing, rather than taking the speaker over.  Apple's DenyInterruptions.
+ * Whether a second sender's session SETUP is refused (RTSP 453) while another
+ * holds a session, playing or paused, rather than taking the speaker over.
+ * Apple's DenyInterruptions.
  * Off by default: the last sender wins.  Applies at once.
  */
 bool settings_airplay_deny_interruptions(void);
