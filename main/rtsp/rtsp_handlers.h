@@ -27,9 +27,6 @@
  */
 uint64_t airplay_features(void);
 
-/** The model string from the AirPlay settings (TXT model/am, /info). */
-const char *airplay_model(void);
-
 // audioBufferSize for a buffered stream is sized per codec in
 // airplay_audio_buffer_size() (rtsp_policy.h), capped at the 512 KiB this
 // receiver used to advertise: the sender queues that much ahead, and on a

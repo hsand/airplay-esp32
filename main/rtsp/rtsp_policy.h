@@ -33,16 +33,9 @@
 // parts count as 0; 0 for NULL or an empty string.
 uint32_t airplay_source_version_parse(const char *text);
 
-/** The model string the receiver presents itself with. */
-typedef enum {
-  // AudioAccessory5,1: a modern sender treats the receiver as a HomePod mini.
-  AIRPLAY_MODEL_HOMEPOD = 0,
-  // AirPlayGeneric1,1, Apple's own fallback: a third-party speaker.
-  AIRPLAY_MODEL_GENERIC = 1,
-  AIRPLAY_MODEL_COUNT,
-} airplay_model_t;
-
-const char *airplay_model_string(airplay_model_t model);
+/** The model the receiver presents itself as (TXT model/am, /info): a
+ *  HomePod mini. */
+#define AIRPLAY_MODEL "AudioAccessory5,1"
 
 /**
  * AirPlay feature bits, (hi << 32) | lo.  AirPlay 1 mode keeps the classic

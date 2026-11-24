@@ -153,22 +153,6 @@ bool settings_airplay_v1_configured(void);
 esp_err_t settings_set_airplay_v1(bool v1);
 
 /**
- * The model string AirPlay 2 presents (TXT model/am, /info model), by index:
- * 0 "AudioAccessory5,1" (a HomePod mini to an Apple sender, the default),
- * 1 "AirPlayGeneric1,1" (a third-party speaker).  See airplay_model_t in
- * rtsp_policy.h.  Fixed at settings_init(), like settings_airplay_v1(): the
- * TXT records and /info must agree for as long as the receiver runs.
- */
-#define SETTINGS_AIRPLAY_MODEL_COUNT 2
-int settings_airplay_model(void);
-
-/** The model held in storage, which takes effect on the next boot. */
-int settings_airplay_model_configured(void);
-
-/** Save the AirPlay model (0 or 1). Takes effect on restart. */
-esp_err_t settings_set_airplay_model(int model);
-
-/**
  * Whether a second sender's session SETUP is refused (RTSP 453) while one is
  * playing, rather than taking the speaker over.  Apple's DenyInterruptions.
  * Off by default: the last sender wins.  Applies at once.

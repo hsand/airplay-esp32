@@ -33,16 +33,6 @@ uint32_t airplay_source_version_parse(const char *text) {
   return parts[0] * 10000U + parts[1] * 100U + parts[2];
 }
 
-const char *airplay_model_string(airplay_model_t model) {
-  switch (model) {
-  case AIRPLAY_MODEL_GENERIC:
-    return "AirPlayGeneric1,1";
-  case AIRPLAY_MODEL_HOMEPOD:
-  default:
-    return "AudioAccessory5,1";
-  }
-}
-
 #define FEATURE(bit) (UINT64_C(1) << (bit))
 
 uint64_t airplay_features_compute(bool airplay_v1, bool artwork) {

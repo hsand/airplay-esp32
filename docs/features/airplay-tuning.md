@@ -64,28 +64,9 @@ let in, since it is taking back its own session.
 
 ## Device model
 
-Apple senders decide a few things from the model a receiver claims. The setting is under
-**Configuration → Appears to Apple devices as**, and takes effect after a restart.
-
-| Setting | Model string | What it means |
-| --- | --- | --- |
-| **HomePod mini** (default) | `AudioAccessory5,1` | What this firmware has always claimed. iOS treats the speaker as an Apple HomePod. |
-| **Generic AirPlay speaker** | `AirPlayGeneric1,1` | Apple's own name for a receiver of unknown make. iOS treats it as a third-party speaker. |
-
-Buffered audio, multi-room timing and pairing are decided by the advertised features, not
-by the model, so both settings play the same way. The differences:
-
-- **HomePod mini** makes iOS expect HomePod-only behaviour this firmware does not have,
-  such as full MediaRemote control and HomePod cluster logic. iOS also skips its volume
-  safety clamp for Apple speakers, so a session starts at exactly the speaker's last
-  volume.
-- **Generic** is the honest answer and avoids those HomePod paths. iOS applies its
-  third-party volume clamp: a session that would start very quiet is raised to −27 dB, and
-  one at full volume is lowered to −20 dB.
-- **Risk with Generic:** iOS's pairing code consults whether the receiver is an Apple
-  audio accessory when deciding whether to ask for a PIN. This has not been seen on a
-  device. If your iPhone asks for a PIN after switching to Generic, switch back to HomePod
-  mini; this firmware has no PIN to give.
+The speaker presents itself to Apple devices as a HomePod mini (`AudioAccessory5,1`), as
+it always has. Buffered audio, multi-room timing and pairing follow the advertised
+features, not the model.
 
 ## Buffer the sender may queue
 

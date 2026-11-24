@@ -108,7 +108,7 @@ void mdns_airplay_init(void) {
   const airplay_txt_input_t txt_in = {
       .device_id = device_id,
       .features = features_str,
-      .model = airplay_model(),
+      .model = AIRPLAY_MODEL,
       .pk_hex = pk_str,
       .pi = pi,
       .metadata_types = airplay_metadata_types(AIRPLAY_ARTWORK),

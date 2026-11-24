@@ -171,13 +171,13 @@ def main():
         airplay = dict(txt["TXT_AIRPLAY"])
         assert len(airplay) == len(txt["TXT_AIRPLAY"]), "duplicate key"
         assert airplay["deviceid"] == "24:0A:C4:12:34:56"
-        assert airplay["model"] == "AirPlayGeneric1,1"
+        assert airplay["model"] == "AudioAccessory5,1"
         assert airplay["pi"] == "PI-VALUE"
         assert airplay["md"] == "0,2" and airplay["vv"] == "1"
         assert airplay["srcvers"] == "377.40.00"
         assert airplay["protovers"] == "1.1" and airplay["flags"] == "0x4"
         raop = dict(txt["TXT_RAOP"])
-        assert raop["am"] == "AirPlayGeneric1,1" and raop["md"] == "0,2"
+        assert raop["am"] == "AudioAccessory5,1" and raop["md"] == "0,2"
         assert raop["ft"] == airplay["features"] and raop["vv"] == "1"
         assert raop["vs"] == "377.40.00" and raop["et"] == "0,1,3,5"
         print("TXT records: PASS")

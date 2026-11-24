@@ -242,11 +242,7 @@ static void test_advertisement(void) {
   CHECK(strcmp(airplay_metadata_types(true), "0,1,2") == 0 &&
             strcmp(airplay_metadata_types(false), "0,2") == 0,
         "md");
-  CHECK(strcmp(airplay_model_string(AIRPLAY_MODEL_HOMEPOD),
-               "AudioAccessory5,1") == 0 &&
-            strcmp(airplay_model_string(AIRPLAY_MODEL_GENERIC),
-                   "AirPlayGeneric1,1") == 0,
-        "models");
+  CHECK(strcmp(AIRPLAY_MODEL, "AudioAccessory5,1") == 0, "model");
 
   const uint8_t macs[3][6] = {{0x24, 0x0A, 0xC4, 0x12, 0x34, 0x56},
                               {0x24, 0x0A, 0xC4, 0x12, 0x34, 0x57},
@@ -265,7 +261,7 @@ static void test_advertisement(void) {
   const airplay_txt_input_t in = {
       .device_id = "24:0A:C4:12:34:56",
       .features = "0x405C4A00,0x14340",
-      .model = "AirPlayGeneric1,1",
+      .model = AIRPLAY_MODEL,
       .pk_hex = "00112233",
       .pi = "PI-VALUE",
       .metadata_types = "0,2",

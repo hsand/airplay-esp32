@@ -1338,16 +1338,11 @@ static esp_err_t airplay_mode_get_handler(httpd_req_t *req) {
   cJSON *json = cJSON_CreateObject();
   cJSON_AddBoolToObject(json, "v1", settings_airplay_v1_configured());
   cJSON_AddNumberToObject(json, "port", airplay_rtsp_port());
-  cJSON_AddStringToObject(
-      json, "model",
-      settings_airplay_model_configured() == AIRPLAY_MODEL_GENERIC ? "generic"
-                                                                   : "homepod");
   cJSON_AddBoolToObject(json, "deny_interruptions",
                         settings_airplay_deny_interruptions());
-  cJSON_AddBoolToObject(
-      json, "restart_required",
-      settings_airplay_v1_configured() != settings_airplay_v1() ||
-          settings_airplay_model_configured() != settings_airplay_model());
+  cJSON_AddBoolToObject(json, "restart_required",
+                        settings_airplay_v1_configured() !=
+                            settings_airplay_v1());
   cJSON_AddBoolToObject(json, "success", true);
   char *json_str = cJSON_Print(json);
   httpd_resp_set_type(req, "application/json");
@@ -1373,39 +1368,19 @@ static esp_err_t airplay_mode_post_handler(httpd_req_t *req) {
 
   cJSON *response = cJSON_CreateObject();
   cJSON *val = cJSON_GetObjectItem(json, "v1");
-  cJSON *model = cJSON_GetObjectItem(json, "model");
   cJSON *deny = cJSON_GetObjectItem(json, "deny_interruptions");
-  if (model || deny) {
-    // {"model": "homepod"|"generic"} (restart) and/or
-    // {"deny_interruptions": bool} (at once).
-    esp_err_t err = ESP_OK;
-    if (model) {
-      const char *m = cJSON_GetStringValue(model);
-      if (m && strcmp(m, "homepod") == 0) {
-        err = settings_set_airplay_model(AIRPLAY_MODEL_HOMEPOD);
-      } else if (m && strcmp(m, "generic") == 0) {
-        err = settings_set_airplay_model(AIRPLAY_MODEL_GENERIC);
-      } else {
-        err = ESP_ERR_INVALID_ARG;
-      }
-    }
-    if (err == ESP_OK && deny) {
-      err = cJSON_IsBool(deny)
-                ? settings_set_airplay_deny_interruptions(cJSON_IsTrue(deny))
-                : ESP_ERR_INVALID_ARG;
-    }
+  if (deny) {
+    // {"deny_interruptions": bool}, applied at once.
+    const esp_err_t err =
+        cJSON_IsBool(deny)
+            ? settings_set_airplay_deny_interruptions(cJSON_IsTrue(deny))
+            : ESP_ERR_INVALID_ARG;
     cJSON_AddBoolToObject(response, "success", err == ESP_OK);
     if (err != ESP_OK) {
       cJSON_AddStringToObject(response, "error",
                               err == ESP_ERR_INVALID_ARG
-                                  ? "Expected {\"model\": \"homepod\"|"
-                                    "\"generic\"} or "
-                                    "{\"deny_interruptions\": bool}"
+                                  ? "Expected {\"deny_interruptions\": bool}"
                                   : esp_err_to_name(err));
-    } else {
-      cJSON_AddBoolToObject(response, "restart_required",
-                            settings_airplay_model_configured() !=
-                                settings_airplay_model());
     }
   } else if (!val || !cJSON_IsBool(val)) {
     cJSON_AddBoolToObject(response, "success", false);
@@ -1695,9 +1670,6 @@ static esp_err_t status_handler(httpd_req_t *req) {
   }
   if (settings_airplay_v1_configured() != settings_airplay_v1()) {
     cJSON_AddItemToArray(restart, cJSON_CreateString("AirPlay mode"));
-  }
-  if (settings_airplay_model_configured() != settings_airplay_model()) {
-    cJSON_AddItemToArray(restart, cJSON_CreateString("AirPlay model"));
   }
 #ifdef CONFIG_SENDSPIN_ENABLE
   if (settings_sendspin_enabled_configured() != settings_sendspin_enabled()) {

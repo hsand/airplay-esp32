@@ -57,10 +57,6 @@ uint64_t airplay_features(void) {
   return airplay_features_compute(settings_airplay_v1(), AIRPLAY_ARTWORK);
 }
 
-const char *airplay_model(void) {
-  return airplay_model_string((airplay_model_t)settings_airplay_model());
-}
-
 // ============================================================================
 // Codec Registry
 // ============================================================================
@@ -612,7 +608,7 @@ static void handle_get(int socket, rtsp_conn_t *conn, const rtsp_request_t *req,
     const airplay_info_t info = {
         .device_id = device_id,
         .device_name = device_name,
-        .model = airplay_model(),
+        .model = AIRPLAY_MODEL,
         .pi = pi,
         .source_version = AIRPLAY_SOURCE_VERSION,
         .features_ex = features_ex,
