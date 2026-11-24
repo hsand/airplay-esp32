@@ -20,6 +20,29 @@
 #define BPLIST_SET     0xC0
 #define BPLIST_DICT    0xD0
 
+#define BPLIST_HEADER_LEN  8U
+#define BPLIST_TRAILER_LEN 32U
+
+// ---------------------------------------------------------------------------
+// A binary plist is "bplist00", the objects, an offset table holding each
+// object's position, and a 32-byte trailer.  The plists parsed here arrive
+// from the network, some of them before pairing, so nothing in them is
+// trusted: bplist_open() checks the trailer against the buffer once, and
+// every object, length and reference list is then checked against the object
+// area (between the header and the offset table) before it is read.  Counts
+// and lengths can be as large as 2^64 - 1, so the checks divide rather than
+// multiply.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+  const uint8_t *data;
+  size_t objects_end; // where the offset table starts
+  uint8_t offset_size;
+  uint8_t ref_size;
+  uint64_t num_objects;
+  uint64_t top_object;
+} bplist_t;
+
 static uint64_t read_be_int(const uint8_t *data, size_t bytes) {
   uint64_t val = 0;
   for (size_t i = 0; i < bytes; i++) {
@@ -28,78 +51,121 @@ static uint64_t read_be_int(const uint8_t *data, size_t bytes) {
   return val;
 }
 
-static bool bplist_parse_trailer(const uint8_t *plist, size_t plist_len,
-                                 uint8_t *offset_size, uint8_t *ref_size,
-                                 uint64_t *num_objects, uint64_t *top_object,
-                                 uint64_t *offset_table_offset) {
-  if (plist_len < 32) {
+static bool bplist_open(const uint8_t *plist, size_t plist_len, bplist_t *bp) {
+  if (!plist || plist_len < BPLIST_HEADER_LEN + BPLIST_TRAILER_LEN ||
+      memcmp(plist, "bplist00", BPLIST_HEADER_LEN) != 0) {
     return false;
   }
 
-  const uint8_t *trailer = plist + plist_len - 32;
+  const uint8_t *trailer = plist + plist_len - BPLIST_TRAILER_LEN;
+  const uint8_t offset_size = trailer[6];
+  const uint8_t ref_size = trailer[7];
+  const uint64_t num_objects = read_be_int(trailer + 8, 8);
+  const uint64_t top_object = read_be_int(trailer + 16, 8);
+  const uint64_t table = read_be_int(trailer + 24, 8);
+  const size_t table_end = plist_len - BPLIST_TRAILER_LEN;
 
-  *offset_size = trailer[6];
-  *ref_size = trailer[7];
-  *num_objects = read_be_int(trailer + 8, 8);
-  *top_object = read_be_int(trailer + 16, 8);
-  *offset_table_offset = read_be_int(trailer + 24, 8);
-
-  return (*offset_size > 0 && *offset_size <= 8 && *ref_size > 0 &&
-          *ref_size <= 8 && *offset_table_offset < plist_len);
-}
-
-static uint64_t bplist_get_offset(const uint8_t *plist,
-                                  uint64_t offset_table_offset,
-                                  uint8_t offset_size, uint64_t obj_idx) {
-  const uint8_t *entry = plist + offset_table_offset + obj_idx * offset_size;
-  return read_be_int(entry, offset_size);
-}
-
-static bool bplist_read_string(const uint8_t *plist, size_t plist_len,
-                               uint64_t offset, char *out,
-                               size_t out_capacity) {
-  if (offset >= plist_len) {
+  if (offset_size < 1 || offset_size > 8 || ref_size < 1 || ref_size > 8) {
+    return false;
+  }
+  // At least one byte of objects, and the whole offset table before the
+  // trailer.
+  if (table <= BPLIST_HEADER_LEN || table > table_end) {
+    return false;
+  }
+  if (num_objects == 0 ||
+      num_objects > (table_end - (size_t)table) / offset_size ||
+      top_object >= num_objects) {
     return false;
   }
 
-  uint8_t marker = plist[offset];
-  uint8_t type = marker & 0xF0;
-  size_t len = marker & 0x0F;
+  bp->data = plist;
+  bp->objects_end = (size_t)table;
+  bp->offset_size = offset_size;
+  bp->ref_size = ref_size;
+  bp->num_objects = num_objects;
+  bp->top_object = top_object;
+  return true;
+}
+
+// The position of object `index`, which must lie in the object area.
+static bool bp_offset(const bplist_t *bp, uint64_t index, size_t *offset) {
+  if (index >= bp->num_objects) {
+    return false;
+  }
+  const uint64_t value =
+      read_be_int(bp->data + bp->objects_end + (size_t)index * bp->offset_size,
+                  bp->offset_size);
+  if (value < BPLIST_HEADER_LEN || value >= bp->objects_end) {
+    return false;
+  }
+  *offset = (size_t)value;
+  return true;
+}
+
+// True when `count` items of `unit` bytes fit between `pos` and the end of
+// the object area.
+static bool bp_fits(const bplist_t *bp, size_t pos, uint64_t count,
+                    size_t unit) {
+  return pos <= bp->objects_end && count <= (bp->objects_end - pos) / unit;
+}
+
+// The marker type of a data, string or container object and its count: the
+// marker's low nibble, or, when that is 0xF, the integer that follows it.
+// *body is where the object's contents start.
+static bool bp_object(const bplist_t *bp, size_t offset, uint8_t *type,
+                      uint64_t *count, size_t *body) {
+  if (offset >= bp->objects_end) {
+    return false;
+  }
+  const uint8_t marker = bp->data[offset];
   size_t pos = offset + 1;
-
-  if (len == 0x0F) {
-    if (pos >= plist_len) {
+  *type = marker & 0xF0;
+  *count = marker & 0x0F;
+  if (*count == 0x0F) {
+    if (pos >= bp->objects_end) {
       return false;
     }
-    uint8_t len_marker = plist[pos++];
-    if ((len_marker & 0xF0) != BPLIST_INT) {
+    const uint8_t len_marker = bp->data[pos++];
+    if ((len_marker & 0xF0) != BPLIST_INT || (len_marker & 0x0F) > 3) {
       return false;
     }
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
+    const size_t len_bytes = (size_t)1 << (len_marker & 0x0F);
+    if (len_bytes > bp->objects_end - pos) {
       return false;
     }
-    len = (size_t)read_be_int(plist + pos, len_bytes);
+    *count = read_be_int(bp->data + pos, len_bytes);
     pos += len_bytes;
+  }
+  *body = pos;
+  return true;
+}
+
+static bool bp_read_string(const bplist_t *bp, size_t offset, char *out,
+                           size_t out_capacity) {
+  uint8_t type = 0;
+  uint64_t len = 0;
+  size_t pos = 0;
+  if (!bp_object(bp, offset, &type, &len, &pos)) {
+    return false;
   }
 
   if (type == BPLIST_STRING) {
-    if (pos + len > plist_len || len >= out_capacity) {
+    if (!bp_fits(bp, pos, len, 1) || len >= out_capacity) {
       return false;
     }
-    memcpy(out, plist + pos, len);
+    memcpy(out, bp->data + pos, (size_t)len);
     out[len] = '\0';
     return true;
   }
 
   if (type == BPLIST_UNICODE) {
-    size_t bytes = len * 2;
-    if (pos + bytes > plist_len || len >= out_capacity) {
+    if (!bp_fits(bp, pos, len, 2) || len >= out_capacity) {
       return false;
     }
     for (size_t i = 0; i < len; i++) {
       uint16_t code =
-          (uint16_t)(plist[pos + i * 2] << 8) | plist[pos + i * 2 + 1];
+          (uint16_t)(bp->data[pos + i * 2] << 8) | bp->data[pos + i * 2 + 1];
       if (code > 0x7F) {
         return false;
       }
@@ -112,617 +178,267 @@ static bool bplist_read_string(const uint8_t *plist, size_t plist_len,
   return false;
 }
 
-static bool bplist_read_data(const uint8_t *plist, size_t plist_len,
-                             uint64_t offset, uint8_t *out, size_t out_capacity,
-                             size_t *out_len) {
-  if (offset >= plist_len) {
+static bool bp_read_string_len(const bplist_t *bp, size_t offset,
+                               size_t *out_len) {
+  uint8_t type = 0;
+  uint64_t len = 0;
+  size_t pos = 0;
+  if (!bp_object(bp, offset, &type, &len, &pos)) {
     return false;
   }
-
-  uint8_t marker = plist[offset];
-  uint8_t type = marker & 0xF0;
-  size_t len = marker & 0x0F;
-  size_t pos = offset + 1;
-
-  if (len == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    if ((len_marker & 0xF0) != BPLIST_INT) {
-      return false;
-    }
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    len = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
-
-  if (type == BPLIST_DATA) {
-    if (pos + len > plist_len || len > out_capacity) {
-      return false;
-    }
-    memcpy(out, plist + pos, len);
-    *out_len = len;
+  if ((type == BPLIST_STRING && bp_fits(bp, pos, len, 1)) ||
+      (type == BPLIST_UNICODE && bp_fits(bp, pos, len, 2))) {
+    *out_len = (size_t)len;
     return true;
   }
-
   return false;
 }
 
-static bool bplist_read_data_len(const uint8_t *plist, size_t plist_len,
-                                 uint64_t offset, size_t *out_len) {
-  if (offset >= plist_len) {
+// A data object's contents; out may be NULL to ask for the length only.
+static bool bp_read_data(const bplist_t *bp, size_t offset, uint8_t *out,
+                         size_t out_capacity, size_t *out_len) {
+  uint8_t type = 0;
+  uint64_t len = 0;
+  size_t pos = 0;
+  if (!bp_object(bp, offset, &type, &len, &pos) || type != BPLIST_DATA ||
+      !bp_fits(bp, pos, len, 1)) {
     return false;
   }
-
-  uint8_t marker = plist[offset];
-  uint8_t type = marker & 0xF0;
-  size_t len = marker & 0x0F;
-  size_t pos = offset + 1;
-
-  if (len == 0x0F) {
-    if (pos >= plist_len) {
+  if (out) {
+    if (len > out_capacity) {
       return false;
     }
-    uint8_t len_marker = plist[pos++];
-    if ((len_marker & 0xF0) != BPLIST_INT) {
-      return false;
-    }
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    len = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
+    memcpy(out, bp->data + pos, (size_t)len);
   }
-
-  if (type == BPLIST_DATA) {
-    if (pos + len > plist_len) {
-      return false;
-    }
-    *out_len = len;
-    return true;
-  }
-
-  return false;
-}
-
-static bool bplist_read_string_len(const uint8_t *plist, size_t plist_len,
-                                   uint64_t offset, size_t *out_len) {
-  if (offset >= plist_len) {
-    return false;
-  }
-
-  uint8_t marker = plist[offset];
-  uint8_t type = marker & 0xF0;
-  size_t len = marker & 0x0F;
-  size_t pos = offset + 1;
-
-  if (len == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    if ((len_marker & 0xF0) != BPLIST_INT) {
-      return false;
-    }
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    len = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
-
-  if (type == BPLIST_STRING) {
-    if (pos + len > plist_len) {
-      return false;
-    }
-    *out_len = len;
-    return true;
-  }
-  if (type == BPLIST_UNICODE) {
-    size_t bytes = len * 2;
-    if (pos + bytes > plist_len) {
-      return false;
-    }
-    *out_len = len;
-    return true;
-  }
-
-  return false;
-}
-
-static bool bplist_read_int(const uint8_t *plist, size_t plist_len,
-                            uint64_t offset, int64_t *out) {
-  if (offset >= plist_len) {
-    return false;
-  }
-
-  uint8_t marker = plist[offset];
-  uint8_t type = marker & 0xF0;
-
-  if (type == BPLIST_INT) {
-    size_t len = 1 << (marker & 0x0F);
-    if (offset + 1 + len > plist_len) {
-      return false;
-    }
-    *out = (int64_t)read_be_int(plist + offset + 1, len);
-    return true;
-  }
-
-  return false;
-}
-
-static bool bplist_read_real(const uint8_t *plist, size_t plist_len,
-                             uint64_t offset, double *out) {
-  if (offset >= plist_len) {
-    return false;
-  }
-
-  uint8_t marker = plist[offset];
-  uint8_t type = marker & 0xF0;
-
-  if (type == BPLIST_REAL) {
-    size_t len = 1 << (marker & 0x0F);
-    if (offset + 1 + len > plist_len) {
-      return false;
-    }
-
-    if (len == 4) {
-      uint32_t bits = (uint32_t)read_be_int(plist + offset + 1, 4);
-      float f;
-      memcpy(&f, &bits, sizeof(f));
-      *out = (double)f;
-      return true;
-    } else if (len == 8) {
-      uint64_t bits = read_be_int(plist + offset + 1, 8);
-      memcpy(out, &bits, sizeof(*out));
-      return true;
-    }
-  }
-
-  return false;
-}
-
-static bool bplist_parse_count(const uint8_t *plist, size_t plist_len,
-                               uint64_t offset, size_t *count,
-                               size_t *header_len) {
-  if (offset >= plist_len) {
-    return false;
-  }
-
-  uint8_t marker = plist[offset];
-  size_t info = marker & 0x0F;
-  size_t pos = offset + 1;
-
-  if (info == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    *count = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  } else {
-    *count = info;
-  }
-
-  *header_len = pos - offset;
+  *out_len = (size_t)len;
   return true;
 }
 
-static bool bplist_find_data_in_dict(const uint8_t *plist, size_t plist_len,
-                                     uint64_t dict_offset,
-                                     uint64_t offset_table_offset,
-                                     uint8_t offset_size, uint8_t ref_size,
-                                     const char *key, uint8_t *out_data,
-                                     size_t out_capacity, size_t *out_len) {
-  if (dict_offset >= plist_len) {
+static bool bp_read_int(const bplist_t *bp, size_t offset, int64_t *out) {
+  if (offset >= bp->objects_end) {
     return false;
   }
-
-  uint8_t marker = plist[dict_offset];
-  if ((marker & 0xF0) != BPLIST_DICT) {
+  const uint8_t marker = bp->data[offset];
+  // 1 to 8 bytes, or 16 for an unsigned value above INT64_MAX (whose low 8
+  // bytes are returned).
+  if ((marker & 0xF0) != BPLIST_INT || (marker & 0x0F) > 4) {
     return false;
   }
-
-  size_t dict_size = 0;
-  size_t header_len = 0;
-  if (!bplist_parse_count(plist, plist_len, dict_offset, &dict_size,
-                          &header_len)) {
+  const size_t len = (size_t)1 << (marker & 0x0F);
+  if (len > bp->objects_end - offset - 1) {
     return false;
   }
+  *out = (int64_t)read_be_int(bp->data + offset + 1, len);
+  return true;
+}
 
-  size_t pos = dict_offset + header_len;
-  if (pos + dict_size * 2 * ref_size > plist_len) {
+static bool bp_read_real(const bplist_t *bp, size_t offset, double *out) {
+  if (offset >= bp->objects_end) {
     return false;
   }
+  const uint8_t marker = bp->data[offset];
+  if ((marker & 0xF0) != BPLIST_REAL) {
+    return false;
+  }
+  const size_t len = (size_t)1 << (marker & 0x0F);
+  if ((len != 4 && len != 8) || len > bp->objects_end - offset - 1) {
+    return false;
+  }
+  if (len == 4) {
+    uint32_t bits = (uint32_t)read_be_int(bp->data + offset + 1, 4);
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    *out = (double)f;
+  } else {
+    uint64_t bits = read_be_int(bp->data + offset + 1, 8);
+    memcpy(out, &bits, sizeof(*out));
+  }
+  return true;
+}
 
-  const uint8_t *key_refs = plist + pos;
-  const uint8_t *val_refs = plist + pos + dict_size * ref_size;
+// A dict, array or set: its type, its count, and its reference list.  A
+// dict's list is the n key references followed by the n value references.
+static bool bp_container(const bplist_t *bp, size_t offset, uint8_t *type,
+                         size_t *n, const uint8_t **refs) {
+  uint64_t count = 0;
+  size_t pos = 0;
+  if (!bp_object(bp, offset, type, &count, &pos)) {
+    return false;
+  }
+  size_t per = 0;
+  if (*type == BPLIST_DICT) {
+    per = 2;
+  } else if (*type == BPLIST_ARRAY || *type == BPLIST_SET) {
+    per = 1;
+  } else {
+    return false;
+  }
+  if (!bp_fits(bp, pos, count, per * bp->ref_size)) {
+    return false;
+  }
+  *n = (size_t)count;
+  *refs = bp->data + pos;
+  return true;
+}
 
-  for (size_t i = 0; i < dict_size; i++) {
-    uint64_t key_idx = read_be_int(key_refs + i * ref_size, ref_size);
-    uint64_t key_offset =
-        bplist_get_offset(plist, offset_table_offset, offset_size, key_idx);
+// Reference i of a list bp_container() checked.
+static uint64_t bp_ref(const bplist_t *bp, const uint8_t *refs, size_t i) {
+  return read_be_int(refs + i * bp->ref_size, bp->ref_size);
+}
 
-    char found_key[64];
-    if (bplist_read_string(plist, plist_len, key_offset, found_key,
-                           sizeof(found_key))) {
-      if (strcmp(found_key, key) == 0) {
-        uint64_t val_idx = read_be_int(val_refs + i * ref_size, ref_size);
-        uint64_t val_offset =
-            bplist_get_offset(plist, offset_table_offset, offset_size, val_idx);
-        return bplist_read_data(plist, plist_len, val_offset, out_data,
-                                out_capacity, out_len);
-      }
+// The value reference for `key` in the dict at `offset`.
+static bool bp_dict_lookup_at(const bplist_t *bp, size_t offset,
+                              const char *key, uint64_t *value) {
+  uint8_t type = 0;
+  size_t n = 0;
+  const uint8_t *refs = NULL;
+  if (!bp_container(bp, offset, &type, &n, &refs) || type != BPLIST_DICT) {
+    return false;
+  }
+  for (size_t i = 0; i < n; i++) {
+    size_t key_offset = 0;
+    char name[64];
+    if (bp_offset(bp, bp_ref(bp, refs, i), &key_offset) &&
+        bp_read_string(bp, key_offset, name, sizeof(name)) &&
+        strcmp(name, key) == 0) {
+      *value = bp_ref(bp, refs, n + i);
+      return true;
     }
   }
-
   return false;
 }
 
-static bool bplist_find_data_recursive(const uint8_t *plist, size_t plist_len,
-                                       uint64_t obj_idx,
-                                       uint64_t offset_table_offset,
-                                       uint8_t offset_size, uint8_t ref_size,
-                                       const char *key, uint8_t *out_data,
-                                       size_t out_capacity, size_t *out_len,
-                                       int depth) {
-  if (depth > 10) {
-    return false;
-  }
+// The value reference for `key` in the dict that is object `index`.
+static bool bp_dict_lookup(const bplist_t *bp, uint64_t index, const char *key,
+                           uint64_t *value) {
+  size_t offset = 0;
+  return bp_offset(bp, index, &offset) &&
+         bp_dict_lookup_at(bp, offset, key, value);
+}
 
-  uint64_t offset =
-      bplist_get_offset(plist, offset_table_offset, offset_size, obj_idx);
-  if (offset >= plist_len) {
-    return false;
-  }
-
-  uint8_t marker = plist[offset];
-  uint8_t type = marker & 0xF0;
-
-  if (type == BPLIST_DICT) {
-    size_t dict_size = 0;
-    size_t header_len = 0;
-    if (!bplist_parse_count(plist, plist_len, offset, &dict_size,
-                            &header_len)) {
-      return false;
-    }
-
-    size_t pos = offset + header_len;
-    if (pos + dict_size * 2 * ref_size > plist_len) {
-      return false;
-    }
-
-    const uint8_t *key_refs = plist + pos;
-    const uint8_t *val_refs = plist + pos + dict_size * ref_size;
-
-    for (size_t i = 0; i < dict_size; i++) {
-      uint64_t key_idx = read_be_int(key_refs + i * ref_size, ref_size);
-      uint64_t key_offset =
-          bplist_get_offset(plist, offset_table_offset, offset_size, key_idx);
-
-      char found_key[64];
-      if (bplist_read_string(plist, plist_len, key_offset, found_key,
-                             sizeof(found_key))) {
-        if (strcmp(found_key, key) == 0) {
-          uint64_t val_idx = read_be_int(val_refs + i * ref_size, ref_size);
-          uint64_t val_offset = bplist_get_offset(plist, offset_table_offset,
-                                                  offset_size, val_idx);
-          return bplist_read_data(plist, plist_len, val_offset, out_data,
-                                  out_capacity, out_len);
-        }
-      }
-    }
-
-    for (size_t i = 0; i < dict_size; i++) {
-      uint64_t val_idx = read_be_int(val_refs + i * ref_size, ref_size);
-      if (bplist_find_data_recursive(
-              plist, plist_len, val_idx, offset_table_offset, offset_size,
-              ref_size, key, out_data, out_capacity, out_len, depth + 1)) {
-        return true;
-      }
-    }
-  } else if (type == BPLIST_ARRAY || type == BPLIST_SET) {
-    size_t count = 0;
-    size_t header_len = 0;
-    if (!bplist_parse_count(plist, plist_len, offset, &count, &header_len)) {
-      return false;
-    }
-
-    size_t pos = offset + header_len;
-    if (pos + count * ref_size > plist_len) {
-      return false;
-    }
-
-    for (size_t i = 0; i < count; i++) {
-      uint64_t idx = read_be_int(plist + pos + i * ref_size, ref_size);
-      if (bplist_find_data_recursive(plist, plist_len, idx, offset_table_offset,
-                                     offset_size, ref_size, key, out_data,
-                                     out_capacity, out_len, depth + 1)) {
-        return true;
-      }
-    }
-  }
-
-  return false;
+// The position of the value of `key` in the top-level dict.
+static bool bp_find_top(const uint8_t *plist, size_t plist_len, const char *key,
+                        bplist_t *bp, size_t *offset) {
+  uint64_t value = 0;
+  return bplist_open(plist, plist_len, bp) &&
+         bp_dict_lookup(bp, bp->top_object, key, &value) &&
+         bp_offset(bp, value, offset);
 }
 
 bool bplist_find_data(const uint8_t *plist, size_t plist_len, const char *key,
                       uint8_t *out_data, size_t out_capacity, size_t *out_len) {
-  if (plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
+  bplist_t bp;
+  size_t offset = 0;
+  return out_data && out_len &&
+         bp_find_top(plist, plist_len, key, &bp, &offset) &&
+         bp_read_data(&bp, offset, out_data, out_capacity, out_len);
+}
+
+// Bounds on the deep search, so a plist whose references fan out or loop
+// cannot keep the RTSP task busy.
+#define FIND_DEEP_MAX_DEPTH  10
+#define FIND_DEEP_MAX_VISITS 1024U
+
+static bool bp_find_data_recursive(const bplist_t *bp, uint64_t obj_idx,
+                                   const char *key, uint8_t *out_data,
+                                   size_t out_capacity, size_t *out_len,
+                                   int depth, unsigned *visits) {
+  size_t offset = 0;
+  uint8_t type = 0;
+  size_t n = 0;
+  const uint8_t *refs = NULL;
+  if (depth > FIND_DEEP_MAX_DEPTH || ++*visits > FIND_DEEP_MAX_VISITS ||
+      !bp_offset(bp, obj_idx, &offset) ||
+      !bp_container(bp, offset, &type, &n, &refs)) {
     return false;
   }
 
-  uint8_t offset_size = 0;
-  uint8_t ref_size = 0;
-  uint64_t num_objects = 0;
-  uint64_t top_object = 0;
-  uint64_t offset_table_offset = 0;
-  if (!bplist_parse_trailer(plist, plist_len, &offset_size, &ref_size,
-                            &num_objects, &top_object, &offset_table_offset)) {
-    return false;
+  // A dict's own keys first, then each value in turn.
+  const uint8_t *children = refs;
+  if (type == BPLIST_DICT) {
+    uint64_t value = 0;
+    size_t value_offset = 0;
+    if (bp_dict_lookup_at(bp, offset, key, &value)) {
+      return bp_offset(bp, value, &value_offset) &&
+             bp_read_data(bp, value_offset, out_data, out_capacity, out_len);
+    }
+    children = refs + n * bp->ref_size;
   }
-
-  uint64_t top_offset =
-      bplist_get_offset(plist, offset_table_offset, offset_size, top_object);
-  if (top_offset >= plist_len) {
-    return false;
+  for (size_t i = 0; i < n; i++) {
+    if (bp_find_data_recursive(bp, bp_ref(bp, children, i), key, out_data,
+                               out_capacity, out_len, depth + 1, visits)) {
+      return true;
+    }
   }
-
-  return bplist_find_data_in_dict(plist, plist_len, top_offset,
-                                  offset_table_offset, offset_size, ref_size,
-                                  key, out_data, out_capacity, out_len);
+  return false;
 }
 
 bool bplist_find_data_deep(const uint8_t *plist, size_t plist_len,
                            const char *key, uint8_t *out_data,
                            size_t out_capacity, size_t *out_len) {
-  if (plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
-    return false;
-  }
-
-  uint8_t offset_size = 0;
-  uint8_t ref_size = 0;
-  uint64_t num_objects = 0;
-  uint64_t top_object = 0;
-  uint64_t offset_table_offset = 0;
-  if (!bplist_parse_trailer(plist, plist_len, &offset_size, &ref_size,
-                            &num_objects, &top_object, &offset_table_offset)) {
-    return false;
-  }
-
-  (void)num_objects;
-  return bplist_find_data_recursive(plist, plist_len, top_object,
-                                    offset_table_offset, offset_size, ref_size,
-                                    key, out_data, out_capacity, out_len, 0);
+  bplist_t bp;
+  unsigned visits = 0;
+  return out_data && out_len && bplist_open(plist, plist_len, &bp) &&
+         bp_find_data_recursive(&bp, bp.top_object, key, out_data, out_capacity,
+                                out_len, 0, &visits);
 }
 
 bool bplist_find_int(const uint8_t *plist, size_t plist_len, const char *key,
                      int64_t *out_value) {
-  if (plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
-    return false;
-  }
-
-  uint8_t offset_size = 0;
-  uint8_t ref_size = 0;
-  uint64_t num_objects = 0;
-  uint64_t top_object = 0;
-  uint64_t offset_table_offset = 0;
-  if (!bplist_parse_trailer(plist, plist_len, &offset_size, &ref_size,
-                            &num_objects, &top_object, &offset_table_offset)) {
-    return false;
-  }
-
-  uint64_t top_offset =
-      bplist_get_offset(plist, offset_table_offset, offset_size, top_object);
-  if (top_offset >= plist_len) {
-    return false;
-  }
-
-  uint8_t marker = plist[top_offset];
-  if ((marker & 0xF0) != BPLIST_DICT) {
-    return false;
-  }
-
-  size_t dict_size = marker & 0x0F;
-  size_t pos = top_offset + 1;
-
-  if (dict_size == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    dict_size = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
-
-  if (pos + dict_size * 2 * ref_size > plist_len) {
-    return false;
-  }
-
-  const uint8_t *key_refs = plist + pos;
-  const uint8_t *val_refs = plist + pos + dict_size * ref_size;
-
-  for (size_t i = 0; i < dict_size; i++) {
-    uint64_t key_idx = read_be_int(key_refs + i * ref_size, ref_size);
-    uint64_t key_offset =
-        bplist_get_offset(plist, offset_table_offset, offset_size, key_idx);
-
-    char found_key[64];
-    if (bplist_read_string(plist, plist_len, key_offset, found_key,
-                           sizeof(found_key))) {
-      if (strcmp(found_key, key) == 0) {
-        uint64_t val_idx = read_be_int(val_refs + i * ref_size, ref_size);
-        uint64_t val_offset =
-            bplist_get_offset(plist, offset_table_offset, offset_size, val_idx);
-        return bplist_read_int(plist, plist_len, val_offset, out_value);
-      }
-    }
-  }
-
-  return false;
+  bplist_t bp;
+  size_t offset = 0;
+  return out_value && bp_find_top(plist, plist_len, key, &bp, &offset) &&
+         bp_read_int(&bp, offset, out_value);
 }
 
 bool bplist_find_real(const uint8_t *plist, size_t plist_len, const char *key,
                       double *out_value) {
-  if (plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
+  bplist_t bp;
+  size_t offset = 0;
+  if (!out_value || !bp_find_top(plist, plist_len, key, &bp, &offset)) {
     return false;
   }
-
-  uint8_t offset_size = 0;
-  uint8_t ref_size = 0;
-  uint64_t num_objects = 0;
-  uint64_t top_object = 0;
-  uint64_t offset_table_offset = 0;
-  if (!bplist_parse_trailer(plist, plist_len, &offset_size, &ref_size,
-                            &num_objects, &top_object, &offset_table_offset)) {
-    return false;
+  if (bp_read_real(&bp, offset, out_value)) {
+    return true;
   }
-
-  uint64_t top_offset =
-      bplist_get_offset(plist, offset_table_offset, offset_size, top_object);
-  if (top_offset >= plist_len) {
-    return false;
+  int64_t int_val = 0;
+  if (bp_read_int(&bp, offset, &int_val)) {
+    *out_value = (double)int_val;
+    return true;
   }
-
-  uint8_t marker = plist[top_offset];
-  if ((marker & 0xF0) != BPLIST_DICT) {
-    return false;
-  }
-
-  size_t dict_size = marker & 0x0F;
-  size_t pos = top_offset + 1;
-
-  if (dict_size == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    dict_size = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
-
-  if (pos + dict_size * 2 * ref_size > plist_len) {
-    return false;
-  }
-
-  const uint8_t *key_refs = plist + pos;
-  const uint8_t *val_refs = plist + pos + dict_size * ref_size;
-
-  for (size_t i = 0; i < dict_size; i++) {
-    uint64_t key_idx = read_be_int(key_refs + i * ref_size, ref_size);
-    uint64_t key_offset =
-        bplist_get_offset(plist, offset_table_offset, offset_size, key_idx);
-
-    char found_key[64];
-    if (bplist_read_string(plist, plist_len, key_offset, found_key,
-                           sizeof(found_key))) {
-      if (strcmp(found_key, key) == 0) {
-        uint64_t val_idx = read_be_int(val_refs + i * ref_size, ref_size);
-        uint64_t val_offset =
-            bplist_get_offset(plist, offset_table_offset, offset_size, val_idx);
-        if (bplist_read_real(plist, plist_len, val_offset, out_value)) {
-          return true;
-        }
-        int64_t int_val = 0;
-        if (bplist_read_int(plist, plist_len, val_offset, &int_val)) {
-          *out_value = (double)int_val;
-          return true;
-        }
-        return false;
-      }
-    }
-  }
-
   return false;
 }
 
 bool bplist_find_string(const uint8_t *plist, size_t plist_len, const char *key,
                         char *out_str, size_t out_capacity) {
-  if (plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
-    return false;
-  }
+  bplist_t bp;
+  size_t offset = 0;
+  return out_str && bp_find_top(plist, plist_len, key, &bp, &offset) &&
+         bp_read_string(&bp, offset, out_str, out_capacity);
+}
 
-  uint8_t offset_size = 0;
-  uint8_t ref_size = 0;
-  uint64_t num_objects = 0;
-  uint64_t top_object = 0;
-  uint64_t offset_table_offset = 0;
-  if (!bplist_parse_trailer(plist, plist_len, &offset_size, &ref_size,
-                            &num_objects, &top_object, &offset_table_offset)) {
-    return false;
-  }
+// ---------------------------------------------------------------------------
+// The "streams" array of a SETUP request: [{type, ekey?, eiv?, shk?, ...}]
+// ---------------------------------------------------------------------------
 
-  uint64_t top_offset =
-      bplist_get_offset(plist, offset_table_offset, offset_size, top_object);
-  if (top_offset >= plist_len) {
-    return false;
-  }
+static bool bp_streams(const uint8_t *plist, size_t plist_len, bplist_t *bp,
+                       size_t *count, const uint8_t **refs) {
+  size_t offset = 0;
+  uint8_t type = 0;
+  return bp_find_top(plist, plist_len, "streams", bp, &offset) &&
+         bp_container(bp, offset, &type, count, refs) && type == BPLIST_ARRAY;
+}
 
-  uint8_t marker = plist[top_offset];
-  if ((marker & 0xF0) != BPLIST_DICT) {
-    return false;
-  }
-
-  size_t dict_size = marker & 0x0F;
-  size_t pos = top_offset + 1;
-
-  if (dict_size == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    dict_size = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
-
-  if (pos + dict_size * 2 * ref_size > plist_len) {
-    return false;
-  }
-
-  const uint8_t *key_refs = plist + pos;
-  const uint8_t *val_refs = plist + pos + dict_size * ref_size;
-
-  for (size_t i = 0; i < dict_size; i++) {
-    uint64_t key_idx = read_be_int(key_refs + i * ref_size, ref_size);
-    uint64_t key_offset =
-        bplist_get_offset(plist, offset_table_offset, offset_size, key_idx);
-
-    char found_key[64];
-    if (bplist_read_string(plist, plist_len, key_offset, found_key,
-                           sizeof(found_key))) {
-      if (strcmp(found_key, key) == 0) {
-        uint64_t val_idx = read_be_int(val_refs + i * ref_size, ref_size);
-        uint64_t val_offset =
-            bplist_get_offset(plist, offset_table_offset, offset_size, val_idx);
-        return bplist_read_string(plist, plist_len, val_offset, out_str,
-                                  out_capacity);
-      }
-    }
-  }
-
-  return false;
+// The dict of stream `index`.
+static bool bp_stream_dict(const uint8_t *plist, size_t plist_len, size_t index,
+                           bplist_t *bp, size_t *n, const uint8_t **refs) {
+  size_t count = 0;
+  const uint8_t *streams = NULL;
+  size_t offset = 0;
+  uint8_t type = 0;
+  return bp_streams(plist, plist_len, bp, &count, &streams) && index < count &&
+         bp_offset(bp, bp_ref(bp, streams, index), &offset) &&
+         bp_container(bp, offset, &type, n, refs) && type == BPLIST_DICT;
 }
 
 bool bplist_get_streams_count(const uint8_t *plist, size_t plist_len,
@@ -730,110 +446,16 @@ bool bplist_get_streams_count(const uint8_t *plist, size_t plist_len,
   if (!count) {
     return false;
   }
-
   *count = 0;
 
-  if (plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
+  bplist_t bp;
+  size_t n = 0;
+  const uint8_t *refs = NULL;
+  if (!bp_streams(plist, plist_len, &bp, &n, &refs)) {
     return false;
   }
-
-  uint8_t offset_size = 0;
-  uint8_t ref_size = 0;
-  uint64_t num_objects = 0;
-  uint64_t top_object = 0;
-  uint64_t offset_table_offset = 0;
-  if (!bplist_parse_trailer(plist, plist_len, &offset_size, &ref_size,
-                            &num_objects, &top_object, &offset_table_offset)) {
-    return false;
-  }
-
-  uint64_t top_offset =
-      bplist_get_offset(plist, offset_table_offset, offset_size, top_object);
-  if (top_offset >= plist_len) {
-    return false;
-  }
-
-  size_t streams_key_len = 0;
-  uint64_t streams_key_offset = 0;
-  for (uint64_t i = 0; i < num_objects; i++) {
-    uint64_t offset =
-        bplist_get_offset(plist, offset_table_offset, offset_size, i);
-    if (offset >= plist_len) {
-      continue;
-    }
-    char key[16];
-    if (bplist_read_string(plist, plist_len, offset, key, sizeof(key))) {
-      if (strcmp(key, "streams") == 0) {
-        streams_key_offset = offset;
-        if (!bplist_read_string_len(plist, plist_len, offset,
-                                    &streams_key_len)) {
-          return false;
-        }
-        break;
-      }
-    }
-  }
-
-  if (streams_key_len == 0) {
-    return false;
-  }
-
-  uint64_t top_dict_offset = top_offset;
-  uint8_t marker = plist[top_dict_offset];
-  if ((marker & 0xF0) != BPLIST_DICT) {
-    return false;
-  }
-
-  size_t dict_size = marker & 0x0F;
-  size_t pos = top_dict_offset + 1;
-  if (dict_size == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    dict_size = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
-
-  if (pos + dict_size * 2 * ref_size > plist_len) {
-    return false;
-  }
-
-  const uint8_t *key_refs = plist + pos;
-  const uint8_t *val_refs = plist + pos + dict_size * ref_size;
-
-  for (size_t i = 0; i < dict_size; i++) {
-    uint64_t key_idx = read_be_int(key_refs + i * ref_size, ref_size);
-    uint64_t key_offset =
-        bplist_get_offset(plist, offset_table_offset, offset_size, key_idx);
-
-    if (key_offset == streams_key_offset) {
-      uint64_t val_idx = read_be_int(val_refs + i * ref_size, ref_size);
-      uint64_t val_offset =
-          bplist_get_offset(plist, offset_table_offset, offset_size, val_idx);
-
-      uint8_t val_marker = plist[val_offset];
-      if ((val_marker & 0xF0) != BPLIST_ARRAY) {
-        return false;
-      }
-
-      size_t array_count = 0;
-      size_t header_len = 0;
-      if (!bplist_parse_count(plist, plist_len, val_offset, &array_count,
-                              &header_len)) {
-        return false;
-      }
-
-      *count = array_count;
-      return true;
-    }
-  }
-
-  return false;
+  *count = n;
+  return true;
 }
 
 bool bplist_get_stream_info(const uint8_t *plist, size_t plist_len,
@@ -854,172 +476,38 @@ bool bplist_get_stream_info(const uint8_t *plist, size_t plist_len,
     *shk_len = 0;
   }
 
-  if (plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
+  bplist_t bp;
+  size_t n = 0;
+  const uint8_t *refs = NULL;
+  if (!bp_stream_dict(plist, plist_len, index, &bp, &n, &refs)) {
     return false;
   }
 
-  uint8_t offset_size = 0;
-  uint8_t ref_size = 0;
-  uint64_t num_objects = 0;
-  uint64_t top_object = 0;
-  uint64_t offset_table_offset = 0;
-  if (!bplist_parse_trailer(plist, plist_len, &offset_size, &ref_size,
-                            &num_objects, &top_object, &offset_table_offset)) {
-    return false;
-  }
-
-  uint64_t top_offset =
-      bplist_get_offset(plist, offset_table_offset, offset_size, top_object);
-  if (top_offset >= plist_len) {
-    return false;
-  }
-
-  size_t streams_key_len = 0;
-  uint64_t streams_key_offset = 0;
-  for (uint64_t i = 0; i < num_objects; i++) {
-    uint64_t offset =
-        bplist_get_offset(plist, offset_table_offset, offset_size, i);
-    if (offset >= plist_len) {
+  for (size_t j = 0; j < n; j++) {
+    size_t key_offset = 0;
+    size_t val_offset = 0;
+    char key[32];
+    if (!bp_offset(&bp, bp_ref(&bp, refs, j), &key_offset) ||
+        !bp_read_string(&bp, key_offset, key, sizeof(key)) ||
+        !bp_offset(&bp, bp_ref(&bp, refs, n + j), &val_offset)) {
       continue;
     }
-    char key[16];
-    if (bplist_read_string(plist, plist_len, offset, key, sizeof(key))) {
-      if (strcmp(key, "streams") == 0) {
-        streams_key_offset = offset;
-        if (!bplist_read_string_len(plist, plist_len, offset,
-                                    &streams_key_len)) {
-          return false;
-        }
-        break;
+
+    if (strcmp(key, "type") == 0) {
+      int64_t type_val = 0;
+      if (bp_read_int(&bp, val_offset, &type_val)) {
+        *type = type_val;
       }
+    } else if (strcmp(key, "ekey") == 0 && ekey_len) {
+      bp_read_data(&bp, val_offset, NULL, 0, ekey_len);
+    } else if (strcmp(key, "eiv") == 0 && eiv_len) {
+      bp_read_data(&bp, val_offset, NULL, 0, eiv_len);
+    } else if (strcmp(key, "shk") == 0 && shk_len) {
+      bp_read_data(&bp, val_offset, NULL, 0, shk_len);
     }
   }
 
-  if (streams_key_len == 0) {
-    return false;
-  }
-
-  uint64_t top_dict_offset = top_offset;
-  uint8_t marker = plist[top_dict_offset];
-  if ((marker & 0xF0) != BPLIST_DICT) {
-    return false;
-  }
-
-  size_t dict_size = marker & 0x0F;
-  size_t pos = top_dict_offset + 1;
-  if (dict_size == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    dict_size = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
-
-  if (pos + dict_size * 2 * ref_size > plist_len) {
-    return false;
-  }
-
-  const uint8_t *key_refs = plist + pos;
-  const uint8_t *val_refs = plist + pos + dict_size * ref_size;
-
-  for (size_t i = 0; i < dict_size; i++) {
-    uint64_t key_idx = read_be_int(key_refs + i * ref_size, ref_size);
-    uint64_t key_offset =
-        bplist_get_offset(plist, offset_table_offset, offset_size, key_idx);
-
-    if (key_offset == streams_key_offset) {
-      uint64_t val_idx = read_be_int(val_refs + i * ref_size, ref_size);
-      uint64_t val_offset =
-          bplist_get_offset(plist, offset_table_offset, offset_size, val_idx);
-
-      uint8_t val_marker = plist[val_offset];
-      if ((val_marker & 0xF0) != BPLIST_ARRAY) {
-        return false;
-      }
-
-      size_t array_count = 0;
-      size_t header_len = 0;
-      if (!bplist_parse_count(plist, plist_len, val_offset, &array_count,
-                              &header_len)) {
-        return false;
-      }
-
-      if (index >= array_count) {
-        return false;
-      }
-
-      size_t array_pos = val_offset + header_len;
-      if (array_pos + array_count * ref_size > plist_len) {
-        return false;
-      }
-
-      uint64_t stream_idx =
-          read_be_int(plist + array_pos + index * ref_size, ref_size);
-      uint64_t stream_offset = bplist_get_offset(plist, offset_table_offset,
-                                                 offset_size, stream_idx);
-
-      uint8_t stream_marker = plist[stream_offset];
-      if ((stream_marker & 0xF0) != BPLIST_DICT) {
-        return false;
-      }
-
-      size_t stream_dict_size = 0;
-      size_t stream_header_len = 0;
-      if (!bplist_parse_count(plist, plist_len, stream_offset,
-                              &stream_dict_size, &stream_header_len)) {
-        return false;
-      }
-
-      size_t stream_pos = stream_offset + stream_header_len;
-      if (stream_pos + stream_dict_size * 2 * ref_size > plist_len) {
-        return false;
-      }
-
-      const uint8_t *stream_key_refs = plist + stream_pos;
-      const uint8_t *stream_val_refs =
-          plist + stream_pos + stream_dict_size * ref_size;
-
-      for (size_t j = 0; j < stream_dict_size; j++) {
-        uint64_t stream_key_idx =
-            read_be_int(stream_key_refs + j * ref_size, ref_size);
-        uint64_t stream_key_offset = bplist_get_offset(
-            plist, offset_table_offset, offset_size, stream_key_idx);
-
-        char stream_key[32];
-        if (!bplist_read_string(plist, plist_len, stream_key_offset, stream_key,
-                                sizeof(stream_key))) {
-          continue;
-        }
-
-        uint64_t stream_val_idx =
-            read_be_int(stream_val_refs + j * ref_size, ref_size);
-        uint64_t stream_val_offset = bplist_get_offset(
-            plist, offset_table_offset, offset_size, stream_val_idx);
-
-        if (strcmp(stream_key, "type") == 0) {
-          int64_t type_val = 0;
-          if (bplist_read_int(plist, plist_len, stream_val_offset, &type_val)) {
-            *type = type_val;
-          }
-        } else if (strcmp(stream_key, "ekey") == 0 && ekey_len) {
-          bplist_read_data_len(plist, plist_len, stream_val_offset, ekey_len);
-        } else if (strcmp(stream_key, "eiv") == 0 && eiv_len) {
-          bplist_read_data_len(plist, plist_len, stream_val_offset, eiv_len);
-        } else if (strcmp(stream_key, "shk") == 0 && shk_len) {
-          bplist_read_data_len(plist, plist_len, stream_val_offset, shk_len);
-        }
-      }
-
-      return (*type != -1);
-    }
-  }
-
-  return false;
+  return (*type != -1);
 }
 
 bool bplist_get_stream_kv_info(const uint8_t *plist, size_t plist_len,
@@ -1031,197 +519,60 @@ bool bplist_get_stream_kv_info(const uint8_t *plist, size_t plist_len,
 
   *out_count = 0;
 
-  if (plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
+  bplist_t bp;
+  size_t n = 0;
+  const uint8_t *refs = NULL;
+  if (!bp_stream_dict(plist, plist_len, index, &bp, &n, &refs)) {
     return false;
   }
 
-  uint8_t offset_size = 0;
-  uint8_t ref_size = 0;
-  uint64_t num_objects = 0;
-  uint64_t top_object = 0;
-  uint64_t offset_table_offset = 0;
-  if (!bplist_parse_trailer(plist, plist_len, &offset_size, &ref_size,
-                            &num_objects, &top_object, &offset_table_offset)) {
-    return false;
-  }
-
-  uint64_t top_offset =
-      bplist_get_offset(plist, offset_table_offset, offset_size, top_object);
-  if (top_offset >= plist_len) {
-    return false;
-  }
-
-  size_t streams_key_len = 0;
-  uint64_t streams_key_offset = 0;
-  for (uint64_t i = 0; i < num_objects; i++) {
-    uint64_t offset =
-        bplist_get_offset(plist, offset_table_offset, offset_size, i);
-    if (offset >= plist_len) {
+  for (size_t j = 0; j < n && *out_count < out_capacity; j++) {
+    size_t key_offset = 0;
+    char key[64];
+    if (!bp_offset(&bp, bp_ref(&bp, refs, j), &key_offset) ||
+        !bp_read_string(&bp, key_offset, key, sizeof(key))) {
       continue;
     }
-    char key[16];
-    if (bplist_read_string(plist, plist_len, offset, key, sizeof(key))) {
-      if (strcmp(key, "streams") == 0) {
-        streams_key_offset = offset;
-        if (!bplist_read_string_len(plist, plist_len, offset,
-                                    &streams_key_len)) {
-          return false;
-        }
-        break;
+
+    bplist_kv_info_t *info = &out[*out_count];
+    memset(info, 0, sizeof(*info));
+    strlcpy(info->key, key, sizeof(info->key));
+    (*out_count)++;
+
+    size_t val_offset = 0;
+    if (!bp_offset(&bp, bp_ref(&bp, refs, n + j), &val_offset)) {
+      continue; // BPLIST_VALUE_UNKNOWN
+    }
+    const uint8_t val_type = bp.data[val_offset] & 0xF0;
+
+    if (val_type == BPLIST_INT) {
+      info->value_type = BPLIST_VALUE_INT;
+      int64_t int_val = 0;
+      if (bp_read_int(&bp, val_offset, &int_val)) {
+        info->int_value = int_val;
       }
+    } else if (val_type == BPLIST_DATA) {
+      info->value_type = BPLIST_VALUE_DATA;
+      size_t len = 0;
+      if (bp_read_data(&bp, val_offset, NULL, 0, &len)) {
+        info->value_len = len;
+      }
+    } else if (val_type == BPLIST_STRING || val_type == BPLIST_UNICODE) {
+      info->value_type = BPLIST_VALUE_STRING;
+      size_t len = 0;
+      if (bp_read_string_len(&bp, val_offset, &len)) {
+        info->value_len = len;
+      }
+    } else if (val_type == BPLIST_UID) {
+      info->value_type = BPLIST_VALUE_UID;
+    } else if (val_type == BPLIST_ARRAY) {
+      info->value_type = BPLIST_VALUE_ARRAY;
+    } else if (val_type == BPLIST_DICT) {
+      info->value_type = BPLIST_VALUE_DICT;
     }
   }
 
-  if (streams_key_len == 0) {
-    return false;
-  }
-
-  uint64_t top_dict_offset = top_offset;
-  uint8_t marker = plist[top_dict_offset];
-  if ((marker & 0xF0) != BPLIST_DICT) {
-    return false;
-  }
-
-  size_t dict_size = marker & 0x0F;
-  size_t pos = top_dict_offset + 1;
-  if (dict_size == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    dict_size = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
-
-  if (pos + dict_size * 2 * ref_size > plist_len) {
-    return false;
-  }
-
-  const uint8_t *key_refs = plist + pos;
-  const uint8_t *val_refs = plist + pos + dict_size * ref_size;
-
-  for (size_t i = 0; i < dict_size; i++) {
-    uint64_t key_idx = read_be_int(key_refs + i * ref_size, ref_size);
-    uint64_t key_offset =
-        bplist_get_offset(plist, offset_table_offset, offset_size, key_idx);
-
-    if (key_offset == streams_key_offset) {
-      uint64_t val_idx = read_be_int(val_refs + i * ref_size, ref_size);
-      uint64_t val_offset =
-          bplist_get_offset(plist, offset_table_offset, offset_size, val_idx);
-
-      uint8_t val_marker = plist[val_offset];
-      if ((val_marker & 0xF0) != BPLIST_ARRAY) {
-        return false;
-      }
-
-      size_t array_count = 0;
-      size_t header_len = 0;
-      if (!bplist_parse_count(plist, plist_len, val_offset, &array_count,
-                              &header_len)) {
-        return false;
-      }
-
-      if (index >= array_count) {
-        return false;
-      }
-
-      size_t array_pos = val_offset + header_len;
-      if (array_pos + array_count * ref_size > plist_len) {
-        return false;
-      }
-
-      uint64_t stream_idx =
-          read_be_int(plist + array_pos + index * ref_size, ref_size);
-      uint64_t stream_offset = bplist_get_offset(plist, offset_table_offset,
-                                                 offset_size, stream_idx);
-
-      uint8_t stream_marker = plist[stream_offset];
-      if ((stream_marker & 0xF0) != BPLIST_DICT) {
-        return false;
-      }
-
-      size_t stream_dict_size = 0;
-      size_t stream_header_len = 0;
-      if (!bplist_parse_count(plist, plist_len, stream_offset,
-                              &stream_dict_size, &stream_header_len)) {
-        return false;
-      }
-
-      size_t stream_pos = stream_offset + stream_header_len;
-      if (stream_pos + stream_dict_size * 2 * ref_size > plist_len) {
-        return false;
-      }
-
-      const uint8_t *stream_key_refs = plist + stream_pos;
-      const uint8_t *stream_val_refs =
-          plist + stream_pos + stream_dict_size * ref_size;
-
-      for (size_t j = 0; j < stream_dict_size && *out_count < out_capacity;
-           j++) {
-        uint64_t stream_key_idx =
-            read_be_int(stream_key_refs + j * ref_size, ref_size);
-        uint64_t stream_key_offset = bplist_get_offset(
-            plist, offset_table_offset, offset_size, stream_key_idx);
-
-        char stream_key[64];
-        if (!bplist_read_string(plist, plist_len, stream_key_offset, stream_key,
-                                sizeof(stream_key))) {
-          continue;
-        }
-
-        uint64_t stream_val_idx =
-            read_be_int(stream_val_refs + j * ref_size, ref_size);
-        uint64_t stream_val_offset = bplist_get_offset(
-            plist, offset_table_offset, offset_size, stream_val_idx);
-
-        bplist_kv_info_t *info = &out[*out_count];
-        memset(info, 0, sizeof(*info));
-        strlcpy(info->key, stream_key, sizeof(info->key));
-
-        uint8_t stream_val_marker = plist[stream_val_offset];
-        uint8_t stream_val_type = stream_val_marker & 0xF0;
-
-        if (stream_val_type == BPLIST_INT) {
-          info->value_type = BPLIST_VALUE_INT;
-          int64_t int_val = 0;
-          if (bplist_read_int(plist, plist_len, stream_val_offset, &int_val)) {
-            info->int_value = int_val;
-          }
-        } else if (stream_val_type == BPLIST_DATA) {
-          info->value_type = BPLIST_VALUE_DATA;
-          size_t len = 0;
-          if (bplist_read_data_len(plist, plist_len, stream_val_offset, &len)) {
-            info->value_len = len;
-          }
-        } else if (stream_val_type == BPLIST_STRING ||
-                   stream_val_type == BPLIST_UNICODE) {
-          info->value_type = BPLIST_VALUE_STRING;
-          size_t len = 0;
-          if (bplist_read_string_len(plist, plist_len, stream_val_offset,
-                                     &len)) {
-            info->value_len = len;
-          }
-        } else if (stream_val_type == BPLIST_UID) {
-          info->value_type = BPLIST_VALUE_UID;
-        } else if (stream_val_type == BPLIST_ARRAY) {
-          info->value_type = BPLIST_VALUE_ARRAY;
-        } else if (stream_val_type == BPLIST_DICT) {
-          info->value_type = BPLIST_VALUE_DICT;
-        }
-
-        (*out_count)++;
-      }
-
-      return (*out_count > 0);
-    }
-  }
-
-  return false;
+  return (*out_count > 0);
 }
 
 bool bplist_find_stream_crypto(const uint8_t *plist, size_t plist_len,
@@ -1310,12 +661,7 @@ bool bplist_find_stream_crypto(const uint8_t *plist, size_t plist_len,
 // ---------------------------------------------------------------------------
 
 typedef struct {
-  const uint8_t *plist;
-  size_t len;
-  uint8_t offset_size;
-  uint8_t ref_size;
-  uint64_t num_objects;
-  uint64_t offset_table_offset;
+  bplist_t bp;
   uint32_t *out;
   size_t max;
   size_t count;
@@ -1352,28 +698,18 @@ static bool parse_dotted_quad(const char *s, uint8_t octets[4]) {
   return *s == '\0';
 }
 
-static bool walk_object_offset(const ipv4_walk_t *w, uint64_t index,
-                               uint64_t *offset) {
-  if (index >= w->num_objects ||
-      w->offset_table_offset + (index + 1U) * w->offset_size > w->len) {
-    return false;
-  }
-  *offset = bplist_get_offset(w->plist, w->offset_table_offset, w->offset_size,
-                              index);
-  return *offset < w->len;
-}
-
 static void walk_ipv4(ipv4_walk_t *w, uint64_t index, int depth) {
-  uint64_t offset = 0;
+  const bplist_t *bp = &w->bp;
+  size_t offset = 0;
   if (depth > IPV4_WALK_MAX_DEPTH || ++w->visits > IPV4_WALK_MAX_VISITS ||
-      !walk_object_offset(w, index, &offset)) {
+      !bp_offset(bp, index, &offset)) {
     return;
   }
-  const uint8_t type = w->plist[offset] & 0xF0;
+  const uint8_t type = bp->data[offset] & 0xF0;
   if (type == BPLIST_STRING || type == BPLIST_UNICODE) {
     char text[64];
     uint8_t octets[4];
-    if (!bplist_read_string(w->plist, w->len, offset, text, sizeof(text)) ||
+    if (!bp_read_string(bp, offset, text, sizeof(text)) ||
         !parse_dotted_quad(text, octets)) {
       return;
     }
@@ -1392,21 +728,18 @@ static void walk_ipv4(ipv4_walk_t *w, uint64_t index, int depth) {
   if (type != BPLIST_ARRAY && type != BPLIST_DICT) {
     return;
   }
+  uint8_t container = 0;
   size_t n = 0;
-  size_t header = 0;
-  if (!bplist_parse_count(w->plist, w->len, offset, &n, &header)) {
-    return;
-  }
-  const size_t refs_at = (size_t)offset + header;
-  if (n > w->num_objects || refs_at > w->len ||
-      (type == BPLIST_DICT ? 2U : 1U) * n * w->ref_size > w->len - refs_at) {
+  const uint8_t *refs = NULL;
+  if (!bp_container(bp, offset, &container, &n, &refs)) {
     return;
   }
   // A dict's values follow its keys; only the values can hold addresses.
-  const uint8_t *refs =
-      w->plist + refs_at + (type == BPLIST_DICT ? n * w->ref_size : 0U);
+  if (container == BPLIST_DICT) {
+    refs += n * bp->ref_size;
+  }
   for (size_t i = 0; i < n; i++) {
-    walk_ipv4(w, read_be_int(refs + i * w->ref_size, w->ref_size), depth + 1);
+    walk_ipv4(w, bp_ref(bp, refs, i), depth + 1);
   }
 }
 
@@ -1416,106 +749,31 @@ bool bplist_collect_ipv4(const uint8_t *plist, size_t plist_len,
   if (count) {
     *count = 0;
   }
-  if (!plist || !out || !count || plist_len < 40 ||
-      memcmp(plist, "bplist00", 8) != 0) {
+  ipv4_walk_t w = {.out = out, .max = max};
+  if (!out || !count || !bplist_open(plist, plist_len, &w.bp)) {
     return false;
   }
-  ipv4_walk_t w = {.plist = plist, .len = plist_len, .out = out, .max = max};
-  uint64_t top_object = 0;
-  if (!bplist_parse_trailer(plist, plist_len, &w.offset_size, &w.ref_size,
-                            &w.num_objects, &top_object,
-                            &w.offset_table_offset)) {
+  uint64_t start = w.bp.top_object;
+  if (key && !bp_dict_lookup(&w.bp, w.bp.top_object, key, &start)) {
     return false;
-  }
-  uint64_t start = top_object;
-  if (key) {
-    uint64_t top_offset = 0;
-    if (!walk_object_offset(&w, top_object, &top_offset) ||
-        (plist[top_offset] & 0xF0) != BPLIST_DICT) {
-      return false;
-    }
-    size_t n = 0;
-    size_t header = 0;
-    if (!bplist_parse_count(plist, plist_len, top_offset, &n, &header) ||
-        n > w.num_objects ||
-        (size_t)top_offset + header + 2U * n * w.ref_size > plist_len) {
-      return false;
-    }
-    const uint8_t *keys = plist + top_offset + header;
-    const uint8_t *values = keys + n * w.ref_size;
-    bool found = false;
-    for (size_t i = 0; i < n && !found; i++) {
-      uint64_t key_offset = 0;
-      char name[64];
-      if (walk_object_offset(&w, read_be_int(keys + i * w.ref_size, w.ref_size),
-                             &key_offset) &&
-          bplist_read_string(plist, plist_len, key_offset, name,
-                             sizeof(name)) &&
-          strcmp(name, key) == 0) {
-        start = read_be_int(values + i * w.ref_size, w.ref_size);
-        found = true;
-      }
-    }
-    if (!found) {
-      return false;
-    }
   }
   walk_ipv4(&w, start, 0);
   *count = w.count;
   return true;
 }
 
-// The value reference for `key` in the dict at object `index`, using the
-// bounds-checked walk helpers above.
-static bool walk_dict_lookup(const ipv4_walk_t *w, uint64_t index,
-                             const char *key, uint64_t *value_index) {
-  uint64_t offset = 0;
-  if (!walk_object_offset(w, index, &offset) ||
-      (w->plist[offset] & 0xF0) != BPLIST_DICT) {
-    return false;
-  }
-  size_t n = 0;
-  size_t header = 0;
-  if (!bplist_parse_count(w->plist, w->len, offset, &n, &header) ||
-      n > w->num_objects ||
-      (size_t)offset + header + 2U * n * w->ref_size > w->len) {
-    return false;
-  }
-  const uint8_t *keys = w->plist + offset + header;
-  const uint8_t *values = keys + n * w->ref_size;
-  for (size_t i = 0; i < n; i++) {
-    uint64_t key_offset = 0;
-    char name[64];
-    if (walk_object_offset(w, read_be_int(keys + i * w->ref_size, w->ref_size),
-                           &key_offset) &&
-        bplist_read_string(w->plist, w->len, key_offset, name, sizeof(name)) &&
-        strcmp(name, key) == 0) {
-      *value_index = read_be_int(values + i * w->ref_size, w->ref_size);
-      return true;
-    }
-  }
-  return false;
-}
-
 bool bplist_find_nested_int(const uint8_t *plist, size_t plist_len,
                             const char *dict_key, const char *key,
                             int64_t *out_value) {
-  if (!plist || !dict_key || !key || !out_value || plist_len < 40 ||
-      memcmp(plist, "bplist00", 8) != 0) {
+  if (!dict_key || !key || !out_value) {
     return false;
   }
-  ipv4_walk_t w = {.plist = plist, .len = plist_len};
-  uint64_t top_object = 0;
-  if (!bplist_parse_trailer(plist, plist_len, &w.offset_size, &w.ref_size,
-                            &w.num_objects, &top_object,
-                            &w.offset_table_offset)) {
-    return false;
-  }
+  bplist_t bp;
   uint64_t inner = 0;
   uint64_t value = 0;
-  uint64_t offset = 0;
-  return walk_dict_lookup(&w, top_object, dict_key, &inner) &&
-         walk_dict_lookup(&w, inner, key, &value) &&
-         walk_object_offset(&w, value, &offset) &&
-         bplist_read_int(plist, plist_len, offset, out_value);
+  size_t offset = 0;
+  return bplist_open(plist, plist_len, &bp) &&
+         bp_dict_lookup(&bp, bp.top_object, dict_key, &inner) &&
+         bp_dict_lookup(&bp, inner, key, &value) &&
+         bp_offset(&bp, value, &offset) && bp_read_int(&bp, offset, out_value);
 }
