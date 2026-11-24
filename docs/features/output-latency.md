@@ -33,8 +33,6 @@ Output latency: DMA 43537 us (modelled; live depth used) + FIFO 726 + resampler 
 output delay 0 + DAC 499 (preset: PCM510xA normal filter) + trim 0 = 44762 us at 44100 Hz
 ```
 
-The **Configuration** page shows the same parts under the trim control.
-
 ## The DAC's delay
 
 A DAC with a driver reports its own delay where the datasheet gives one. The PCM5122 (the
@@ -106,8 +104,10 @@ This is the accurate method, to about 0.1 ms. You need a HomePod or HomePod mini
 Apple TV playing through HomePods), a phone that can record audio, and a computer with
 [Audacity](https://www.audacityteam.org/).
 
-1. Group this speaker with the HomePod in the Home app or from Control Center. Do not use
-   a TV's own speakers as the reference: a TV adds its own delay.
+1. Group this speaker with the HomePod in the Home app or from Control Center. A Sonos, or
+   shairport-sync playing through a computer's own sound card, also works: measured against
+   each other they agree to within 1 ms. Do not use a TV or a soundbar as the reference:
+   they add their own delay (17 ms for one soundbar).
 2. Play a click track: one short, sharp click a second, for about 30 seconds, at a
    moderate level.
 3. Hold the phone's microphone the same distance from both speakers. If you cannot,
