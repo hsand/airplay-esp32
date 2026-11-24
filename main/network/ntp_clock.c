@@ -227,13 +227,24 @@ static bool disc_adjust(ntp_disc_t *d, int64_t local_ns, int64_t offset_ns,
 #define NTP_FREQ_ACQUIRE_MIN_POINTS 5
 #define NTP_FREQ_ACQUIRE_MAX_SE_PPB 10000.0
 
-/* Above lwIP's tcpip task (18): the reply is stamped the moment tcpip hands
- * it to the socket, not when a busier task gets round to it.  The task does
- * a few microseconds of arithmetic per reply and sleeps otherwise. */
+/* Above lwIP's tcpip task (18).  A reply is stamped when select() returns
+ * in this task, so below tcpip the stamp would also wait for whatever else
+ * tcpip has queued, and that wait lands on one leg of the round trip.  The
+ * priority is safe only because the task never holds the CPU for long: per
+ * reply it does a few microseconds of integer arithmetic, plus, in the first
+ * NTP_FREQ_ACQUIRE_S, a fit of a few hundred double operations (software
+ * floating point on most of these chips); it sleeps in select() otherwise.
+ * The 10 s status line is DEBUG for the same reason: a UART log line takes
+ * milliseconds, which would hold tcpip off on this core.  Only the lock, a
+ * step and errors log above DEBUG, a few lines per session.
+ *
+ * 4 KB of stack: a log line formats 64-bit integers through vprintf, and with
+ * the web log viewer on, log_stream.c formats it again into a 256-byte buffer
+ * of its own.  3 KB left too little margin for that on top of select(). */
 #ifndef NTP_TASK_PRIORITY
 #define NTP_TASK_PRIORITY 19
 #endif
-#define NTP_STACK_SIZE 3072
+#define NTP_STACK_SIZE 4096
 
 static struct {
   bool running;
@@ -396,7 +407,7 @@ static void freq_acquire(int64_t local_ns, int64_t absolute_ns,
     }
   }
   /* Three passes over at most NTP_FREQ_POINTS, recomputing each point's
-   * weight rather than keeping arrays of doubles on a 3 KB stack. */
+   * weight rather than keeping arrays of doubles on the task's stack. */
   double sw = 0, sx = 0, sy = 0, w, x, y;
   for (uint32_t i = 0; i < ntp.points; i++) {
     freq_point(i, min_delay, local_ns, absolute_ns, &w, &x, &y);
@@ -554,7 +565,7 @@ static void status_line(int64_t now_us) {
   // ppm with three decimals, in integers: ns/s is ppb.
   const int64_t freq_ppb = div_round(freq_q32 / (1LL << 16), 65536);
   const int64_t abs_ppb = freq_ppb < 0 ? -freq_ppb : freq_ppb;
-  ESP_LOGI(TAG,
+  ESP_LOGD(TAG,
            "ntp: locked=%d freq=%c%" PRId64 ".%03" PRId64 " ppm last=%+" PRId64
            " us phase=%+" PRId64 " us delay min/avg/max="
            "%" PRId64 "/%" PRId64 "/%" PRId64 " us used=%" PRIu32 "/%" PRIu32
