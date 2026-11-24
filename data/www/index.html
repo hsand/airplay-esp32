@@ -64,6 +64,10 @@
 </select></div>
 <p class='hint' id='chan-hint'>Which channel this speaker plays. Two speakers can make a stereo pair, one playing left and one right.</p></div>
 <p class='hint' id='chan-fixed' hidden>The amplifier wiring fixes which channel each output plays; the Equaliser routes them.</p>
+<div class='form-group' id='lat-group' hidden><label for='lat-trim'>Output latency trim (ms)</label>
+<div class='row'><input type='number' id='lat-trim' min='-50' max='50' step='0.1' onchange='saveLatency()'></div>
+<p class='hint'>Extra delay after the DAC, such as an amplifier with DSP or an AV receiver. Positive if this speaker sounds late next to an Apple speaker. Applies at once, with no restart: playout drifts onto it inaudibly over a few seconds, or with one short fade for 10 ms or more. <a href='https://rbouteiller.github.io/airplay-esp32/features/output-latency/' target='_blank' rel='noopener'>How to measure it</a></p>
+<p class='hint' id='lat-parts'></p></div>
 <div class='form-group' id='amp-box' hidden>
 <div class='form-group' id='pbtl-group' hidden><label for='pbtl-mode' id='pbtl-label'>Amplifier wiring</label>
 <div class='row'><select id='pbtl-mode' onchange='saveWiring("pbtl")'>
@@ -285,8 +289,35 @@ async function saveWiring(which){
   catch(e){undo();Shell.tick(sel,false,e.message);}
 }
 
+/* The output latency trim, and what the receiver already compensates for. */
+function ms(us){return (us/1000).toFixed(2)+' ms';}
+function showLatency(d){
+  $('lat-group').hidden=false;
+  $('lat-trim').value=(d.trim_us/1000).toFixed(1);
+  var dac=d.dac_source==='unknown'?'DAC unknown':
+    'DAC '+ms(d.dac_us)+(d.dac_source==='preset'?' ('+d.dac_preset+')':'');
+  var parts=['DMA ~'+ms(d.dma_us),'FIFO '+ms(d.fifo_us)];
+  if(d.resampler_us)parts.push('resampler '+ms(d.resampler_us));
+  if(d.output_delay_us)parts.push('output delay '+ms(d.output_delay_us));
+  parts.push(dac,'trim '+ms(d.trim_us));
+  $('lat-parts').textContent='Compensated: '+parts.join(' + ')+' = '+ms(d.total_us)+' at '+d.rate+' Hz.';
+}
+async function loadLatency(){
+  /* Older firmware has no such endpoint: leave the control hidden. */
+  try{showLatency(await Shell.get('/api/audio/latency'));}catch(e){}
+}
+async function saveLatency(){
+  var el=$('lat-trim'),v=Number(el.value);
+  if(!isFinite(v)){Shell.tick(el,false,'Not a number');return;}
+  try{var d=await Shell.post('/api/audio/latency',{trim_us:Math.round(Math.max(-50,Math.min(50,v))*1000)});
+    if(!d.success)throw new Error(d.error);
+    showLatency(d);Shell.tick(el,true);}
+  catch(e){Shell.tick(el,false,e.message);}
+}
+
 Shell.info().then(async function(i){
   await loadChannel();
+  await loadLatency();
   /* Only a TAS58xx build registers the wiring; asking anyway logs a
      warning on the device for every page load. */
   if(i.dual_supported)await loadWiring();

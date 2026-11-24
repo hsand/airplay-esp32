@@ -109,6 +109,15 @@ jobs:
       - name: Simulate the buffered playout chain, v0.3.0 against this tree
         run: python3 tests/playout_sim/run.py
 
+      - name: Test the deferred amp mute, DAC delay presets and latency sum
+        run: python3 tests/dac_dispatch/run.py
+
+      - name: Test the volume law against 10^(dB/20)
+        run: python3 tests/audio_volume/run.py
+
+      - name: Test the stream SETUP reply against plistlib
+        run: python3 tests/bplist_setup/run.py
+
       - name: Test how far a TAS58xx filter chain lifts full scale
         run: python3 tests/tas58xx_peak/run.py
 

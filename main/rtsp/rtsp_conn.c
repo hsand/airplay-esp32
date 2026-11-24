@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include "audio_receiver.h"
+#include "audio_volume.h"
 #include "esp_log.h"
 #include "settings.h"
 
@@ -23,15 +24,7 @@ rtsp_conn_t *rtsp_conn_create(void) {
   float saved_volume;
   (void)settings_get_volume(&saved_volume);
   conn->volume_db = saved_volume;
-  // Apply volume curve
-  if (saved_volume <= -30.0f) {
-    conn->volume_q15 = 0;
-  } else if (saved_volume >= 0.0f) {
-    conn->volume_q15 = 32768;
-  } else {
-    float normalized = (saved_volume + 30.0f) / 30.0f;
-    conn->volume_q15 = (int32_t)(normalized * normalized * 32768.0f);
-  }
+  conn->volume_q15 = audio_volume_q15(saved_volume);
 
   ESP_LOGI(TAG, "New conn: starting volume=%.2f dB (q15=%ld)", conn->volume_db,
            (long)conn->volume_q15);
@@ -122,20 +115,20 @@ void rtsp_conn_set_volume(rtsp_conn_t *conn, float volume_db) {
     return;
   }
 
-  conn->volume_db = volume_db;
-
-  // AirPlay volume: 0 dB = max, -30 dB = mute
-  // Use squared curve for better perceptual control
-  if (volume_db <= -30.0f) {
-    conn->volume_q15 = 0;
-  } else if (volume_db >= 0.0f) {
-    conn->volume_q15 = 32768;
-  } else {
-    // Map -30..0 to 0..1, then square for perceptual curve
-    float normalized = (volume_db + 30.0f) / 30.0f;
-    float curved = normalized * normalized;
-    conn->volume_q15 = (int32_t)(curved * 32768.0f);
+  // The slider's range, as Apple keeps it: the sender's -144 ("muted") is
+  // its bottom, -30 dB.
+  if (!(volume_db > -30.0f)) {
+    volume_db = -30.0f;
+  } else if (volume_db > 0.0f) {
+    volume_db = 0.0f;
   }
+  // Apple drops a change it would not hear: under 0.3 dB, 1 % of the slider.
+  if (!audio_volume_change_noticeable(conn->volume_db, volume_db)) {
+    return;
+  }
+  conn->volume_db = volume_db;
+  // AirPlay volume: 0 dB = max, -30 dB = mute, by the configured law.
+  conn->volume_q15 = audio_volume_q15(volume_db);
 
   // Update cached volume + DAC (NVS persisted at disconnect)
   settings_set_volume(volume_db);

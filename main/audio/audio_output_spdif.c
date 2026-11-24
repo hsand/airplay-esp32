@@ -227,8 +227,9 @@ static void apply_volume(int16_t *buf, size_t n) {
   // audible on every step of the sender's volume slider.  Approach the
   // target exponentially, stepping once per stereo frame (even indices) so
   // both channels always carry the same gain; the /256 divisor gives a
-  // ~3 ms time constant and a worst-case per-frame gain step of ~0.4%,
-  // with a minimum step of 1 so the ramp always completes.
+  // 256-frame time constant (5.8 ms at 44.1 kHz) and a worst-case per-frame
+  // gain step of ~0.4%, with a minimum step of 1 so the ramp always
+  // completes.
   static int32_t cur_q15 = -1;
   int32_t target = airplay_get_volume_q15();
   if (cur_q15 < 0) {
@@ -323,11 +324,11 @@ static void playback_task(void *arg) {
     }
     if (flush_requested) {
       flush_requested = false;
-      audio_resample_reset();
       // The DMA ring is left running, as on I2S.  Stopping it would drop
       // the receiver's lock (it mutes and relocks, often audibly) and break
-      // the cursor's continuity.  By the time a flush arrives the render
-      // has gone quiet, so the ring already holds silence.
+      // the cursor's continuity.  The resampler keeps its history as well:
+      // the engine fades the stream out over its next few milliseconds, and
+      // a reset ahead of that fade cut the waveform and clicked.
     }
     size_t samples = audio_output_read_source(pcm, FRAME_SAMPLES + 1);
     if (samples > 0) {
@@ -485,4 +486,11 @@ bool audio_output_get_pipeline_us(int64_t *now_us, uint32_t *pipeline_us) {
 
 uint32_t audio_output_get_underruns(void) {
   return __atomic_load_n(&output_underruns, __ATOMIC_RELAXED);
+}
+
+// As in audio_output.c: the TX FIFO's 64 x 32-bit entries are still to go
+// out when a descriptor completes.  Each audio frame is four 32-bit BMC
+// words here, so they hold 16 frames.
+uint32_t audio_output_get_fifo_frames(void) {
+  return 64U / (BMC_FRAME_BYTES / sizeof(uint32_t));
 }

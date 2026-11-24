@@ -33,12 +33,14 @@ SCENARIOS = (
     "glitch20ms", "clockstep20",
     "gm_change", "pause_resume", "skip_deferred", "lost_packet",
     "reanchor_same", "reanchor_moved",
+    "dac_pcm5102a", "avr20_trimmed", "trim_to+2ms", "trim_to-3ms",
+    "trim_to+20ms",
 )
 
 NEW_SOURCES = [AUDIO / f for f in (
     "audio_engine_v2.c", "audio_scheduler.c", "audio_timeline.c",
     "audio_clock_map.c", "audio_epoch.c", "audio_playout_clock.c",
-    "audio_flush_queue.c", "audio_plc.c")]
+    "audio_flush_queue.c", "audio_plc.c", "audio_latency.c")]
 OLD_SOURCES = [HERE / "baseline" / f for f in (
     "audio_engine_v2.c", "audio_scheduler.c", "audio_timeline.c",
     "audio_clock_map.c", "audio_epoch.c")]
@@ -48,7 +50,8 @@ def build(build_dir, name, baseline):
     includes = ["-I", str(build_dir), "-I", str(HERE)]
     if baseline:
         includes += ["-I", str(HERE / "baseline")]
-    includes += ["-I", str(AUDIO), "-I", str(ROOT / "main/network")]
+    includes += ["-I", str(AUDIO), "-I", str(ROOT / "main/network"),
+                 "-I", str(ROOT / "components/dac/include")]
     sources = OLD_SOURCES if baseline else NEW_SOURCES
     command = shlex.split(os.environ.get("CC", "cc")) + [
         "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-g", "-O2",
@@ -69,12 +72,15 @@ def run(binary, scenario):
                          stdout=subprocess.PIPE, text=True).stdout
     line = next(l for l in out.splitlines() if l.startswith("RESULT"))
     fields = line.split()[2:]
-    return {k: float(v) for k, v in (f.split("=") for f in fields)}
+    r = {k: float(v) for k, v in (f.split("=") for f in fields)}
+    r["abs_bias_us"] = abs(r["bias_us"])
+    return r
 
 
 COLUMNS = (
     ("mean_us", "mean|e| us", "{:.0f}"),
     ("p95_us", "p95|e| us", "{:.0f}"),
+    ("bias_us", "bias us", "{:.0f}"),
     ("max_us", "max|e| us", "{:.0f}"),
     ("silent_ms", "silent ms", "{:.0f}"),
     ("steps", "steps", "{:.0f}"),
@@ -82,6 +88,7 @@ COLUMNS = (
     ("far", "far>100ms", "{:.0f}"),
     ("wrong_track_ms", "old-trk ms", "{:.0f}"),
     ("first_sound_s", "start s", "{:.2f}"),
+    ("settle_s", "settle s", "{:.1f}"),
 )
 
 # What the new build must do.  Each is (scenario, field, op, bound).
@@ -102,6 +109,23 @@ EXPECT = (
     ("skip_deferred", "p95_us", "<", 500),
     ("reanchor_same", "steps", "==", 0),
     ("reanchor_moved", "far", "==", 0),
+    # The latency model: emission lands on the ideal once the receiver knows
+    # the path after the ring, and the trim covers what it cannot know.
+    ("dac_pcm5102a", "p95_us", "<", 500),
+    ("dac_pcm5102a", "abs_bias_us", "<", 100),
+    ("avr20_trimmed", "p95_us", "<", 500),
+    ("avr20_trimmed", "abs_bias_us", "<", 100),
+    # A trim change mid-stream: no restart, and no faded step below the
+    # scheduler's 10 ms step threshold.  The drift servo takes it in at its
+    # inaudible trim rate (about 10 s for 2 ms); past 10 ms one faded step
+    # does it in well under a second.
+    ("trim_to+2ms", "steps", "==", 0),
+    ("trim_to+2ms", "settle_s", "<", 12),
+    ("trim_to+2ms", "far", "==", 0),
+    ("trim_to-3ms", "steps", "==", 0),
+    ("trim_to-3ms", "settle_s", "<", 15),
+    ("trim_to+20ms", "steps", "==", 1),
+    ("trim_to+20ms", "settle_s", "<", 3),
 )
 
 

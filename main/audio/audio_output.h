@@ -8,6 +8,7 @@
 
 #include "esp_err.h"
 
+#include "audio_latency.h"
 #include "freertos/FreeRTOS.h"
 
 /**
@@ -138,24 +139,42 @@ bool audio_output_get_pipeline_us(int64_t *now_us, uint32_t *pipeline_us);
 
 /**
  * Local monotonic time (ns) at which the first sample of the NEXT backend
- * write will be heard.
- *
- * Deliberately built on the stable modelled latency rather than the live
- * cursor from audio_output_get_pipeline_us(): this is a *scheduling* input,
- * consumed once per render to pick which RTP timestamp to emit next.  The
- * live cursor steps at DMA descriptor boundaries, so feeding it in here would
- * make the chosen timestamp jitter by a whole descriptor and repeatedly
- * re-target the read cursor.  Error measurement still uses the live value.
+ * write will be heard: the live queue depth from
+ * audio_output_get_pipeline_us() (interpolated between DMA completions, so
+ * it does not step by a descriptor), plus the post-ring latency of
+ * audio_output_get_latency().  Falls back to the modelled depth for a
+ * backend without a completion cursor.
  */
 int64_t audio_output_get_next_playout_time_ns(int64_t now_us);
 
 /**
- * What Apple calls the platform latency: from a block leaving the playback
- * task to it being heard, i.e. the modelled DMA depth plus
- * CONFIG_AUDIO_OUTPUT_EXTRA_LATENCY_US.  Scheduling already subtracts it;
- * RECORD reports it to the sender as Audio-Latency.
+ * The post-ring latency and its parts (audio_latency.h): FIFO, resampler,
+ * common output delay, DAC and user trim, at the current output rate.
+ */
+void audio_output_get_latency(audio_latency_t *latency);
+
+/**
+ * What Apple calls the device latency: from the DMA ring to the ear, i.e. the
+ * post-ring latency, never below 0.
+ */
+uint32_t audio_output_get_device_latency_us(void);
+
+/**
+ * Apple's platform latency plus its I/O buffer: from a block leaving the
+ * playback task to it being heard, i.e. the modelled DMA depth plus the
+ * device latency.  Scheduling already compensates for all of it.
  */
 uint32_t audio_output_get_platform_latency_us(void);
+
+/**
+ * Backend facts for the latency model; weak defaults in
+ * audio_output_common.c.  The rate the output runs at, the frames that sit in
+ * a hardware FIFO after the completion cursor counts them as sent, and the
+ * delay common to every output (the per-output delay's shared part).
+ */
+uint32_t audio_output_get_rate(void);
+uint32_t audio_output_get_fifo_frames(void);
+uint32_t audio_output_get_common_delay_us(void);
 
 /**
  * Render callback used by a playback task to pull the next block of PCM.

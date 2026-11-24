@@ -94,6 +94,12 @@ typedef struct {
    * exactly on it. */
   bool fas_valid;
   uint32_t fas_rtp;
+  /* The fade-in at every start (AUDIO_SCHED_START_FADE_MS), counted from the
+   * first audible frame: its length in frames, 0 when none is under way,
+   * and how much of it has played. */
+  uint32_t start_fade_len;
+  uint32_t start_fade_pos;
+  uint32_t start_fades;
   audio_scheduler_wait_reason_t wait_reason;
   uint64_t render_calls;
   uint64_t silent_render_calls;
@@ -119,6 +125,28 @@ void audio_scheduler_set_first_audible(audio_scheduler_t *scheduler, bool valid,
 /* The clock offset used for the coming render; see clock_offset_ns. */
 void audio_scheduler_set_clock_offset(audio_scheduler_t *scheduler, bool valid,
                                       int64_t offset_ns);
+
+/* Transitions.  Apple's buffered receiver fades in linearly over 30 ms at
+ * every start and resume, and cuts hard on a pause, a flush and a teardown.
+ * The fade-in is the same here, counted from the first audible sample, and
+ * covers restarts after a flush or a dropout too.  The stop is faded as well
+ * (AUDIO_SCHED_FADE_OUT_MS): on a DAC with no mute line, such as a PCM5102A
+ * with XSMT tied high, a hard cut to zero clicks. */
+#define AUDIO_SCHED_START_FADE_MS 30U
+#define AUDIO_SCHED_FADE_OUT_MS   8U
+
+/* Frames the stop's fade-out needs at `sample_rate`. */
+uint32_t audio_scheduler_fade_out_frames(uint32_t sample_rate);
+
+/* Called as playout stops (pause, flush, teardown), before the stream is
+ * changed: the next `frames` frames from the cursor, faded to silence, go to
+ * `out` (`frames` * `channels` samples), and the cursor moves past them.
+ * Returns the frames written: 0 if nothing was playing, or playout was
+ * already silent (a step holding, or the first audible sample still
+ * ahead). */
+size_t audio_scheduler_take_tail(audio_scheduler_t *scheduler,
+                                 audio_timeline_t *timeline, int16_t *out,
+                                 size_t frames, uint8_t channels);
 
 size_t audio_scheduler_render(audio_scheduler_t *scheduler,
                               audio_timeline_t *timeline,

@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "nvs.h"
+#include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -28,6 +29,7 @@ static const char *TAG = "settings";
 #define NVS_KEY_AMP_MUTE       "amp_mute"
 #define NVS_KEY_AMP_MIX        "amp_mix"
 #define NVS_KEY_OUT_DELAY      "out_delay"
+#define NVS_KEY_LATENCY_TRIM   "lat_trim"
 #define NVS_KEY_FIRST_PBTL     "amp1_pbtl"
 #define NVS_KEY_SECOND_PBTL    "amp2_pbtl"
 #define NVS_KEY_USB_PD_VOLTS   "pd_volts"
@@ -53,6 +55,20 @@ static float g_volume_db = -24.0f; /* default: 20 % */
 static bool g_volume_loaded = false;
 static bool g_volume_dirty = false;
 
+// Same range as AUDIO_LATENCY_TRIM_MAX_US.
+#define LATENCY_TRIM_MAX_US 50000
+static int32_t g_latency_trim_us;
+
+// What is kept as the level: the slider's range, as Apple keeps it.  The
+// sender's -144 ("muted") is the bottom of it, so the next session starts
+// muted rather than at a level no slider position can express.
+static float clamp_volume_db(float db) {
+  if (!(db > DAC_VOLUME_MIN_DB)) {
+    return DAC_VOLUME_MIN_DB;
+  }
+  return db > 0.0f ? 0.0f : db;
+}
+
 #ifdef CONFIG_BT_A2DP_ENABLE
 static uint8_t g_bt_volume = 25; /* default: 20 % */
 static bool g_bt_volume_loaded = false;
@@ -77,9 +93,16 @@ esp_err_t settings_init(void) {
     int32_t vol_fixed;
     err = nvs_get_i32(nvs, NVS_KEY_VOLUME, &vol_fixed);
     if (err == ESP_OK) {
-      g_volume_db = (float)vol_fixed / 100.0f;
+      g_volume_db = clamp_volume_db((float)vol_fixed / 100.0f);
       g_volume_loaded = true;
       ESP_LOGI(TAG, "Loaded volume: %.2f dB", g_volume_db);
+    }
+
+    int32_t trim = 0;
+    if (nvs_get_i32(nvs, NVS_KEY_LATENCY_TRIM, &trim) == ESP_OK &&
+        trim >= -LATENCY_TRIM_MAX_US && trim <= LATENCY_TRIM_MAX_US) {
+      g_latency_trim_us = trim;
+      ESP_LOGI(TAG, "Loaded output latency trim: %" PRId32 " us", trim);
     }
 
     uint8_t airplay_v1;
@@ -135,6 +158,7 @@ esp_err_t settings_get_volume(float *volume_db) {
 }
 
 esp_err_t settings_set_volume(float volume_db) {
+  volume_db = clamp_volume_db(volume_db);
   // Skip if unchanged
   if (g_volume_loaded && volume_db == g_volume_db) {
     return ESP_OK;
@@ -769,6 +793,38 @@ settings_set_output_delay_us(const uint16_t us[SETTINGS_DELAY_OUTPUTS]) {
     ESP_LOGE(TAG, "Failed to save output delays: %s", esp_err_to_name(err));
   }
   return err;
+}
+
+int32_t settings_get_output_latency_trim_us(void) {
+  return g_latency_trim_us;
+}
+
+esp_err_t settings_set_output_latency_trim_us(int32_t us) {
+  if (us > LATENCY_TRIM_MAX_US) {
+    us = LATENCY_TRIM_MAX_US;
+  } else if (us < -LATENCY_TRIM_MAX_US) {
+    us = -LATENCY_TRIM_MAX_US;
+  }
+  if (us == g_latency_trim_us) {
+    return ESP_OK;
+  }
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to open NVS: %s", esp_err_to_name(err));
+    return err;
+  }
+  err = nvs_set_i32(nvs, NVS_KEY_LATENCY_TRIM, us);
+  if (err == ESP_OK) {
+    err = nvs_commit(nvs);
+  }
+  nvs_close(nvs);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to save the latency trim: %s", esp_err_to_name(err));
+    return err;
+  }
+  g_latency_trim_us = us;
+  return ESP_OK;
 }
 
 /* ================================================================== */

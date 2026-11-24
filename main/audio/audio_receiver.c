@@ -422,10 +422,6 @@ uint32_t audio_receiver_get_hardware_latency_us(void) {
   return audio_timing_get_hardware_latency();
 }
 
-uint32_t audio_receiver_get_advertised_latency_us(void) {
-  return audio_timing_get_advertised_latency(&receiver.timing);
-}
-
 void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
                                     uint32_t rtp_time) {
   if (!receiver.stream) {
@@ -535,7 +531,36 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
   }
 }
 
+// The output latency the playout schedule compensates for, once per start.
+// From the RTSP task: the playback task must never wait on a log line.
+static void log_output_latency(void) {
+  audio_latency_t latency;
+  audio_output_get_latency(&latency);
+  const uint32_t dma_us = audio_output_get_hardware_latency_us();
+  dac_delay_source_t source = latency.dac_source;
+  ESP_LOGI(TAG,
+           "Output latency: DMA %" PRIu32 " us (modelled; live depth used) + "
+           "FIFO %" PRIu32 " + resampler %" PRIu32 " + output delay %" PRIu32
+           " + DAC %" PRIu32 " (%s%s%s) + trim %" PRId32 " = %" PRId64
+           " us at %" PRIu32 " Hz",
+           dma_us, latency.fifo_us, latency.resampler_us, latency.channel_us,
+           latency.dac_us, dac_delay_source_name(source),
+           source == DAC_DELAY_FROM_PRESET ? ": " : "",
+           source == DAC_DELAY_FROM_PRESET ? dac_output_delay_preset_name()
+                                           : "",
+           latency.trim_us, (int64_t)dma_us + latency.post_ring_us,
+           audio_output_get_rate());
+}
+
+// Whether a start has been logged since the last stop; its own flag, as
+// timing.playing starts out true.
+static bool s_latency_logged;
+
 void audio_receiver_set_playing(bool playing) {
+  if (playing && !s_latency_logged) {
+    log_output_latency();
+  }
+  s_latency_logged = playing;
   audio_timing_set_playing(&receiver.timing, playing);
   if (receiver.engine_v2_ready) {
     audio_engine_v2_set_playing(&receiver.engine_v2, playing);
@@ -1014,6 +1039,7 @@ void audio_receiver_pause(void) {
   // SETRATEANCHORTIME anchor that re-aligns the buffered frames to the
   // correct wall-clock position; no flush or offset compensation is needed.
   audio_timing_set_playing(&receiver.timing, false);
+  s_latency_logged = false;
   if (receiver.engine_v2_ready) {
     if (receiver.stream == receiver.buffered_stream) {
       // Rate 0 on Apple flushes the output and invalidates the anchor but

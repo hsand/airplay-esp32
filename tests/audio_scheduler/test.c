@@ -525,7 +525,11 @@ static void test_first_audible(void) {
       if (block[k * AUDIO_V2_MAX_CHANNELS] != 0 ||
           block[k * AUDIO_V2_MAX_CHANNELS + 1] != 0) {
         first_sound = i * BLOCK + (int64_t)k;
-        CHECK(block[k * AUDIO_V2_MAX_CHANNELS] == tone_sample(fas, 0),
+        /* The start's fade-in begins on it: its first step. */
+        const uint32_t len = RATE * AUDIO_SCHED_START_FADE_MS / 1000U;
+        const int32_t gain = (int32_t)((1ULL << 15) / (len + 1U));
+        CHECK(block[k * AUDIO_V2_MAX_CHANNELS] ==
+                  (int16_t)((int32_t)tone_sample(fas, 0) * gain / 32768),
               "first sound is not the first audible sample");
         break;
       }
@@ -534,6 +538,112 @@ static void test_first_audible(void) {
   CHECK(first_sound == 1000, "first sound at frame %lld, wanted 1000",
         (long long)first_sound);
   CHECK(!scheduler.fas_valid, "gate still armed");
+}
+
+/* The ramp every fade uses, sample for sample as audio_scheduler.c has it. */
+static int16_t ramp_sample(int16_t x, uint32_t num, uint32_t len) {
+  const int32_t gain = (int32_t)(((uint64_t)num << 15) / (len + 1U));
+  return (int16_t)((int32_t)x * gain / 32768);
+}
+
+/* The largest step between neighbouring samples of the unfaded left tone. */
+static int max_tone_step(void) {
+  return (int)ceil(AMP * 2.0 * M_PI * tone_hz[0] / RATE) + 1;
+}
+
+/* Every start fades in over AUDIO_SCHED_START_FADE_MS, straight from 0, and
+ * plays the tone untouched after it.  Then a stop: the tail continues the
+ * waveform from the cursor and fades it to nothing, with no step at the join
+ * or at the end. */
+static void test_start_and_stop_fades(void) {
+  printf("start fade-in and stop fade-out\n");
+  drift_ppm = 0.0;
+  audio_scheduler_t scheduler;
+  audio_scheduler_init(&scheduler, RATE / 4, 0);
+  audio_scheduler_begin_epoch(&scheduler, 1, mock_now_us);
+  const uint32_t len = RATE * AUDIO_SCHED_START_FADE_MS / 1000U;
+  enum { BLOCKS = 8 };
+  static int16_t out[BLOCKS * BLOCK * AUDIO_V2_MAX_CHANNELS];
+  uint32_t first_rtp = 0;
+  for (int b = 0; b < BLOCKS; b++) {
+    const int64_t network_ns = (int64_t)clock_map.anchor_network_ns +
+                               (int64_t)b * BLOCK * 1000000000LL / RATE;
+    (void)audio_scheduler_render(&scheduler, &timeline, &clock_map, network_ns,
+                                 &out[(size_t)b * BLOCK * AUDIO_V2_MAX_CHANNELS],
+                                 BLOCK, AUDIO_V2_MAX_CHANNELS, NULL);
+    if (b == 0) {
+      first_rtp = scheduler.cursor_rtp - BLOCK;
+    }
+  }
+  CHECK(scheduler.cursor_rtp == first_rtp + BLOCKS * BLOCK,
+        "playout not contiguous");
+  CHECK(scheduler.start_fades == 1, "%u fades", (unsigned)scheduler.start_fades);
+  int wrong = 0;
+  int worst_step = 0;
+  for (uint32_t k = 0; k < BLOCKS * BLOCK; k++) {
+    for (uint8_t ch = 0; ch < AUDIO_V2_MAX_CHANNELS; ch++) {
+      const int16_t x = tone_sample(first_rtp + k, ch);
+      const int16_t want = k < len ? ramp_sample(x, k + 1U, len) : x;
+      wrong += out[k * AUDIO_V2_MAX_CHANNELS + ch] != want;
+    }
+    const int prev = k ? out[(k - 1) * AUDIO_V2_MAX_CHANNELS] : 0;
+    const int step = abs(out[k * AUDIO_V2_MAX_CHANNELS] - prev);
+    worst_step = step > worst_step ? step : worst_step;
+  }
+  CHECK(wrong == 0, "%d samples off the fade-in", wrong);
+  CHECK(abs(out[0]) <= (int)(AMP / (len + 1)) + 1, "starts at %d", out[0]);
+  CHECK(worst_step <= max_tone_step(), "step of %d from silence", worst_step);
+  printf("  fade-in %u frames, first sample %d, largest step %d (tone %d)\n",
+         (unsigned)len, out[0], worst_step, max_tone_step());
+
+  /* Stop. */
+  const uint32_t tail_len = audio_scheduler_fade_out_frames(RATE);
+  static int16_t tail[96 * AUDIO_SCHED_FADE_OUT_MS * AUDIO_V2_MAX_CHANNELS];
+  const uint32_t cursor = scheduler.cursor_rtp;
+  const size_t taken = audio_scheduler_take_tail(
+      &scheduler, &timeline, tail, tail_len, AUDIO_V2_MAX_CHANNELS);
+  CHECK(taken == tail_len, "tail of %zu frames, wanted %u", taken,
+        (unsigned)tail_len);
+  wrong = 0;
+  worst_step = abs(tail[0] - out[(BLOCKS * BLOCK - 1) * AUDIO_V2_MAX_CHANNELS]);
+  for (uint32_t k = 0; k < tail_len; k++) {
+    for (uint8_t ch = 0; ch < AUDIO_V2_MAX_CHANNELS; ch++) {
+      const int16_t want =
+          ramp_sample(tone_sample(cursor + k, ch), tail_len - k, tail_len);
+      wrong += tail[k * AUDIO_V2_MAX_CHANNELS + ch] != want;
+    }
+    if (k) {
+      const int step = abs(tail[k * AUDIO_V2_MAX_CHANNELS] -
+                           tail[(k - 1) * AUDIO_V2_MAX_CHANNELS]);
+      worst_step = step > worst_step ? step : worst_step;
+    }
+  }
+  const int last = tail[(tail_len - 1) * AUDIO_V2_MAX_CHANNELS];
+  CHECK(wrong == 0, "%d samples off the fade-out", wrong);
+  CHECK(abs(last) <= (int)(AMP / (tail_len + 1)) + 1, "ends at %d", last);
+  CHECK(worst_step <= max_tone_step(), "step of %d into the tail", worst_step);
+  CHECK(scheduler.cursor_rtp == cursor + tail_len, "cursor not moved on");
+  printf("  fade-out %u frames, last sample %d, largest step %d\n",
+         (unsigned)tail_len, last, worst_step);
+
+  /* A stop inside the fade-in fades from where the fade-in had got to. */
+  audio_scheduler_begin_epoch(&scheduler, 2, mock_now_us);
+  (void)audio_scheduler_render(&scheduler, &timeline, &clock_map,
+                               (int64_t)clock_map.anchor_network_ns, out,
+                               BLOCK, AUDIO_V2_MAX_CHANNELS, NULL);
+  const int16_t before = out[(BLOCK - 1) * AUDIO_V2_MAX_CHANNELS];
+  (void)audio_scheduler_take_tail(&scheduler, &timeline, tail, tail_len,
+                                  AUDIO_V2_MAX_CHANNELS);
+  const int join = abs(tail[0] - before);
+  CHECK(join <= max_tone_step() * (int)BLOCK / (int)len + 2,
+        "a stop during the fade-in jumps by %d", join);
+  CHECK(scheduler.start_fade_len == 0, "fade-in still armed after a stop");
+
+  /* Nothing playing yet: no tail. */
+  audio_scheduler_begin_epoch(&scheduler, 3, mock_now_us);
+  CHECK(audio_scheduler_take_tail(&scheduler, &timeline, tail, tail_len,
+                                  AUDIO_V2_MAX_CHANNELS) == 0,
+        "a tail before playout started");
 }
 
 int main(void) {
@@ -551,6 +661,7 @@ int main(void) {
   test_step_clock_excursion();
   test_anchor_reset();
   test_first_audible();
+  test_start_and_stop_fades();
   if (failures) {
     printf("%d check(s) failed\n", failures);
     return 1;

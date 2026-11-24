@@ -81,4 +81,3 @@ static inline void vTaskDelay(TickType_t t) {
 #define heap_caps_malloc(n, caps)    malloc(n)
 #define heap_caps_calloc(n, s, caps) calloc(n, s)
 
-#define CONFIG_AUDIO_OUTPUT_EXTRA_LATENCY_US 5000

@@ -77,8 +77,27 @@ void vTaskDelay(uint32_t ticks);
 #define portMAX_DELAY     UINT32_MAX
 #define pdMS_TO_TICKS(ms) (ms)
 
+// dac.c's deferred quieting. The mock never runs its task (xTaskCreate
+// fails), so every power mode applies at once, as the driver tests expect;
+// tests/dac_power covers the deferral.
+typedef uint32_t TickType_t;
+typedef int BaseType_t;
+typedef void *TaskHandle_t;
+typedef int portMUX_TYPE;
+#define portMUX_INITIALIZER_UNLOCKED 0
+#define pdPASS                       1
+#define pdTRUE                       1
+#define taskENTER_CRITICAL(mux)      ((void)(mux))
+#define taskEXIT_CRITICAL(mux)       ((void)(mux))
+BaseType_t xTaskCreate(void (*fn)(void *), const char *name, uint32_t stack,
+                       void *arg, int priority, TaskHandle_t *handle);
+TickType_t xTaskGetTickCount(void);
+uint32_t ulTaskNotifyTake(BaseType_t clear, TickType_t wait);
+void xTaskNotifyGive(TaskHandle_t task);
+
 esp_err_t settings_get_volume(float *volume);
 #define CONFIG_PCM51XX_MAX_VOLUME 0
+#define CONFIG_DAC_PLAIN_DELAY_UNKNOWN 1
 #define CONFIG_PCM51XX_I2C_ADDR   0x4D
 #define CONFIG_DAC_ENABLE_GPIO    13
 #define CONFIG_DAC_I2C_SDA        21

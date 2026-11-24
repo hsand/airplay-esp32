@@ -24,6 +24,11 @@ such as a WM8805 I2S-to-S/PDIF bridge.
 
 Pins can be changed under **Board Configuration → Pin Configuration** in `menuconfig`.
 
+The build assumes the PCM5102A's normal filter (FLT low, as in the
+[shopping-list photo](../getting-started/shopping-list.md#check-the-dac-board)) when it
+works out its [output latency](../features/output-latency.md). Strap FLT high, or use a
+different DAC, and change the preset to match.
+
 !!! warning "Bridge VIN/VOUT"
 
     Most ESP32-S3 boards ship with the VIN/VOUT solder pads open. Bridge them, or the

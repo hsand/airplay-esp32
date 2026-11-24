@@ -261,7 +261,16 @@ static void es8388_set_volume(float volume_airplay_db) {
   // of it. Without this, AirPlay mute doesn't actually silence the output —
   // and DAC_CONTROLS_VOLUME disables the software-attenuation fallback that
   // would otherwise cover for it.
+#ifndef CONFIG_DAC_VOLUME_LAW_LEGACY
+  // Apple's law: 1:1 below the ceiling; -30 dB goes to the codec's -96 dB
+  // floor, so mute really is silent.
+  float level;
+  float db = dac_volume_apple_db(volume_airplay_db, &level)
+                 ? (float)CONFIG_ES8388_MAX_VOLUME + level
+                 : -96.0f;
+#else
   float db = (float)CONFIG_ES8388_MAX_VOLUME + (volume_airplay_db * 2.0f);
+#endif
   if (db < -96.0f) {
     db = -96.0f;
   }
@@ -301,6 +310,9 @@ static void es8388_enable_line_out(bool enable) {
                 "all outputs are enabled together");
 }
 
+// No output_delay_q4: the ES8388 datasheet and user guide give no DAC filter
+// group delay, so the delay is left unknown. Calibrate with the output
+// latency trim.
 const dac_ops_t dac_es8388_ops = {
     .init = es8388_init,
     .deinit = es8388_deinit,

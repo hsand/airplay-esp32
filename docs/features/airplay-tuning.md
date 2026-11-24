@@ -125,3 +125,33 @@ the presence of `_airplay._tcp` alone — a receiver publishing a fully classic 
 TXT record on port 5000 is still refused while that service is up, and starts working the
 moment it is withdrawn. iOS needs the same service to negotiate AirPlay 2, and a device
 publishes one advertisement, so the mode is a real either/or.
+
+## Volume curve
+
+The sender's volume slider runs from 0 dB at the top to −30 dB at the bottom, and sends
+−144 dB for mute. By default the receiver turns it into a gain the way Apple's receivers
+do: 1:1 in decibels (−10 dB on the slider is 10 dB quieter), with the bottom of the slider
+and −144 both silent. This holds in software and on DACs with their own volume control, so
+a speaker grouped with HomePods plays at their level for the same slider position. Changes
+under 0.3 dB, 1 % of the slider, are ignored, as Apple ignores them. The stored level is
+kept within −30…0 dB, so a muted session does not start the next one silent.
+
+The curves of earlier firmware are still available as
+**DAC Configuration → Volume curve → Earlier firmware's** in `menuconfig`
+(`CONFIG_DAC_VOLUME_LAW_LEGACY`): the square of the slider position in software, and 2 dB
+of DAC attenuation per slider dB on DACs with volume control. They are louder than Apple's
+in the upper half of the slider and much quieter near the bottom.
+
+## Starts and stops
+
+Every start fades in over 30 ms from the first sample: a new stream, a resume, after a seek
+or a skip, and after a dropout. Apple's receiver does the same.
+
+Every stop fades out over 8 ms: a pause, a seek, a skip and the end of a session. Apple's
+receiver cuts off hard here. This one does not, because many boards have no mute line —
+a PCM5102A board with XSMT bridged high among them — and a hard cut to silence clicks. A
+board's amplifier enable or mute line is only switched off 80 ms after the stop, once the
+fade has left the DMA queue, and is switched on again before the first sample of the next
+start.
+
+See also [Output latency](output-latency.md).
