@@ -367,10 +367,19 @@ static void es8311_set_volume(float volume_airplay_db) {
     volume_airplay_db = -30.0f;
   }
 
+#ifndef CONFIG_DAC_VOLUME_LAW_LEGACY
+  // Apple's law: 1:1 below the configured codec ceiling, and the register
+  // floor (-95.5 dB) for mute at -30 dB.
+  float level;
+  float db = dac_volume_apple_db(volume_airplay_db, &level)
+                 ? (float)CONFIG_ES8311_MAX_VOLUME + level
+                 : -95.5f;
+#else
   // Map AirPlay -30..0 dB below the configured codec ceiling. For example,
   // max=-60 maps AirPlay 0 dB to -60 dB and AirPlay -30 dB to -120 dB
   // before clamping to the ES8311 register range.
   float db = (float)CONFIG_ES8311_MAX_VOLUME + (volume_airplay_db * 2.0f);
+#endif
   if (db < -95.5f) {
     db = -95.5f;
   }
@@ -410,6 +419,9 @@ static void es8311_enable_line_out(bool enable) {
   ESP_LOGW(TAG, "Line out not supported");
 }
 
+// No output_delay_q4: Everest's ES8311 datasheet gives no DAC filter group
+// delay, so the delay is left unknown (and the plain-DAC preset, normally
+// "Unknown", stands in). Calibrate with the output latency trim.
 const dac_ops_t dac_es8311_ops = {
     .init = es8311_init,
     .deinit = es8311_deinit,

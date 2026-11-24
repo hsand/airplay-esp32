@@ -1822,13 +1822,22 @@ static float tas58xx_map_volume_db(float volume_airplay_db) {
     volume_airplay_db = -30.0f;
   }
 
+  float max_db = s_max_volume_db + s_makeup_db;
+  float db_level;
+
+#ifndef CONFIG_DAC_VOLUME_LAW_LEGACY
+  // Apple's law: 1:1 below the digital gain, mute at -30 dB.
+  float level;
+  if (!dac_volume_apple_db(volume_airplay_db, &level)) {
+    db_level = -103.0f;
+  } else {
+    db_level = max_db + level;
+  }
+#else
   // Volume mapping (2:1 scaling):
   //   AirPlay 0 dB    -> DAC s_max_volume_db (the digital gain)
   //   AirPlay -25 dB  -> DAC (MAX - 50)
   //   AirPlay -30..-25 dB -> steep roll-off to mute
-  float max_db = s_max_volume_db + s_makeup_db;
-  float db_level;
-
   if (volume_airplay_db >= -25.0f) {
     // 2:1 linear scaling: 25 dB AirPlay range -> 50 dB DAC range
     db_level = max_db + (volume_airplay_db * 2.0f);
@@ -1838,6 +1847,7 @@ static float tas58xx_map_volume_db(float volume_airplay_db) {
     float rolloff_top = max_db - 50.0f;
     db_level = -103.0f + normalized * (103.0f + rolloff_top);
   }
+#endif
 
   // Clamp to TAS5825M valid range: +24 dB to -103 dB
   if (db_level > 24.0f) {
@@ -2163,6 +2173,10 @@ bool dac_tas58xx_set_soft_routing(int dev, bool on) {
 static void tas58xx_on_i2s_stopping(void);
 static void tas58xx_on_i2s_started(uint32_t sample_rate_hz);
 
+// No output_delay_q4: neither part's datasheet gives a latency (TAS5825M
+// SLASEH7H §7.5, TAS5805M SLASEH5D §6.5), nor do the process-flow notes
+// (SLAA786A; SLOA263A, whose Flow 1 resamples to 96/88.2 kHz ahead of the EQ
+// but states no delay for it). Left unknown; calibrate with the trim.
 const dac_ops_t dac_tas58xx_ops = {
     .init = tas58xx_init,
     .deinit = tas58xx_deinit,

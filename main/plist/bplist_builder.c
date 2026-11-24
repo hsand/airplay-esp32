@@ -320,124 +320,65 @@ size_t bplist_build_initial_setup(uint8_t *out, size_t capacity,
 size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
                                  int64_t stream_type, uint16_t data_port,
                                  uint16_t control_port,
-                                 uint32_t audio_buffer_size) {
-  if (capacity < 200) {
+                                 uint32_t audio_buffer_size,
+                                 int64_t arrival_to_render_ms) {
+  if (!out || capacity < sizeof(BPLIST_MAGIC)) {
     return 0;
   }
-
-  size_t pos = 0;
-  memcpy(out + pos, BPLIST_MAGIC, sizeof(BPLIST_MAGIC));
-  pos += 8;
-
-  size_t offsets[16];
+  /* Objects, in order:
+   *  0 "streams"  1 "type"  2 "dataPort"  3 "controlPort"
+   *  4 "audioBufferSize" (buffered) or "arrivalToRenderLatencyMs" (realtime,
+   *    when given)
+   *  5 type  6 data port  7 control port  8 the value for 4
+   *  9 {1: 5, 2: 6, 3: 7[, 4: 8]}  10 [9]  11 {0: 10}  (top) */
+  enum { OBJECTS = 12 };
+  const bool buffered =
+      audio_stream_uses_buffer((audio_stream_type_t)stream_type);
+  const bool extra = buffered || arrival_to_render_ms >= 0;
+  size_t offsets[OBJECTS];
   size_t obj = 0;
+  size_t pos = 0;
+  memcpy(out, BPLIST_MAGIC, sizeof(BPLIST_MAGIC));
+  pos += sizeof(BPLIST_MAGIC);
 
-  offsets[obj++] = pos;
-  out[pos++] = 0x57;
-  memcpy(out + pos, "streams", 7);
-  pos += 7;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x54;
-  memcpy(out + pos, "type", 4);
-  pos += 4;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x58;
-  memcpy(out + pos, "dataPort", 8);
-  pos += 8;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x5B;
-  memcpy(out + pos, "controlPort", 11);
-  pos += 11;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x5F;
-  out[pos++] = 0x10;
-  out[pos++] = 15;
-  memcpy(out + pos, "audioBufferSize", 15);
-  pos += 15;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x10;
-  out[pos++] = (uint8_t)stream_type;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x11;
-  out[pos++] = (data_port >> 8) & 0xFF;
-  out[pos++] = data_port & 0xFF;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x11;
-  out[pos++] = (control_port >> 8) & 0xFF;
-  out[pos++] = control_port & 0xFF;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x12;
-  out[pos++] = (audio_buffer_size >> 24) & 0xFF;
-  out[pos++] = (audio_buffer_size >> 16) & 0xFF;
-  out[pos++] = (audio_buffer_size >> 8) & 0xFF;
-  out[pos++] = audio_buffer_size & 0xFF;
-
-  offsets[obj++] = pos;
-  if (audio_stream_uses_buffer((audio_stream_type_t)stream_type)) {
-    out[pos++] = 0xD4;
-    out[pos++] = 1;
-    out[pos++] = 2;
-    out[pos++] = 4;
-    out[pos++] = 3;
-    out[pos++] = 5;
-    out[pos++] = 6;
-    out[pos++] = 8;
-    out[pos++] = 7;
-  } else {
-    out[pos++] = 0xD3;
-    out[pos++] = 1;
-    out[pos++] = 2;
-    out[pos++] = 3;
-    out[pos++] = 5;
-    out[pos++] = 6;
-    out[pos++] = 7;
-  }
-
-  offsets[obj++] = pos;
-  out[pos++] = 0xA1;
-  out[pos++] = 9;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0xD1;
-  out[pos++] = 0;
-  out[pos++] = 10;
-
-  size_t offset_table_offset = pos;
-  for (size_t i = 0; i < obj; i++) {
-    if (offsets[i] > 0xFF) {
+  const char *const keys[] = {"streams", "type", "dataPort", "controlPort",
+                              buffered ? "audioBufferSize"
+                                       : "arrivalToRenderLatencyMs"};
+  for (size_t i = 0; i < 5; i++) {
+    offsets[obj++] = pos;
+    if (!bplist_write_ascii_string(out, capacity, &pos, keys[i])) {
       return 0;
     }
-    out[pos++] = (uint8_t)offsets[i];
   }
-
-  memset(out + pos, 0, 6);
-  pos += 6;
-  out[pos++] = 1;
-  out[pos++] = 1;
-
-  for (int i = 0; i < 7; i++) {
-    out[pos++] = 0;
+  const uint64_t values[] = {
+      (uint64_t)stream_type, data_port, control_port,
+      buffered ? audio_buffer_size
+               : (uint64_t)(extra ? arrival_to_render_ms : 0)};
+  for (size_t i = 0; i < 4; i++) {
+    offsets[obj++] = pos;
+    if (!bplist_write_int(out, capacity, &pos, values[i])) {
+      return 0;
+    }
   }
-  out[pos++] = (uint8_t)obj;
-
-  for (int i = 0; i < 7; i++) {
-    out[pos++] = 0;
+  static const uint8_t stream_keys[] = {1, 2, 3, 4};
+  static const uint8_t stream_values[] = {5, 6, 7, 8};
+  offsets[obj++] = pos;
+  if (!bplist_write_dict(out, capacity, &pos, stream_keys, stream_values,
+                         extra ? 4U : 3U)) {
+    return 0;
   }
-  out[pos++] = 11;
-
-  for (int i = 0; i < 7; i++) {
-    out[pos++] = 0;
+  static const uint8_t stream_list[] = {9};
+  offsets[obj++] = pos;
+  if (!bplist_write_array(out, capacity, &pos, stream_list, 1)) {
+    return 0;
   }
-  out[pos++] = (uint8_t)offset_table_offset;
-
+  static const uint8_t top_keys[] = {0};
+  static const uint8_t top_values[] = {10};
+  offsets[obj++] = pos;
+  if (!bplist_write_dict(out, capacity, &pos, top_keys, top_values, 1) ||
+      !bplist_finish(out, capacity, &pos, offsets, obj, obj - 1U)) {
+    return 0;
+  }
   return pos;
 }
 

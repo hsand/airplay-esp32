@@ -86,8 +86,9 @@ static void apply_volume(int16_t *buf, size_t n) {
   // audible on every step of the sender's volume slider.  Approach the
   // target exponentially, stepping once per stereo frame (even indices) so
   // both channels always carry the same gain; the /256 divisor gives a
-  // ~3 ms time constant and a worst-case per-frame gain step of ~0.4%,
-  // with a minimum step of 1 so the ramp always completes.
+  // 256-frame time constant (5.8 ms at 44.1 kHz) and a worst-case per-frame
+  // gain step of ~0.4%, with a minimum step of 1 so the ramp always
+  // completes.
   static int32_t cur_q15 = -1;
   int32_t target = airplay_get_volume_q15();
   if (cur_q15 < 0) {

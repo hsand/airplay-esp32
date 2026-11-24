@@ -1605,20 +1605,35 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   }
 
   if (is_bplist) {
+    // Realtime only: how long after arrival a packet is rendered, which the
+    // sender uses to decide how early realtime packets must arrive.  Apple
+    // answers round((platform latency + I/O buffer) in ms) + 4, the 4 being
+    // its default rasUserSpaceDelayMs; here, the modelled DMA ring plus the
+    // device latency past it.
+    int64_t arrival_to_render_ms = -1;
+    if (stream_type == 96) {
+      arrival_to_render_ms =
+          (int64_t)((audio_output_get_platform_latency_us() + 500U) / 1000U) +
+          4;
+    }
     uint8_t plist_body[256];
     size_t plist_len = bplist_build_stream_setup(
         plist_body, sizeof(plist_body), stream_type, response_data_port,
         conn->control_port,
         stream_type == 103 ? AP2_AUDIO_BUFFER_SIZE
-                           : AP2_REALTIME_AUDIO_BUFFER_SIZE);
+                           : AP2_REALTIME_AUDIO_BUFFER_SIZE,
+        arrival_to_render_ms);
     if (plist_len == 0) {
       audio_receiver_stop();
       rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
                          NULL, 0);
       return;
     }
-    ESP_LOGI(TAG, "SETUP response: type=%lld dataPort=%u controlPort=%u",
-             (long long)stream_type, response_data_port, conn->control_port);
+    ESP_LOGI(TAG,
+             "SETUP response: type=%lld dataPort=%u controlPort=%u "
+             "arrivalToRenderLatencyMs=%lld",
+             (long long)stream_type, response_data_port, conn->control_port,
+             (long long)arrival_to_render_ms);
     rtsp_send_response(socket, conn, 200, "OK", req->cseq,
                        "Content-Type: application/x-apple-binary-plist\r\n",
                        (const char *)plist_body, plist_len);
@@ -1700,16 +1715,19 @@ static void handle_record(int socket, rtsp_conn_t *conn,
   conn->stream_paused = false;
   playback_events_emit(PLAYBACK_SOURCE_AIRPLAY, PLAYBACK_EVENT_PLAYING, NULL);
 
-  // Apple reports its platform latency here (device latency plus output
-  // latency, in samples), and compensates for it internally as well -- as
-  // this receiver does, by scheduling every block that much early.  [I]
-  // Whether senders act on the value is not known.  AirPlay 1 keeps the 0 it
-  // has always reported: nothing says how a RAOP sender would read it.
+  // Apple reports the main audio session's platform latency here, in
+  // samples, and compensates for it internally as well -- as this receiver
+  // does, by scheduling every block that much early.  An Apple TV's buffered
+  // session (the hose) answers 0; only realtime sessions report a figure,
+  // and it leaves the I/O buffer out: the device latency past the DMA ring.
+  // [I] Whether senders act on it is not known; the tvOS sender has no code
+  // that reads it.  AirPlay 1 keeps the 0 it has always reported: nothing
+  // says how a RAOP sender would read it.
   char headers[128];
   const int sample_rate = conn->sample_rate > 0 ? conn->sample_rate : 44100;
   const uint32_t latency_samples =
-      conn->protocol_version == 2
-          ? (uint32_t)(((uint64_t)audio_output_get_platform_latency_us() *
+      conn->protocol_version == 2 && conn->stream_type == 96
+          ? (uint32_t)(((uint64_t)audio_output_get_device_latency_us() *
                         (uint64_t)sample_rate) /
                        1000000ULL)
           : 0U;

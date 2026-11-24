@@ -12,12 +12,32 @@
 #include <stdio.h>
 #include <string.h>
 
-static int bus_token, device_token, mutex_token;
+static int bus_token, device_token;
+// dac_register() creates dac.c's power-mode lock first; the driver's own
+// mutex, which every register access must hold, is the second.
+static int mutex_tokens[2], mutex_count;
+static bool pm_locked;
+#define mutex_token (mutex_tokens[1])
 static bool device_live, bus_live, spi_live, locked, enabled;
 static bool fail_probe, fail_add, fail_remove, fail_bus, fail_listener;
 static bool fail_gpio, fail_mutex, fail_all_writes;
 static int write_count, fail_write;
 static uint8_t regs[256];
+static uint8_t reset_psel = 1;
+
+// The volume codes for -24, -25, -27.5 and -20 dB by each law: Apple's is
+// 1:1 in dB (0.5 dB a code below 0x30), the earlier one 2:1 with a roll-off.
+#ifdef CONFIG_DAC_VOLUME_LAW_LEGACY
+#define CODE_M24  0x90
+#define CODE_M25  0x94
+#define CODE_M275 0xC9
+#define CODE_M20  0x80
+#else
+#define CODE_M24  0x60
+#define CODE_M25  0x62
+#define CODE_M275 0x67
+#define CODE_M20  0x58
+#endif
 static void (*before_lock)(void);
 static playback_event_callback_t listener;
 
@@ -32,10 +52,19 @@ void mock_log(const char *tag, const char *format, ...) {
 }
 
 SemaphoreHandle_t xSemaphoreCreateMutex(void) {
-  return fail_mutex ? NULL : &mutex_token;
+  if (fail_mutex) {
+    return NULL;
+  }
+  assert(mutex_count < 2);
+  return &mutex_tokens[mutex_count++];
 }
 
 int xSemaphoreTake(SemaphoreHandle_t mutex, uint32_t timeout) {
+  if (mutex == &mutex_tokens[0]) {
+    assert(!pm_locked && !locked && timeout == portMAX_DELAY);
+    pm_locked = true;
+    return 1;
+  }
   assert(mutex == &mutex_token && timeout == portMAX_DELAY);
   if (before_lock) {
     void (*callback)(void) = before_lock;
@@ -48,6 +77,11 @@ int xSemaphoreTake(SemaphoreHandle_t mutex, uint32_t timeout) {
 }
 
 int xSemaphoreGive(SemaphoreHandle_t mutex) {
+  if (mutex == &mutex_tokens[0]) {
+    assert(pm_locked);
+    pm_locked = false;
+    return 1;
+  }
   assert(mutex == &mutex_token && locked);
   locked = false;
   return 1;
@@ -55,6 +89,31 @@ int xSemaphoreGive(SemaphoreHandle_t mutex) {
 
 void vTaskDelay(uint32_t ticks) {
   (void)ticks;
+}
+
+BaseType_t xTaskCreate(void (*fn)(void *), const char *name, uint32_t stack,
+                       void *arg, int priority, TaskHandle_t *handle) {
+  (void)fn;
+  (void)name;
+  (void)stack;
+  (void)arg;
+  (void)priority;
+  (void)handle;
+  return 0;
+}
+
+TickType_t xTaskGetTickCount(void) {
+  return 0;
+}
+
+uint32_t ulTaskNotifyTake(BaseType_t clear, TickType_t wait) {
+  (void)clear;
+  (void)wait;
+  return 0;
+}
+
+void xTaskNotifyGive(TaskHandle_t task) {
+  (void)task;
 }
 
 esp_err_t gpio_config(const gpio_config_t *config) {
@@ -107,6 +166,7 @@ esp_err_t board_i2c_write(i2c_master_dev_handle_t dev, uint8_t reg,
   if (reg == 1) {
     memset(regs, 0, sizeof(regs));
     regs[0x3D] = regs[0x3E] = 0x30; // Hardware reset volume: 0 dB.
+    regs[0x2B] = reset_psel;        // P0-R43, filter program 1 at reset.
   } else {
     regs[reg] = *data;
   }
@@ -235,13 +295,13 @@ static void test_init_failures(void) {
 static void test_volume_and_playback(void) {
   dac_set_volume(-24.0f);
   init();
-  assert(regs[0x3D] == 0x90 && regs[0x3E] == 0x90);
+  assert(regs[0x3D] == CODE_M24 && regs[0x3E] == CODE_M24);
   const struct {
     float volume;
     uint8_t code;
   } cases[] = {
-      {0, 0x30},      {12, 0x30},       {-25, 0x94},
-      {-27.5f, 0xC9}, {-30, 0xFF},      {-144, 0xFF},
+      {0, 0x30},          {12, 0x30},       {-25, CODE_M25},
+      {-27.5f, CODE_M275}, {-30, 0xFF},      {-144, 0xFF},
       {NAN, 0xFF},    {INFINITY, 0xFF}, {-INFINITY, 0xFF},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -266,7 +326,7 @@ static void test_volume_and_playback(void) {
     assert(!enabled);
     fail_write = 0;
     dac_set_power_mode(DAC_POWER_ON);
-    assert(enabled && regs[0x3D] == 0x80 && regs[0x3E] == 0x80);
+    assert(enabled && regs[0x3D] == CODE_M20 && regs[0x3E] == CODE_M20);
   }
   fail_all_writes = true;
   dac_set_volume(-144.0f);
@@ -284,6 +344,35 @@ static void test_volume_and_playback(void) {
   puts("Passed volume boundaries, playback failures, and recovery");
 }
 
+// The interpolation filter the part runs, read back from P0-R43, gives the
+// output delay; a program with no published figure leaves it unknown.
+static void test_output_delay(void) {
+  dac_delay_source_t source;
+  init();
+  assert(dac_get_output_delay_q4(44100, &source) == 20U * 16U &&
+         source == DAC_DELAY_FROM_DRIVER);
+  deinit();
+  const struct {
+    uint8_t psel;
+    uint32_t q4;
+  } cases[] = {{2, 56}, {3, 539}, {7, 19}};
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    reset_psel = cases[i].psel;
+    init();
+    assert(dac_get_output_delay_q4(48000, &source) == cases[i].q4 &&
+           source == DAC_DELAY_FROM_DRIVER);
+    deinit();
+  }
+  // RAM program: no figure, and no preset in this build either.
+  reset_psel = 0x1F;
+  init();
+  assert(dac_get_output_delay_q4(48000, &source) == 0 &&
+         source == DAC_DELAY_UNKNOWN);
+  deinit();
+  reset_psel = 1;
+  puts("Passed output delay by filter program");
+}
+
 static void test_deinit_lifetime(void) {
   init();
   fail_remove = true;
@@ -293,9 +382,10 @@ static void test_deinit_lifetime(void) {
   fail_remove = false;
   deinit();
   // Simulate deinit finishing while a callback waits to acquire the mutex.
+  // (A power mode cannot get here: dac.c serialises it against dac_deinit.)
   init();
   before_lock = deinit;
-  dac_set_power_mode(DAC_POWER_ON);
+  dac_set_volume(-12.0f);
   expect_inactive();
   init();
   before_lock = deinit;
@@ -314,7 +404,7 @@ static void test_board_failures(void) {
     *failures[i] = false;
     assert(iot_board_init() == ESP_OK);
     assert(iot_board_is_init() && listener);
-    assert(regs[0x3D] == 0x90 && regs[0x3E] == 0x90);
+    assert(regs[0x3D] == CODE_M24 && regs[0x3E] == CODE_M24);
     assert(iot_board_init() == ESP_OK);
     listener(PLAYBACK_SOURCE_AIRPLAY, PLAYBACK_EVENT_PLAYING, NULL, NULL);
     assert(enabled);
@@ -341,6 +431,7 @@ int main(void) {
   dac_register(&dac_pcm51xx_ops);
   test_init_failures();
   test_volume_and_playback();
+  test_output_delay();
   test_deinit_lifetime();
   test_board_failures();
   return 0;

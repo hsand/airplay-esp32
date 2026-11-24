@@ -78,7 +78,19 @@ typedef struct {
   /* Buffered anchors, for the status line. */
   uint32_t anchors_installed;
   uint32_t anchors_consistent;
+
+  /* The stop's fade-out (audio_scheduler_take_tail()), taken under
+   * control_mutex as playout stops and handed out by the next renders ahead
+   * of anything else, so the stream fades where it was cut.  In PSRAM, for
+   * AUDIO_V2_TAIL_MAX_FRAMES frames. */
+  int16_t *tail;
+  uint32_t tail_frames;
+  uint32_t tail_pos;
+  uint32_t tails;
 } audio_engine_v2_t;
+
+/* The longest fade-out: AUDIO_SCHED_FADE_OUT_MS at 96 kHz. */
+#define AUDIO_V2_TAIL_MAX_FRAMES (96U * AUDIO_SCHED_FADE_OUT_MS)
 
 /* A SETRATEANCHORTIME rate=1 anchor, already in nanoseconds. */
 typedef struct {

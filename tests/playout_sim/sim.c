@@ -9,6 +9,12 @@
  *   window -> reader -> decode queue -> "decode" -> timeline -> scheduler ->
  *   a DMA ring drained by a DAC on the local crystal -> the ear.
  *
+ * Past the ring the sound still has the I2S FIFO, the DAC's filter and
+ * anything downstream to get through.  Unless a scenario models that path
+ * (.phys), it takes exactly as long as each receiver assumes -- 5 ms for
+ * v0.3.0, the latency breakdown (audio_latency.c) for this tree -- so the
+ * other scenarios measure everything but the latency model.
+ *
  * Every PCM frame carries its own RTP position and track in its two channels
  * (two offset ramps), so what reaches the DAC can be decoded back and its
  * true emission time compared with when the sender meant it to play.  The
@@ -32,13 +38,19 @@
 #include "audio_playout_clock.h"
 #include "ntp_clock.h"
 #include "ptp_clock.h"
+
+#include "audio_latency.h"
 #endif
 
 #define FS           44100
 #define FRAME        1024U
 #define BLOCK        353U
 #define RING_FRAMES  2048U
-#define EXTRA_US     5000
+#define EXTRA_US     5000 /* v0.3.0's fixed post-ring latency */
+/* The DAC this tree's receiver is told about: the PCM5102A preset (22
+ * samples, Q4) behind a 32-frame I2S FIFO. */
+#define RX_DAC_Q4      (22U * 16U)
+#define RX_FIFO_FRAMES 32U
 #define CHANNELS     2
 #define BLOCKS       192
 #define RTP_ORIGIN   1000000U
@@ -94,6 +106,13 @@ typedef struct {
   double lose_at_s;
   double reanchor_every_s, reanchor_shift_ms;
   double clock_noise_us;
+  /* The real path after the ring, when the scenario models it: the FIFO,
+   * the DAC's group delay and whatever is downstream (an AV receiver). */
+  bool phys;
+  double phys_fifo_frames, phys_dac_samples, phys_downstream_us;
+  /* This tree's output latency trim: from the start, then changed at
+   * trim_at_s to trim_to_us. */
+  double trim_us, trim_at_s, trim_to_us;
 } scenario_t;
 
 static const scenario_t scenarios[] = {
@@ -136,6 +155,46 @@ static const scenario_t scenarios[] = {
      .duration_s = 40,
      .reanchor_every_s = 15,
      .reanchor_shift_ms = 30},
+    /* A PCM5102A board as it really is: 32 frames of FIFO and 22 samples of
+     * filter after the ring. */
+    {.name = "dac_pcm5102a",
+     .duration_s = 40,
+     .phys = true,
+     .phys_fifo_frames = 32,
+     .phys_dac_samples = 22},
+    /* The same into an AV receiver adding 20 ms, calibrated with the trim. */
+    {.name = "avr20_trimmed",
+     .duration_s = 40,
+     .phys = true,
+     .phys_fifo_frames = 32,
+     .phys_dac_samples = 22,
+     .phys_downstream_us = 20000,
+     .trim_us = 20000},
+    /* The trim changed mid-stream to what a calibration found. */
+    {.name = "trim_to+2ms",
+     .duration_s = 40,
+     .phys = true,
+     .phys_fifo_frames = 32,
+     .phys_dac_samples = 22,
+     .phys_downstream_us = 2000,
+     .trim_at_s = 20,
+     .trim_to_us = 2000},
+    {.name = "trim_to-3ms",
+     .duration_s = 40,
+     .phys = true,
+     .phys_fifo_frames = 32,
+     .phys_dac_samples = 22,
+     .phys_downstream_us = -3000,
+     .trim_at_s = 20,
+     .trim_to_us = -3000},
+    {.name = "trim_to+20ms",
+     .duration_s = 40,
+     .phys = true,
+     .phys_fifo_frames = 32,
+     .phys_dac_samples = 22,
+     .phys_downstream_us = 20000,
+     .trim_at_s = 20,
+     .trim_to_us = 20000},
 };
 
 static scenario_t sc;
@@ -509,6 +568,25 @@ static size_t rx_render(int64_t output_local_ns, int16_t *out) {
 static void rx_init(void) {
   audio_playout_clock_reset(&playout_clock, AUDIO_PLAYOUT_CLOCK_PTP);
   audio_flush_queue_reset(&flush_queue);
+  (void)audio_latency_set_trim_us((int32_t)sc.trim_us);
+}
+
+/* What dac.c reports for the board the receiver runs on. */
+uint32_t dac_get_output_delay_q4(uint32_t sample_rate_hz,
+                                 dac_delay_source_t *source) {
+  (void)sample_rate_hz;
+  if (source) {
+    *source = DAC_DELAY_FROM_PRESET;
+  }
+  return RX_DAC_Q4;
+}
+
+/* The latency the receiver adds past the ring, as audio_output_common.c
+ * does: the breakdown with the trim in it. */
+static int64_t rx_post_ring_ns(void) {
+  audio_latency_t latency;
+  audio_latency_compute(FS, RX_FIFO_FRAMES, 0, 0, &latency);
+  return (int64_t)latency.post_ring_us * 1000LL;
 }
 #else
 /* The v0.3.0 receiver glue around the engine (audio_receiver.c). */
@@ -618,6 +696,10 @@ static size_t rx_render(int64_t output_local_ns, int16_t *out) {
 static void rx_init(void) {
   memset(&old, 0, sizeof(old));
 }
+
+static int64_t rx_post_ring_ns(void) {
+  return EXTRA_US * 1000LL;
+}
 #endif
 
 /* ---------- output ---------- */
@@ -642,6 +724,7 @@ static struct {
   uint64_t new_track;
   uint32_t last_rtp;
   bool last_valid;
+  double last_off_true_ns; /* after a trim change: last error over 300 us */
 } m;
 
 static bool silence_planned(double true_ns) {
@@ -705,10 +788,34 @@ static void measure(const int16_t *frame, double emit_true_ns) {
   if (fabs(err) > 100e6) {
     m.far++;
   }
+  if (sc.trim_at_s > 0 && emit_true_ns >= sc.trim_at_s * 1e9 &&
+      fabs(err) > 300e3) {
+    m.last_off_true_ns = emit_true_ns;
+  }
   /* Settled playout only: from 3 s after the first sound. */
   if (emit_true_ns - m.first_sound_true_ns > 3e9 && n_errs < MAX_ERRS) {
     errs[n_errs++] = (float)err;
   }
+}
+
+/* How long after a frame leaves the ring it is heard. */
+static double post_ring_ns(void) {
+  if (!sc.phys) {
+    return (double)rx_post_ring_ns();
+  }
+  return (sc.phys_fifo_frames + sc.phys_dac_samples) * 1e9 / FS +
+         sc.phys_downstream_us * 1e3;
+}
+
+/* After a trim change: how long until playout stays within 300 us.  v0.3.0
+ * has no trim, so -1 there. */
+static double settle_s(void) {
+#ifdef BASELINE
+  return sc.trim_at_s > 0 ? -1.0 : 0.0;
+#else
+  return sc.trim_at_s > 0 ? fmax(0.0, m.last_off_true_ns / 1e9 - sc.trim_at_s)
+                          : 0.0;
+#endif
 }
 
 static int cmp_float(const void *a, const void *b) {
@@ -773,6 +880,9 @@ int main(int argc, char **argv) {
 
   const uint64_t total_frames = (uint64_t)(sc.duration_s * FS);
   bool anchored = false, paused = false, resumed = false, gm_note = false;
+#ifndef BASELINE
+  bool trim_changed = false;
+#endif
   double next_reanchor_s = sc.reanchor_every_s > 0 ? 10.0 : 1e9;
   double next_net_ms = 0;
   int16_t pcm[FRAME * CHANNELS];
@@ -782,6 +892,12 @@ int main(int argc, char **argv) {
     sim_now_us = (int64_t)(local_ns / 1000.0);
     const double true_ns = true_of_local(local_ns);
     clock_tick(true_ns);
+#ifndef BASELINE
+    if (sc.trim_at_s > 0 && !trim_changed && true_ns >= sc.trim_at_s * 1e9) {
+      trim_changed = true;
+      (void)audio_latency_set_trim_us((int32_t)sc.trim_to_us);
+    }
+#endif
 
     /* ----- the sender and the network, every millisecond ----- */
     if (true_ns >= next_net_ms * 1e6) {
@@ -869,7 +985,7 @@ int main(int argc, char **argv) {
          * first frame will be heard. */
         const int64_t output_local_ns =
             (int64_t)llround(local_ns + (double)ring_count * 1e9 / FS) +
-            EXTRA_US * 1000LL;
+            rx_post_ring_ns();
         const size_t produced =
             rx_render(output_local_ns, &pending_block[0][0]);
         pending_frames = produced > 0 ? produced : BLOCK;
@@ -894,7 +1010,7 @@ int main(int argc, char **argv) {
       ring_head = (ring_head + 1) % RING_FRAMES;
       ring_count--;
     }
-    measure(frame, true_of_local(local_ns + EXTRA_US * 1000.0));
+    measure(frame, true_of_local(local_ns + post_ring_ns()));
   }
 
   double mean = 0, p95 = 0, max = 0, bias = 0;
@@ -914,12 +1030,13 @@ int main(int argc, char **argv) {
   printf("RESULT %s mean_us=%.1f p95_us=%.1f max_us=%.1f bias_us=%.1f "
          "silent_ms=%.1f unknown=%" PRIu64 " far=%" PRIu64
          " steps=%u trims_per_s=%.2f wrong_track_ms=%.1f new_track_ms=%.1f "
-         "first_sound_s=%.3f flushes=%u\n",
+         "first_sound_s=%.3f flushes=%u settle_s=%.2f\n",
          sc.name, mean / 1e3, p95 / 1e3, max / 1e3, bias / 1e3,
          (double)m.silent_unplanned * 1e3 / FS, m.unknown, m.far,
          rx_stats.steps, heard_s > 0 ? rx_stats.trims / heard_s : 0.0,
          (double)m.wrong_track * 1e3 / FS, (double)m.new_track * 1e3 / FS,
-         m.heard ? m.first_sound_true_ns / 1e9 : -1.0, rx_stats.epoch_resets);
+         m.heard ? m.first_sound_true_ns / 1e9 : -1.0, rx_stats.epoch_resets,
+         settle_s());
   audio_engine_v2_deinit(&engine);
   return 0;
 }

@@ -6,6 +6,9 @@
 #include <inttypes.h>
 #include <string.h>
 
+#include <stdlib.h>
+
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -29,6 +32,49 @@ static const char *TAG = "audio_v2";
 
 static void control_lock(audio_engine_v2_t *engine);
 static void control_unlock(audio_engine_v2_t *engine);
+
+/* Playout is about to stop: keep the next few milliseconds of the stream,
+ * faded to silence, for the renders that follow.  Apple cuts hard here; on a
+ * DAC without a mute line that is a click at every pause, seek and skip.
+ * Taken now, while the audio at the cursor is still in the timeline, because
+ * a flush sweeps it straight after.  A tail not yet played is kept: it
+ * already ends in silence.  Caller holds control_mutex. */
+static void take_tail_locked(audio_engine_v2_t *engine) {
+  if (!engine->tail || engine->format.sample_rate <= 0 ||
+      engine->tail_pos < engine->tail_frames) {
+    return;
+  }
+  uint32_t frames =
+      audio_scheduler_fade_out_frames((uint32_t)engine->format.sample_rate);
+  if (frames > AUDIO_V2_TAIL_MAX_FRAMES) {
+    frames = AUDIO_V2_TAIL_MAX_FRAMES;
+  }
+  const size_t taken = audio_scheduler_take_tail(
+      &engine->scheduler, &engine->timeline, engine->tail, frames,
+      (uint8_t)engine->format.channels);
+  if (taken > 0U) {
+    engine->tail_frames = (uint32_t)taken;
+    engine->tail_pos = 0;
+    engine->tails++;
+  }
+}
+
+/* The fade-out, ahead of anything else; the rest of the block is silent.
+ * Caller holds control_mutex.  Returns false when there is none. */
+static bool emit_tail_locked(audio_engine_v2_t *engine, int16_t *out,
+                             size_t samples) {
+  if (engine->tail_pos >= engine->tail_frames) {
+    return false;
+  }
+  const size_t channels = (size_t)engine->format.channels;
+  const uint32_t left = engine->tail_frames - engine->tail_pos;
+  const size_t n = samples < left ? samples : left;
+  memcpy(out, &engine->tail[(size_t)engine->tail_pos * channels],
+         n * channels * sizeof(int16_t));
+  memset(&out[n * channels], 0, (samples - n) * channels * sizeof(int16_t));
+  engine->tail_pos += (uint32_t)n;
+  return true;
+}
 
 /* Startup watchdog: first report, then the interval between repeats. */
 #define START_STALL_AFTER_US  3000000LL
@@ -56,6 +102,14 @@ esp_err_t audio_engine_v2_init(audio_engine_v2_t *engine,
     audio_timeline_deinit(&engine->timeline);
     return ESP_ERR_NO_MEM;
   }
+  /* Without it a stop cuts hard, as it always used to. */
+  const size_t tail_bytes = (size_t)AUDIO_V2_TAIL_MAX_FRAMES *
+                            AUDIO_V2_MAX_CHANNELS * sizeof(int16_t);
+  engine->tail =
+      heap_caps_malloc(tail_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!engine->tail) {
+    engine->tail = malloc(tail_bytes);
+  }
 
   engine->format = *format;
   uint32_t preroll_samples =
@@ -81,6 +135,7 @@ void audio_engine_v2_deinit(audio_engine_v2_t *engine) {
   if (engine->control_mutex) {
     vSemaphoreDelete(engine->control_mutex);
   }
+  free(engine->tail);
   memset(engine, 0, sizeof(*engine));
 }
 
@@ -89,6 +144,10 @@ uint32_t audio_engine_v2_begin_epoch(audio_engine_v2_t *engine,
   if (!engine || !engine->initialized) {
     return 0;
   }
+  /* Before the slots go: a flush or teardown fades out of what was playing. */
+  control_lock(engine);
+  take_tail_locked(engine);
+  control_unlock(engine);
   portENTER_CRITICAL(&engine->publish_lock);
   uint32_t next = audio_epoch_advance(&engine->epoch);
   audio_timeline_clear_slots(&engine->timeline);
@@ -343,6 +402,7 @@ void audio_engine_v2_stop(audio_engine_v2_t *engine) {
     return;
   }
   control_lock(engine);
+  take_tail_locked(engine);
   engine->playing = false;
   engine->start_watchdog_armed = false;
   audio_clock_map_reset(&engine->clock_map);
@@ -392,6 +452,7 @@ void audio_engine_v2_wait_for_anchor(audio_engine_v2_t *engine,
   }
 
   control_lock(engine);
+  take_tail_locked(engine);
   audio_clock_map_reset(&engine->clock_map);
   engine->scheduler.state =
       engine->playing ? AUDIO_SCHED_WAIT_ANCHOR : AUDIO_SCHED_PAUSED;
@@ -428,6 +489,7 @@ void audio_engine_v2_set_playing(audio_engine_v2_t *engine, bool playing) {
 
   if (!playing) {
     engine->start_watchdog_armed = false;
+    take_tail_locked(engine);
     if (engine->scheduler.state != AUDIO_SCHED_PAUSED) {
       audio_scheduler_set_paused(&engine->scheduler, true);
     }
@@ -672,6 +734,9 @@ static size_t render_locked(audio_engine_v2_t *engine,
                             int64_t output_network_ns, bool have_clock,
                             int16_t *out, size_t samples) {
   __atomic_add_fetch(&engine->render_calls, 1, __ATOMIC_RELAXED);
+  if (emit_tail_locked(engine, out, samples)) {
+    return samples;
+  }
   if (engine->playing && !have_clock && engine->clock_map.valid) {
     /* Hold position: silence now, and the cursor stays where it is for when
      * the clock comes. */

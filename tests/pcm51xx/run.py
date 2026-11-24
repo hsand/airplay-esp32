@@ -45,8 +45,13 @@ with tempfile.TemporaryDirectory(prefix="pcm51xx-tests-") as temporary:
         str(ROOT / "components/boards/hifi-esp32-plus/board.c"),
         "-lm", "-o", str(build / "test"),
     ]
-    for ethernet in (False, True):
-        print(f"PCM512x host tests (Ethernet={ethernet})", flush=True)
-        flags = ["-DCONFIG_ETH_W5500_ENABLED=1"] if ethernet else []
-        subprocess.run(command + flags, check=True)
-        subprocess.run([str(build / "test")], check=True)
+    for legacy in (False, True):
+        for ethernet in (False, True):
+            law = "legacy" if legacy else "Apple"
+            print(f"PCM512x host tests (Ethernet={ethernet}, {law} volume law)",
+                  flush=True)
+            flags = ["-DCONFIG_ETH_W5500_ENABLED=1"] if ethernet else []
+            if legacy:
+                flags.append("-DCONFIG_DAC_VOLUME_LAW_LEGACY=1")
+            subprocess.run(command + flags, check=True)
+            subprocess.run([str(build / "test")], check=True)

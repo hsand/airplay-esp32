@@ -286,19 +286,24 @@ size_t bplist_build_initial_setup(uint8_t *out, size_t capacity,
 
 /**
  * Build stream SETUP response bplist (with streams array)
- * Returns streams[] array with type, dataPort, controlPort, audioBufferSize.
+ * Returns streams[] array with type, dataPort, controlPort, and
+ * audioBufferSize for a buffered stream or arrivalToRenderLatencyMs for a
+ * realtime one, as Apple's receiver answers.
  * @param out Output buffer
  * @param capacity Buffer capacity
  * @param stream_type Stream type (96=realtime UDP, 103=buffered TCP)
  * @param data_port Data port to include
  * @param control_port Control port to include
- * @param audio_buffer_size Audio buffer size to advertise
+ * @param audio_buffer_size Audio buffer size to advertise (buffered only)
+ * @param arrival_to_render_ms Realtime only: arrivalToRenderLatencyMs, or
+ *        negative to leave the key out
  * @return Length of generated bplist, or 0 on error
  */
 size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
                                  int64_t stream_type, uint16_t data_port,
                                  uint16_t control_port,
-                                 uint32_t audio_buffer_size);
+                                 uint32_t audio_buffer_size,
+                                 int64_t arrival_to_render_ms);
 
 /**
  * Build feedback response bplist

@@ -1886,12 +1886,21 @@ static float tas57xx_map_volume_db(float volume_airplay_db) {
     volume_airplay_db = -30.0f;
   }
 
+  float max_db = (float)CONFIG_TAS57XX_MAX_VOLUME;
+  float db_level;
+#ifndef CONFIG_DAC_VOLUME_LAW_LEGACY
+  // Apple's law: 1:1 below the ceiling, the register floor at -30 dB.
+  float level;
+  if (!dac_volume_apple_db(volume_airplay_db, &level)) {
+    return TAS57XX_VOL_MIN_DB;
+  }
+  db_level = max_db + level;
+  return db_level < TAS57XX_VOL_MIN_DB ? TAS57XX_VOL_MIN_DB : db_level;
+#else
   // Volume mapping (2:1 scaling):
   // AirPlay 0 dB    -> DAC CONFIG_TAS57XX_MAX_VOLUME
   // AirPlay -25 dB  -> DAC (MAX - 50)
   // AirPlay -30..-25 dB -> DAC mute(-103)..(MAX-50) (steep roll-off)
-  float max_db = (float)CONFIG_TAS57XX_MAX_VOLUME;
-  float db_level;
   if (volume_airplay_db >= -25.0f) {
     // 2:1 linear scaling: 25 dB AirPlay range -> 50 dB DAC range
     db_level = max_db + (volume_airplay_db * 2.0f);
@@ -1903,6 +1912,7 @@ static float tas57xx_map_volume_db(float volume_airplay_db) {
         TAS57XX_VOL_MIN_DB + normalized * (rolloff_top - TAS57XX_VOL_MIN_DB);
   }
   return db_level;
+#endif
 }
 
 // Convert a DAC dB level to a P0-R61/R62 register value.
@@ -2068,6 +2078,10 @@ int dac_tas57xx_get_device_count(void) {
   return s_dev_count;
 }
 
+// No output_delay_q4: TI publishes no latency for the TAS5756M/54M HybridFlow
+// programs this driver runs (SLAS988B §7.5 has no delay entry; the flows add
+// their own processing and, in some, a delay element), so it is left
+// unknown. Calibrate with the output latency trim.
 const dac_ops_t dac_tas57xx_ops = {
     .init = tas57xx_init,
     .deinit = tas57xx_deinit,

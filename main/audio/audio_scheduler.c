@@ -352,15 +352,29 @@ static void step_read(audio_scheduler_t *scheduler, audio_timeline_t *timeline,
   }
 }
 
-/* Scale `frames` frames by a straight ramp down to silence. */
-static void step_fade_out(int16_t *out, size_t frames, uint8_t channels) {
+/* Every fade here -- a step's dip, the fade-in at a start, the fade-out at a
+ * stop -- is this straight ramp.  Frame `pos + k` of a `len`-frame ramp gets
+ * the gain (pos + k + 1) / (len + 1) going up and (len - pos - k) / (len + 1)
+ * going down: never exactly 0 or 1 inside it, so a ramp split across blocks
+ * joins without a seam, and the largest gain step is 1 / (len + 1).  Integer
+ * only, at one division per frame: the ESP32-C5 has no FPU. */
+static void apply_ramp(int16_t *out, size_t frames, uint8_t channels,
+                       uint32_t pos, uint32_t len, bool up) {
+  const uint32_t den = len + 1U;
   for (size_t k = 0; k < frames; k++) {
-    const int32_t gain = (int32_t)(frames - k);
+    const uint32_t num = up ? pos + (uint32_t)k + 1U : len - pos - (uint32_t)k;
+    /* Q15, at most 32767 inside a ramp, so the product fits 31 bits. */
+    const int32_t gain = (int32_t)(((uint64_t)num << 15) / den);
     for (uint8_t ch = 0; ch < channels; ch++) {
-      out[k * channels + ch] = (int16_t)((int32_t)out[k * channels + ch] *
-                                         gain / (int32_t)(frames + 1U));
+      const int32_t x = out[k * channels + ch];
+      out[k * channels + ch] = (int16_t)((x * gain) / 32768);
     }
   }
+}
+
+/* Scale `frames` frames by a straight ramp down to silence. */
+static void step_fade_out(int16_t *out, size_t frames, uint8_t channels) {
+  apply_ramp(out, frames, channels, 0U, (uint32_t)frames, false);
 }
 
 /* The next `frames` frames of the fade back in, which may run into the
@@ -370,14 +384,7 @@ static void step_fade_in(audio_scheduler_t *scheduler, int16_t *out,
   const uint32_t len = scheduler->drift_step_fade_in;
   const uint32_t left = len - scheduler->drift_step_faded_in;
   const size_t n = frames < left ? frames : left;
-  for (size_t k = 0; k < n; k++) {
-    const int32_t gain =
-        (int32_t)(scheduler->drift_step_faded_in + (uint32_t)k + 1U);
-    for (uint8_t ch = 0; ch < channels; ch++) {
-      out[k * channels + ch] = (int16_t)((int32_t)out[k * channels + ch] *
-                                         gain / (int32_t)(len + 1U));
-    }
-  }
+  apply_ramp(out, n, channels, scheduler->drift_step_faded_in, len, true);
   scheduler->drift_step_faded_in += (uint32_t)n;
   if (scheduler->drift_step_faded_in >= len) {
     scheduler->drift_step_fade_in = 0;
@@ -469,6 +476,8 @@ void audio_scheduler_begin_epoch(audio_scheduler_t *scheduler, uint32_t epoch,
   scheduler->anchor_resets = 0;
   scheduler->fas_valid = false;
   scheduler->fas_rtp = 0;
+  scheduler->start_fade_len = 0;
+  scheduler->start_fade_pos = 0;
   scheduler->wait_reason = AUDIO_SCHED_WAIT_CLOCK_MAP;
   scheduler->render_calls = 0;
   scheduler->silent_render_calls = 0;
@@ -531,21 +540,92 @@ void audio_scheduler_set_clock_offset(audio_scheduler_t *scheduler, bool valid,
 /* Silence everything before the first audible sample.  `first_rtp` is the
  * source position the block started from; a trim inside the block moves its
  * frames by under one sample, which is below what this needs to resolve. */
-static void fas_gate(audio_scheduler_t *scheduler, int16_t *out,
-                     uint32_t first_rtp, size_t samples, uint8_t channels) {
+static size_t fas_gate(audio_scheduler_t *scheduler, int16_t *out,
+                       uint32_t first_rtp, size_t samples, uint8_t channels) {
   if (!scheduler->fas_valid) {
-    return;
+    return 0;
   }
   const int32_t ahead = (int32_t)(scheduler->fas_rtp - first_rtp);
   if (ahead <= 0) {
     scheduler->fas_valid = false;
-    return;
+    return 0;
   }
   const size_t mute = (size_t)ahead < samples ? (size_t)ahead : samples;
   output_silence(out, mute, channels);
   if ((size_t)ahead <= samples) {
     scheduler->fas_valid = false;
   }
+  return mute;
+}
+
+uint32_t audio_scheduler_fade_out_frames(uint32_t sample_rate) {
+  return sample_rate * AUDIO_SCHED_FADE_OUT_MS / 1000U;
+}
+
+/* Arm the fade-in for a start: it runs from the first audible frame. */
+static void start_fade_arm(audio_scheduler_t *scheduler, uint32_t sample_rate) {
+  scheduler->start_fade_len = sample_rate * AUDIO_SCHED_START_FADE_MS / 1000U;
+  scheduler->start_fade_pos = 0;
+  scheduler->start_fades++;
+}
+
+/* The start's fade-in over a block whose first `muted` frames the first
+ * audible sample silenced.  Apple ramps from the anchor's media time, so a
+ * first audible sample more than 30 ms past the anchor starts hard there
+ * [I]; ramping from the first audible frame instead fades every start. */
+static void start_fade_apply(audio_scheduler_t *scheduler, int16_t *out,
+                             size_t samples, uint8_t channels, size_t muted) {
+  if (scheduler->start_fade_len == 0U || scheduler->fas_valid ||
+      muted >= samples) {
+    return;
+  }
+  const uint32_t left = scheduler->start_fade_len - scheduler->start_fade_pos;
+  const size_t avail = samples - muted;
+  const size_t n = avail < left ? avail : left;
+  apply_ramp(&out[muted * channels], n, channels, scheduler->start_fade_pos,
+             scheduler->start_fade_len, true);
+  scheduler->start_fade_pos += (uint32_t)n;
+  if (scheduler->start_fade_pos >= scheduler->start_fade_len) {
+    scheduler->start_fade_len = 0;
+    scheduler->start_fade_pos = 0;
+  }
+}
+
+/* What a render does to the frames it read: silence before the first
+ * audible sample, then the start's fade-in. */
+static void render_gain(audio_scheduler_t *scheduler, int16_t *out,
+                        uint32_t first_rtp, size_t samples, uint8_t channels) {
+  const size_t muted = fas_gate(scheduler, out, first_rtp, samples, channels);
+  start_fade_apply(scheduler, out, samples, channels, muted);
+}
+
+size_t audio_scheduler_take_tail(audio_scheduler_t *scheduler,
+                                 audio_timeline_t *timeline, int16_t *out,
+                                 size_t frames, uint8_t channels) {
+  if (!scheduler || !timeline || !out || frames == 0U ||
+      scheduler->state != AUDIO_SCHED_PLAYING ||
+      scheduler->drift_step_hold > 0U) {
+    return 0;
+  }
+  /* Still silent up to a first audible sample beyond the tail: nothing to
+   * fade. */
+  if (scheduler->fas_valid &&
+      (int32_t)(scheduler->fas_rtp - scheduler->cursor_rtp) >=
+          (int32_t)frames) {
+    return 0;
+  }
+  const uint32_t first_rtp = scheduler->cursor_rtp;
+  step_read(scheduler, timeline, out, frames, channels, NULL);
+  /* Whatever the stream was doing carries on under the fade: a step's fade
+   * back in, the start's fade-in. */
+  if (scheduler->drift_step_fade_in > 0U) {
+    step_fade_in(scheduler, out, frames, channels);
+  }
+  render_gain(scheduler, out, first_rtp, frames, channels);
+  apply_ramp(out, frames, channels, 0U, (uint32_t)frames, false);
+  scheduler->start_fade_len = 0;
+  scheduler->start_fade_pos = 0;
+  return frames;
 }
 
 /* Start a step by `raw_error` (positive: early, hold back; negative: late,
@@ -855,6 +935,7 @@ size_t audio_scheduler_render(audio_scheduler_t *scheduler,
       scheduler->wait_reason = AUDIO_SCHED_WAIT_NONE;
       measure_reset(scheduler, true);
       step_reset(scheduler);
+      start_fade_arm(scheduler, clock_map->sample_rate);
       /* The start itself lands where the anchor says. */
       scheduler->anchor_reset_pending = false;
     } else {
@@ -894,6 +975,7 @@ size_t audio_scheduler_render(audio_scheduler_t *scheduler,
         scheduler->state = AUDIO_SCHED_PLAYING;
         measure_reset(scheduler, true);
         step_reset(scheduler);
+        start_fade_arm(scheduler, clock_map->sample_rate);
         scheduler->anchor_reset_pending = false;
       } else {
         scheduler->state = AUDIO_SCHED_PREROLL;
@@ -928,7 +1010,7 @@ size_t audio_scheduler_render(audio_scheduler_t *scheduler,
   if (step_active(scheduler)) {
     const size_t stepped = step_render(scheduler, timeline, out, samples,
                                        channels, concealed_samples);
-    fas_gate(scheduler, out, first_rtp, samples, channels);
+    render_gain(scheduler, out, first_rtp, samples, channels);
     return stepped;
   }
 
@@ -972,6 +1054,6 @@ size_t audio_scheduler_render(audio_scheduler_t *scheduler,
       *concealed_samples += spare_concealed;
     }
   }
-  fas_gate(scheduler, out, first_rtp, samples, channels);
+  render_gain(scheduler, out, first_rtp, samples, channels);
   return produced;
 }
