@@ -1918,11 +1918,7 @@ static void handle_packet(const uint8_t *data, size_t len, bool is_event_port,
   if (!parse_header(data, len, &h)) {
     return;
   }
-  ptp_actions_t act;
-  act.events = 0;
-  act.send_dreq = false;
-  act.need_median = false;
-  act.need_lucky = false;
+  ptp_actions_t act = {0};
 
   portENTER_CRITICAL(&ptp_state_mux);
   switch (h.type) {
@@ -1963,41 +1959,30 @@ static void handle_packet(const uint8_t *data, size_t len, bool is_event_port,
     // around the send, which the bracket shows.
     const int64_t t3 = get_local_time_ns();
     const bool t3_ok = t3 - t3_pre <= PTP_TX_STAMP_MAX_NS;
-    ptp_actions_t act2;
-    act2.events = 0;
-    act2.need_median = false;
-    act2.need_lucky = false;
+    // Only this task handles packets, so the Delay_Resp cannot have been
+    // processed yet: the exchange completes in handle_delay_resp().
     portENTER_CRITICAL(&ptp_state_mux);
+    const bool mine =
+        ptp.x_active && ptp.x_dreq_sent && ptp.x_dreq_seq == act.dreq_seq;
     if (sent == PTP_DELAY_REQ_LEN) {
       ptp.dreq_sent++;
-      if (ptp.x_active && ptp.x_dreq_sent && ptp.x_dreq_seq == act.dreq_seq) {
-        ptp.x_t3_pre = t3_pre;
-      }
       if (!t3_ok) {
         ptp.tx_slow++;
       }
-      if (t3_ok && ptp.x_active && ptp.x_dreq_sent &&
-          ptp.x_dreq_seq == act.dreq_seq) {
-        ptp.x_t3 = t3;
-        ptp.x_have_t3 = true;
-        if (ptp.x_have_t1 && ptp.x_have_t4 && ptp.selected >= 0) {
-          two_way_sample(&ptp.ports[ptp.selected], &act2);
-          publish_model(&act2);
+      if (mine) {
+        ptp.x_t3_pre = t3_pre;
+        if (t3_ok) {
+          ptp.x_t3 = t3;
+          ptp.x_have_t3 = true;
         }
       }
     } else {
       ptp.dreq_tx_errors++;
-      if (ptp.x_dreq_seq == act.dreq_seq) {
+      if (mine) {
         ptp.x_dreq_sent = false; // never left: not "unanswered"
       }
     }
     portEXIT_CRITICAL(&ptp_state_mux);
-    act.events |= act2.events;
-    act.need_median |= act2.need_median;
-    act.need_lucky |= act2.need_lucky;
-    if (act2.events & EV_RESET_DROPS) {
-      act.step_ns = act2.step_ns;
-    }
   }
   if (act.need_median || act.need_lucky) {
     update_delay_thresholds(act.need_median, act.need_lucky);
