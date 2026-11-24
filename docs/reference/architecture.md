@@ -174,7 +174,7 @@ main/
 │   ├── audio_latency.c         # Output latency: DMA depth + FIFO + resampler + DAC + trim
 │   ├── audio_volume.c          # AirPlay dB → gain (Apple's law by default)
 │   ├── audio_resample.c        # 44.1 → 48 kHz conversion
-│   ├── audio_output*.c         # I2S, S/PDIF and USB backends, weak defaults
+│   ├── audio_output*.c         # I2S, S/PDIF and USB backends, weak defaults, the DMA queue cursor
 │   ├── audio_delay.c           # Per-output delay for multi-way speakers
 │   ├── audio_eq.c              # Software EQ for DACs without a DSP
 │   ├── eq_ab.c                 # Software/DSP EQ A/B switch on a TAS58xx
